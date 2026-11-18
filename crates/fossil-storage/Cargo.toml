@@ -1,0 +1,21 @@
+[package]
+name = "fossil-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fossil-core.workspace = true
+fossil-soyuz.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+secrecy.workspace = true
+tempfile = "3"
+tokio.workspace = true
+url.workspace = true
+wiremock = "0.6"
