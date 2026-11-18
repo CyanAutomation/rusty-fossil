@@ -589,9 +589,9 @@ impl SqliteStore {
 
     pub fn run_count(&self) -> Result<u64, StoreError> {
         let connection = self.lock()?;
-        let count =
+        let count: i64 =
             connection.query_row("SELECT COUNT(*) FROM run_records", [], |row| row.get(0))?;
-        Ok(count)
+        Ok(count as u64)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
