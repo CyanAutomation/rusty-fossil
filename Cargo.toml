@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/fossil-core",
+    "crates/fossil-storage",
+    "crates/fossil-soyuz",
+    "crates/rusty-fossil",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+repository = "https://github.com/CyanAutomation/rusty-fossil"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+fossil-core = { path = "crates/fossil-core" }
+fossil-soyuz = { path = "crates/fossil-soyuz" }
+fossil-storage = { path = "crates/fossil-storage" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing", "serde"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
