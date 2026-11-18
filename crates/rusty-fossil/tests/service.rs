@@ -36,6 +36,31 @@ fn missing_soyuz_configuration_prevents_execution_readiness() {
 }
 
 #[test]
+fn phase_one_limitations_block_execution_readiness_even_with_complete_configuration() {
+    let config = config(&[
+        ("SOYUZ_API_ORIGIN", "https://soyuz.example"),
+        ("SOYUZ_WORKER_API_TOKEN", "worker-token"),
+        ("SOYUZ_WORKER_ID", "rusty-fossil-host"),
+        ("CLOUDFLARE_ACCOUNT_ID", "account-123"),
+        ("CLOUDFLARE_QUEUE_ID", "queue-123"),
+        ("CLOUDFLARE_QUEUE_TOKEN", "queue-token"),
+    ])
+    .unwrap();
+
+    let report = config.readiness_report(true);
+    assert!(report.missing_dependencies.is_empty());
+    assert!(report.soyuz_configured);
+    assert!(report.queue_configured);
+    assert!(!report.ready);
+    assert!(!report.execution_ready);
+    assert!(
+        report
+            .limitations
+            .contains(&"execution_runtime_not_implemented".to_owned())
+    );
+}
+
+#[test]
 fn invalid_worker_ids_and_unsupported_or_insecure_urls_are_rejected() {
     assert!(matches!(
         config(&[("SOYUZ_WORKER_ID", "bad worker id")]),

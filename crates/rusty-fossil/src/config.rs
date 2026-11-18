@@ -2,11 +2,14 @@ use fossil_core::ids::WorkerId;
 use secrecy::SecretString;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
+
+const MAX_SECRET_BYTES: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -249,6 +252,7 @@ impl AppConfig {
             "production_queue_intake_disabled".to_owned(),
             "execution_runtime_not_implemented".to_owned(),
         ];
+        // Phase 1 limitations are hard blockers for accepting execution work.
         let ready = state_store_ready && missing_dependencies.is_empty() && limitations.is_empty();
         ReadinessReport {
             ready,
@@ -338,14 +342,9 @@ fn read_secret(
     env_key: &'static str,
 ) -> Result<Option<SecretString>, ConfigError> {
     if let Some(path) = values.get(file_key).filter(|path| !path.trim().is_empty()) {
-        let metadata =
-            std::fs::metadata(path).map_err(|_| ConfigError::InvalidSecretFile(file_key))?;
-        if metadata.len() > 4096 {
-            return Err(ConfigError::InvalidSecretFile(file_key));
-        }
-        let value =
-            std::fs::read_to_string(path).map_err(|_| ConfigError::InvalidSecretFile(file_key))?;
-        return normalize_secret(value, file_key);
+        let file =
+            std::fs::File::open(path).map_err(|_| ConfigError::InvalidSecretFile(file_key))?;
+        return read_secret_contents(file, file_key);
     }
     values
         .get(env_key)
@@ -354,6 +353,21 @@ fn read_secret(
         .map(|value| normalize_secret(value, env_key))
         .transpose()
         .map(Option::flatten)
+}
+
+fn read_secret_contents(
+    reader: impl Read,
+    file_key: &'static str,
+) -> Result<Option<SecretString>, ConfigError> {
+    let mut value = String::new();
+    reader
+        .take((MAX_SECRET_BYTES + 1) as u64)
+        .read_to_string(&mut value)
+        .map_err(|_| ConfigError::InvalidSecretFile(file_key))?;
+    if value.len() > MAX_SECRET_BYTES {
+        return Err(ConfigError::InvalidSecretFile(file_key));
+    }
+    normalize_secret(value, file_key)
 }
 
 fn normalize_secret(
@@ -368,4 +382,43 @@ fn normalize_secret(
         return Err(ConfigError::InvalidValue(name));
     }
     Ok(Some(SecretString::from(value)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    struct CountingReader {
+        remaining: usize,
+        bytes_read: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.remaining.min(buffer.len());
+            buffer[..count].fill(b'x');
+            self.remaining -= count;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn oversized_secret_stream_is_rejected_after_a_bounded_read() {
+        let mut reader = CountingReader {
+            remaining: MAX_SECRET_BYTES * 8,
+            bytes_read: 0,
+        };
+
+        let result = read_secret_contents(&mut reader, "SOYUZ_WORKER_API_TOKEN_FILE");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidSecretFile(
+                "SOYUZ_WORKER_API_TOKEN_FILE"
+            ))
+        ));
+        assert_eq!(reader.bytes_read, MAX_SECRET_BYTES + 1);
+    }
 }
