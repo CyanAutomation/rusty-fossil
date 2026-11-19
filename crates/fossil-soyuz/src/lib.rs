@@ -174,10 +174,9 @@ impl SoyuzClient {
         claim_callback_id: ClaimCallbackId,
     ) -> Result<StartedAuthorization, SoyuzClientError> {
         let run = self.get_run(run_id).await?;
-        if !matches!(
-            run.status,
-            SoyuzRunStatus::Running | SoyuzRunStatus::CancelRequested
-        ) || run.worker_id.as_ref() != Some(&worker_id)
+        if run.status != SoyuzRunStatus::Running
+            || run.cancellation_requested()
+            || run.worker_id.as_ref() != Some(&worker_id)
             || run.claim_callback_id != Some(claim_callback_id)
         {
             return Err(SoyuzClientError::Conflict);
@@ -188,6 +187,50 @@ impl SoyuzClient {
             worker_id,
             claim_callback_id,
             source: StartAuthorizationSource::CanonicalStateReconciled,
+        })
+    }
+
+    pub async fn reconcile_claim(
+        &self,
+        run_id: RunId,
+        worker_id: WorkerId,
+        callback_id: ClaimCallbackId,
+    ) -> Result<ClaimAuthorization, SoyuzClientError> {
+        let run = self.get_run(run_id).await?;
+        if run.status != SoyuzRunStatus::Claimed
+            || run.cancellation_requested()
+            || run.worker_id.as_ref() != Some(&worker_id)
+            || run.claim_callback_id != Some(callback_id)
+        {
+            return Err(SoyuzClientError::Conflict);
+        }
+        Ok(ClaimAuthorization {
+            run_id,
+            callback_id,
+            worker_id,
+            source: ClaimAuthorizationSource::CanonicalStateReconciled,
+        })
+    }
+
+    /// Performs the final canonical-state check required before a future
+    /// executor can open its local execution gate.
+    pub async fn verify_execution_gate(
+        &self,
+        authorization: &StartedAuthorization,
+    ) -> Result<ExecutionGateAuthorization, SoyuzClientError> {
+        let run = self.get_run(authorization.run_id()).await?;
+        if run.status != SoyuzRunStatus::Running
+            || run.cancellation_requested()
+            || run.worker_id.as_ref() != Some(authorization.worker_id())
+            || run.claim_callback_id != Some(authorization.claim_callback_id())
+        {
+            return Err(SoyuzClientError::Conflict);
+        }
+        Ok(ExecutionGateAuthorization {
+            run_id: authorization.run_id(),
+            start_callback_id: authorization.callback_id(),
+            worker_id: authorization.worker_id().clone(),
+            claim_callback_id: authorization.claim_callback_id(),
         })
     }
 }
@@ -237,6 +280,40 @@ pub enum StartAuthorizationSource {
     CanonicalStateReconciled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimAuthorizationSource {
+    ClaimCallbackAccepted,
+    CanonicalStateReconciled,
+}
+
+/// Proof that Soyuz accepted a claim or its canonical run read confirms it.
+/// Private fields prevent controller code from manufacturing claim authorization locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimAuthorization {
+    run_id: RunId,
+    callback_id: ClaimCallbackId,
+    worker_id: WorkerId,
+    source: ClaimAuthorizationSource,
+}
+
+impl ClaimAuthorization {
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn callback_id(&self) -> ClaimCallbackId {
+        self.callback_id
+    }
+
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+
+    pub fn source(&self) -> ClaimAuthorizationSource {
+        self.source
+    }
+}
+
 /// Proof that Soyuz accepted a start or its canonical run read confirms it.
 /// Private fields prevent controller code from manufacturing authorization locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,9 +347,60 @@ impl StartedAuthorization {
     }
 }
 
+/// Fresh proof that canonical Soyuz state still permits the exact authorized
+/// run, worker, claim fence, and start callback to cross the execution gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionGateAuthorization {
+    run_id: RunId,
+    start_callback_id: EventId,
+    worker_id: WorkerId,
+    claim_callback_id: ClaimCallbackId,
+}
+
+impl ExecutionGateAuthorization {
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn start_callback_id(&self) -> EventId {
+        self.start_callback_id
+    }
+
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+
+    pub fn claim_callback_id(&self) -> ClaimCallbackId {
+        self.claim_callback_id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationReceipt {
     pub request_id: String,
+}
+
+/// Evidence that Soyuz accepted the callback request for this run and ID.
+/// Private fields prevent storage from being marked delivered without a client response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackDeliveryAuthorization {
+    run_id: RunId,
+    event_id: EventId,
+    operation: &'static str,
+}
+
+impl CallbackDeliveryAuthorization {
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn event_id(&self) -> EventId {
+        self.event_id
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -378,11 +506,11 @@ impl OperationalEvent {
         if self
             .stage
             .as_deref()
-            .is_some_and(|value| !valid_label(value))
+            .is_some_and(|value| !valid_bounded_label(value, 120))
             || self
                 .step
                 .as_deref()
-                .is_some_and(|value| !valid_label(value))
+                .is_some_and(|value| !valid_bounded_label(value, 160))
         {
             return Err(SoyuzClientError::InvalidRequest);
         }
@@ -422,6 +550,7 @@ pub struct CompletedCallback {
     pub summary: Option<String>,
     pub published_url: Option<Url>,
     pub changed_file_count: Option<u32>,
+    pub outcome_summary: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -436,7 +565,7 @@ struct CompletedBody<'a> {
     claim_callback_id: Option<ClaimCallbackId>,
     #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
     completed_at: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "exitCode", skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<&'a str>,
@@ -444,6 +573,8 @@ struct CompletedBody<'a> {
     published_url: Option<&'a Url>,
     #[serde(rename = "changedFileCount", skip_serializing_if = "Option::is_none")]
     changed_file_count: Option<u32>,
+    #[serde(rename = "outcomeSummary", skip_serializing_if = "Option::is_none")]
+    outcome_summary: Option<&'a Value>,
 }
 
 impl CompletedCallback {
@@ -452,11 +583,15 @@ impl CompletedCallback {
             || self
                 .summary
                 .as_deref()
-                .is_some_and(|value| !valid_message(value, 1000))
+                .is_some_and(|value| value.len() > 2_000)
+            || self.published_url.as_ref().is_some_and(|url| {
+                url.as_str().len() > 2_048 || !matches!(url.scheme(), "https" | "http")
+            })
+            || self.changed_file_count.is_some_and(|value| value > 100_000)
             || self
-                .published_url
+                .outcome_summary
                 .as_ref()
-                .is_some_and(|url| url.scheme() != "https")
+                .is_some_and(|value| !valid_outcome_summary(value))
         {
             return Err(SoyuzClientError::InvalidRequest);
         }
@@ -471,6 +606,7 @@ impl CompletedCallback {
             summary: self.summary.as_deref(),
             published_url: self.published_url.as_ref(),
             changed_file_count: self.changed_file_count,
+            outcome_summary: self.outcome_summary.as_ref(),
         })
     }
 }
@@ -485,6 +621,7 @@ pub struct FailedCallback {
     pub exit_code: Option<i32>,
     pub failure_class: String,
     pub failure_message: String,
+    pub outcome_summary: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -499,22 +636,28 @@ struct FailedBody<'a> {
     claim_callback_id: Option<ClaimCallbackId>,
     #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
     completed_at: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "exitCode", skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     #[serde(rename = "failureClass")]
     failure_class: &'a str,
     #[serde(rename = "failureMessage")]
     failure_message: &'a str,
+    #[serde(rename = "outcomeSummary", skip_serializing_if = "Option::is_none")]
+    outcome_summary: Option<&'a Value>,
 }
 
 impl FailedCallback {
     fn body(&self) -> Result<FailedBody<'_>, SoyuzClientError> {
-        if !valid_message(&self.failure_class, 128)
+        if !valid_message(&self.failure_class, 120)
             || !self
                 .failure_class
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-            || !valid_message(&self.failure_message, 1000)
+            || !valid_message(&self.failure_message, 4_000)
+            || self
+                .outcome_summary
+                .as_ref()
+                .is_some_and(|value| !valid_outcome_summary(value))
         {
             return Err(SoyuzClientError::InvalidRequest);
         }
@@ -528,6 +671,7 @@ impl FailedCallback {
             exit_code: self.exit_code,
             failure_class: &self.failure_class,
             failure_message: &self.failure_message,
+            outcome_summary: self.outcome_summary.as_ref(),
         })
     }
 }
@@ -541,6 +685,7 @@ pub struct CancelledCallback {
     pub completed_at: Option<String>,
     pub exit_code: Option<i32>,
     pub reason: Option<String>,
+    pub outcome_summary: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -555,10 +700,12 @@ struct CancelledBody<'a> {
     claim_callback_id: Option<ClaimCallbackId>,
     #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
     completed_at: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "exitCode", skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
+    #[serde(rename = "outcomeSummary", skip_serializing_if = "Option::is_none")]
+    outcome_summary: Option<&'a Value>,
 }
 
 impl CancelledCallback {
@@ -566,7 +713,11 @@ impl CancelledCallback {
         if self
             .reason
             .as_deref()
-            .is_some_and(|value| !valid_message(value, 255))
+            .is_some_and(|value| value.len() > 2_000)
+            || self
+                .outcome_summary
+                .as_ref()
+                .is_some_and(|value| !valid_outcome_summary(value))
         {
             return Err(SoyuzClientError::InvalidRequest);
         }
@@ -579,6 +730,7 @@ impl CancelledCallback {
             completed_at: self.completed_at.as_deref(),
             exit_code: self.exit_code,
             reason: self.reason.as_deref(),
+            outcome_summary: self.outcome_summary.as_ref(),
         })
     }
 }
@@ -586,28 +738,51 @@ impl CancelledCallback {
 #[async_trait]
 pub trait SoyuzApi: Send + Sync {
     async fn get_run(&self, run_id: RunId) -> Result<SoyuzRunRead, SoyuzClientError>;
+    async fn reconcile_claim(
+        &self,
+        run_id: RunId,
+        worker_id: WorkerId,
+        callback_id: ClaimCallbackId,
+    ) -> Result<ClaimAuthorization, SoyuzClientError>;
+    async fn reconcile_started(
+        &self,
+        run_id: RunId,
+        callback_id: EventId,
+        worker_id: WorkerId,
+        claim_callback_id: ClaimCallbackId,
+    ) -> Result<StartedAuthorization, SoyuzClientError>;
+    async fn verify_execution_gate(
+        &self,
+        authorization: &StartedAuthorization,
+    ) -> Result<ExecutionGateAuthorization, SoyuzClientError>;
     async fn claim(
         &self,
         request: WorkerClaimRequest,
-    ) -> Result<OperationReceipt, SoyuzClientError>;
+    ) -> Result<ClaimAuthorization, SoyuzClientError>;
     async fn started(
         &self,
         request: StartedRequest,
     ) -> Result<StartedAuthorization, SoyuzClientError>;
-    async fn event(&self, event: OperationalEvent) -> Result<OperationReceipt, SoyuzClientError>;
+    async fn event(
+        &self,
+        event: OperationalEvent,
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError>;
     async fn heartbeat(
         &self,
         event: OperationalEvent,
-    ) -> Result<OperationReceipt, SoyuzClientError>;
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError>;
     async fn completed(
         &self,
         callback: CompletedCallback,
-    ) -> Result<OperationReceipt, SoyuzClientError>;
-    async fn failed(&self, callback: FailedCallback) -> Result<OperationReceipt, SoyuzClientError>;
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError>;
+    async fn failed(
+        &self,
+        callback: FailedCallback,
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError>;
     async fn cancelled(
         &self,
         callback: CancelledCallback,
-    ) -> Result<OperationReceipt, SoyuzClientError>;
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError>;
 }
 
 #[async_trait]
@@ -622,12 +797,45 @@ impl SoyuzApi for SoyuzClient {
         Ok(run)
     }
 
+    async fn reconcile_claim(
+        &self,
+        run_id: RunId,
+        worker_id: WorkerId,
+        callback_id: ClaimCallbackId,
+    ) -> Result<ClaimAuthorization, SoyuzClientError> {
+        SoyuzClient::reconcile_claim(self, run_id, worker_id, callback_id).await
+    }
+
+    async fn reconcile_started(
+        &self,
+        run_id: RunId,
+        callback_id: EventId,
+        worker_id: WorkerId,
+        claim_callback_id: ClaimCallbackId,
+    ) -> Result<StartedAuthorization, SoyuzClientError> {
+        SoyuzClient::reconcile_started(self, run_id, callback_id, worker_id, claim_callback_id)
+            .await
+    }
+
+    async fn verify_execution_gate(
+        &self,
+        authorization: &StartedAuthorization,
+    ) -> Result<ExecutionGateAuthorization, SoyuzClientError> {
+        SoyuzClient::verify_execution_gate(self, authorization).await
+    }
+
     async fn claim(
         &self,
         request: WorkerClaimRequest,
-    ) -> Result<OperationReceipt, SoyuzClientError> {
+    ) -> Result<ClaimAuthorization, SoyuzClientError> {
         let path = Self::run_path(request.run_id, "/claim");
-        self.operation(path, &request.body()?).await
+        self.operation(path, &request.body()?).await?;
+        Ok(ClaimAuthorization {
+            run_id: request.run_id,
+            callback_id: request.callback_id,
+            worker_id: request.worker_id,
+            source: ClaimAuthorizationSource::ClaimCallbackAccepted,
+        })
     }
 
     async fn started(
@@ -641,7 +849,7 @@ impl SoyuzApi for SoyuzClient {
         if request
             .stage
             .as_deref()
-            .is_some_and(|stage| !valid_label(stage))
+            .is_some_and(|stage| !valid_bounded_label(stage, 120))
         {
             return Err(SoyuzClientError::InvalidRequest);
         }
@@ -668,16 +876,24 @@ impl SoyuzApi for SoyuzClient {
         })
     }
 
-    async fn event(&self, event: OperationalEvent) -> Result<OperationReceipt, SoyuzClientError> {
+    async fn event(
+        &self,
+        event: OperationalEvent,
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError> {
         let body = event.body()?;
         self.operation(Self::run_path(event.run_id, "/events"), &body)
-            .await
+            .await?;
+        Ok(callback_authorization(
+            event.run_id,
+            event.event_id,
+            "event",
+        ))
     }
 
     async fn heartbeat(
         &self,
         mut event: OperationalEvent,
-    ) -> Result<OperationReceipt, SoyuzClientError> {
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError> {
         event.event_type = OperationalEventType::Heartbeat;
         event.stage = None;
         event.step = None;
@@ -688,34 +904,208 @@ impl SoyuzApi for SoyuzClient {
     async fn completed(
         &self,
         callback: CompletedCallback,
-    ) -> Result<OperationReceipt, SoyuzClientError> {
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError> {
         let body = callback.body()?;
         self.operation(Self::run_path(callback.run_id, "/completed"), &body)
-            .await
+            .await?;
+        Ok(callback_authorization(
+            callback.run_id,
+            callback.callback_id,
+            "completed",
+        ))
     }
 
-    async fn failed(&self, callback: FailedCallback) -> Result<OperationReceipt, SoyuzClientError> {
+    async fn failed(
+        &self,
+        callback: FailedCallback,
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError> {
         let body = callback.body()?;
         self.operation(Self::run_path(callback.run_id, "/failed"), &body)
-            .await
+            .await?;
+        Ok(callback_authorization(
+            callback.run_id,
+            callback.callback_id,
+            "failed",
+        ))
     }
 
     async fn cancelled(
         &self,
         callback: CancelledCallback,
-    ) -> Result<OperationReceipt, SoyuzClientError> {
+    ) -> Result<CallbackDeliveryAuthorization, SoyuzClientError> {
         let body = callback.body()?;
         self.operation(Self::run_path(callback.run_id, "/cancelled"), &body)
-            .await
+            .await?;
+        Ok(callback_authorization(
+            callback.run_id,
+            callback.callback_id,
+            "cancelled",
+        ))
     }
 }
 
-fn valid_label(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+fn callback_authorization(
+    run_id: RunId,
+    event_id: EventId,
+    operation: &'static str,
+) -> CallbackDeliveryAuthorization {
+    CallbackDeliveryAuthorization {
+        run_id,
+        event_id,
+        operation,
+    }
+}
+
+fn valid_bounded_label(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control)
 }
 
 fn valid_message(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+pub fn valid_outcome_summary(value: &Value) -> bool {
+    const MAX_BYTES: usize = 8 * 1024;
+    let Ok(encoded) = serde_json::to_vec(value) else {
+        return false;
+    };
+    if encoded.len() > MAX_BYTES {
+        return false;
+    }
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    if !only_keys(
+        root,
+        &[
+            "schemaVersion",
+            "scorecard",
+            "evaluation",
+            "phaseDurationMs",
+        ],
+    ) || root.get("schemaVersion").and_then(Value::as_u64) != Some(1)
+    {
+        return false;
+    }
+
+    let valid_scorecard = root.get("scorecard").is_some_and(|value| {
+        let Some(scorecard) = value.as_object() else {
+            return false;
+        };
+        only_keys(
+            scorecard,
+            &[
+                "score",
+                "grade",
+                "rubricVersion",
+                "completeness",
+                "confidence",
+                "scoredAt",
+            ],
+        ) && number_between(scorecard.get("score"), 0.0, 100.0)
+            && matches!(
+                scorecard.get("grade").and_then(Value::as_str),
+                Some("A" | "B" | "C" | "D" | "F")
+            )
+            && scorecard
+                .get("rubricVersion")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value.len() <= 100)
+            && matches!(
+                scorecard.get("completeness").and_then(Value::as_str),
+                Some("complete" | "provisional" | "not_applicable" | "unavailable")
+            )
+            && number_between(scorecard.get("confidence"), 0.0, 100.0)
+            && scorecard
+                .get("scoredAt")
+                .and_then(Value::as_str)
+                .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok())
+    });
+
+    let valid_evaluation = root.get("evaluation").is_some_and(|value| {
+        let Some(evaluation) = value.as_object() else {
+            return false;
+        };
+        let Some(categories) = evaluation
+            .get("improvementCategories")
+            .and_then(Value::as_array)
+        else {
+            return false;
+        };
+        only_keys(
+            evaluation,
+            &[
+                "assessment",
+                "reviewerConfidence",
+                "taskCompletionScore",
+                "improvementCategories",
+            ],
+        ) && matches!(
+            evaluation.get("assessment").and_then(Value::as_str),
+            Some("excellent" | "good" | "mixed" | "poor" | "unknown")
+        ) && matches!(
+            evaluation.get("reviewerConfidence").and_then(Value::as_str),
+            Some("high" | "medium" | "low" | "unknown")
+        ) && evaluation
+            .get("taskCompletionScore")
+            .is_none_or(|value| value.as_u64().is_some_and(|score| (1..=5).contains(&score)))
+            && categories.len() <= 20
+            && categories.iter().all(|category| {
+                let Some(category) = category.as_object() else {
+                    return false;
+                };
+                let Some(name) = category.get("category").and_then(Value::as_str) else {
+                    return false;
+                };
+                only_keys(category, &["category", "priority", "count"])
+                    && !name.is_empty()
+                    && name.len() <= 64
+                    && name.bytes().enumerate().all(|(index, byte)| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || ((byte == b'_' || byte == b'-') && index > 0)
+                    })
+                    && matches!(
+                        category.get("priority").and_then(Value::as_str),
+                        Some("low" | "medium" | "high" | "unknown")
+                    )
+                    && category
+                        .get("count")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|count| (1..=10_000).contains(&count))
+            })
+    });
+
+    let valid_durations = root.get("phaseDurationMs").is_none_or(|value| {
+        let Some(durations) = value.as_object() else {
+            return false;
+        };
+        only_keys(
+            durations,
+            &[
+                "goal_setting",
+                "scouting",
+                "coding",
+                "validation",
+                "goal_check",
+                "run_evaluation",
+            ],
+        ) && durations
+            .values()
+            .all(|duration| number_between(Some(duration), 0.0, 86_400_000.0))
+    });
+
+    (valid_scorecard || valid_evaluation) && valid_durations
+}
+
+fn only_keys(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn number_between(value: Option<&Value>, min: f64, max: f64) -> bool {
+    value
+        .and_then(Value::as_f64)
+        .is_some_and(|number| number.is_finite() && (min..=max).contains(&number))
 }
 
 fn validate_timestamp(value: Option<&str>) -> Result<(), SoyuzClientError> {

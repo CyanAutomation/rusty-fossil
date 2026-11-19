@@ -1,75 +1,89 @@
-# Soyuz and Queue contracts
+# Soyuz and Cloudflare contracts
 
-## Sources and discovery
+## Sources
 
-Soyuz's current versioned cross-service contract is `contractVersion: "1"`. The current primary references are [Soyuz transport contract](https://github.com/CyanAutomation/soyuz/blob/main/docs/CONTRACT.md), [Kaseki integration policy](https://github.com/CyanAutomation/soyuz/blob/main/docs/KASEKI-INTEGRATION.md), [Soyuz test requirements](https://github.com/CyanAutomation/soyuz/blob/main/docs/TEST-REQUIREMENTS.md), and [Soyuz architecture](https://github.com/CyanAutomation/soyuz/blob/main/docs/ARCHITECTURE.md). These are not copied into Rust source; the contract tests use independent JSON fixtures.
+The implementation follows Soyuz's contract-v1 schemas and worker API. The working references used for this phase are [Soyuz transport contract](https://github.com/CyanAutomation/soyuz/blob/main/docs/CONTRACT.md), [Kaseki integration policy](https://github.com/CyanAutomation/soyuz/blob/main/docs/KASEKI-INTEGRATION.md), [Soyuz test requirements](https://github.com/CyanAutomation/soyuz/blob/main/docs/TEST-REQUIREMENTS.md), and the current source schemas in [`run-request.ts`](https://github.com/CyanAutomation/soyuz/blob/main/src/contracts/run-request.ts) and [`worker-callbacks.ts`](https://github.com/CyanAutomation/soyuz/blob/main/src/contracts/worker-callbacks.ts). The tests use independent JSON fixtures under `crates/fossil-core/tests/fixtures/`.
 
-The referenced published Kaseki page at [kaseki-tunnel.scheimann.xyz/docs](https://kaseki-tunnel.scheimann.xyz/docs) was read on 2026-11-18. It is a human-readable operation index with 33 operations and an explicit link to [OpenAPI 3.1 JSON](https://kaseki-tunnel.scheimann.xyz/api/v1/openapi.json). The linked document was fetched and reports 32 paths. It lists health/readiness, metrics, usage, capabilities, preflight, validation, run submission and status, local run submission, retry, cancellation, events, logs, artifacts, scorecards, webhooks, gateway diagnostics, and Soyuz callback diagnostics/retry. Rusty-Fossil does not implement or proxy those Kaseki API paths. In particular, its runtime does not implement the `POST /api/v1/runs` or `POST /api/v1/runs/local` operations.
+Cloudflare behavior is based on the official [Queues pull-consumer guide](https://developers.cloudflare.com/queues/configuration/pull-consumers/) and [Queues API](https://developers.cloudflare.com/api/resources/queues/). The API adapter posts to `/client/v4/accounts/{account_id}/queues/{queue_id}/messages/pull` and `/messages/ack`. A dedicated token needs Queue read and write access. Cloudflare Queue delivery is at least once.
 
-## Canonical identities
+## Identity and delivery
 
 | Value | Meaning | Rust representation |
 | --- | --- | --- |
-| Soyuz `runId` | Canonical UUIDv7 run identity and durable deduplication key. | `RunId` |
-| Soyuz `displayId` | Human-facing label such as `soyuz-213`. | `DisplayId` |
-| Cloudflare message `id` | Ephemeral Queue message identifier. | `QueueMessageId` |
-| Cloudflare `lease_id` | Lease used only to acknowledge or retry one pulled message. | `QueueLeaseId` |
-| Soyuz `workerId` | Stable, unique identity for one controller host. | `WorkerId` |
-| Claim `callbackId` / echoed `claimCallbackId` | Per-attempt fencing identity used to reject callbacks from stale claims. | `ClaimCallbackId` |
-| Worker callback/event ID | Stable idempotency identity for that operation across retries. | `EventId` |
+| Soyuz `runId` | Canonical UUIDv7 run identity and deduplication key. | `RunId` |
+| Soyuz `displayId` | Human-facing run label. | `DisplayId` |
+| Queue `id` | Ephemeral message identity. | `QueueMessageId` |
+| Queue `lease_id` | One pull lease used only for ack or retry. | `QueueLeaseId` |
+| Soyuz `workerId` | Stable host identity. | `WorkerId` |
+| Claim `callbackId` | Per-attempt claim fence. | `ClaimCallbackId` |
+| Callback/event ID | Stable operation idempotency key across retries. | `EventId` |
 
-These types remain distinct even when their wire representation is a string or UUID. A display ID, queue lease, or callback ID never replaces the canonical run UUID.
+Worker IDs intentionally remain 1–64 ASCII letters, digits, hyphen or underscore. Periods, colons, whitespace, Unicode and empty values fail validation. See [ADR 0004](DECISIONS/0004-worker-id-local-restriction.md).
 
-## Queue envelope and delivery
+Cloudflare pull requests use `batch_size: 1` so the host does not build an in-memory queue, plus a configured visibility timeout. The pull parser accepts no more than one result message. A JSON-content Queue message's body is base64 decoded before contract parsing. Acknowledgement and retry requests refer only to `lease_id`; one lease operation is accepted only when Cloudflare confirms `ackCount == 1` or `retryCount == 1`. The adapter uses bounded response reads and does not log credentials or raw bodies.
 
-Soyuz publishes the validated normalized request in a JSON envelope containing:
+## Queue contract v1
 
-- `contractVersion`, exactly the string `"1"`;
-- `runId`, canonical UUIDv7;
-- `createdAt`, RFC 3339 timestamp;
-- UUID `correlationId` and `requestId`;
-- `request`, including `repoUrl`, `ref`, and a non-empty `taskPrompt` unless `startupCheck` is true.
+The envelope contains `contractVersion: "1"`, canonical UUIDv7 `runId`, RFC 3339 `createdAt`, UUID correlation/request IDs, and a normalized `request`. Unknown contract versions, duplicate fields, unknown fields, malformed base64, or a body above 96 KiB fail closed.
 
-The host must reject unknown versions before work can be considered. The parser caps an envelope at 96 KiB, requires HTTPS `repoUrl` without embedded credentials, validates the ref, and does not store the prompt. The request supports additional Soyuz fields; Phase 1 retains only fields needed for the initial validation and ignores unneeded request extensions rather than inventing local semantics.
+The request model preserves the supported Soyuz run options:
 
-Cloudflare Queues delivers at least once. Deduplicate by `runId`; do not use the ephemeral message ID or `lease_id` as a run key. Soyuz has no `/next-job` endpoint. Its contract calls for a direct Cloudflare HTTP pull consumer in a future phase.
+| Option | Validation |
+| --- | --- |
+| `repoUrl` | HTTPS absolute URL, host required, no embedded credentials, at most 2,048 UTF-16 code units. |
+| `ref` | Defaults to `main`; 1–512 UTF-16 code units. |
+| `projectName` | Optional, 1–200 code units. |
+| `taskPrompt` | Optional only when `startupCheck: true`; otherwise required, 10–32,000 code units. |
+| `changedFilesAllowlist` and `allowlist.include` | At most 500 entries, each 1–512 code units. |
+| `maxDiffBytes` | 1–100,000,000. |
+| `validationCommands`, nested validation commands, auto-lint commands | At most 50 commands, each 1–2,048 code units. |
+| `goalSetting`, `scoutingConfig`, `goalCheck`, `runEvaluation` | Preserve enabled/model/timeout options; models 1–200 code units and timeouts 60–10,800 seconds. `goalCheck.maxRetries` is 0–5. |
+| `taskMode` | `patch` or `inspect`; defaults to `patch`. |
+| `publishMode` | `auto`, `none`, `branch`, or `pr`; defaults to `pr`. |
+| `startupCheckMode` | `boot` or `baseline-validation`. |
+| `tracing`, `idempotencyKey`, `timeoutSeconds` | Preserve UUID tracing IDs and UUID idempotency key; timeout 60–10,800 seconds. |
 
-Cloudflare's current HTTP pull API uses `POST /accounts/{account_id}/queues/{queue_id}/messages/pull` with `batch_size` and `visibility_timeout_ms`. The current documented limits are batch size 1–100 and visibility timeout up to 12 hours. Pull returns message IDs and `lease_id`; `POST .../messages/ack` accepts `acks` and `retries`, each keyed by `lease_id`. Queue credentials need both Queue read and write permissions. For JSON-content messages, the HTTP pull response body is base64 encoded; the recorded fixture covers that form. See the official [Cloudflare pull-consumer guide](https://developers.cloudflare.com/queues/configuration/pull-consumers/) and [Queues API](https://developers.cloudflare.com/api/resources/queues/).
+Fields are typed and `deny_unknown_fields` is applied recursively. In particular, unsupported execution/security controls such as a future webhook configuration are rejected, not silently dropped. The normalized descriptor persisted to SQLite preserves all listed fields and the envelope's run, time and correlation identities. It does not persist Cloudflare transport IDs.
 
-Phase 1 defines the pull, message, and acknowledgement data models and tests fixtures only. It does not make a pull request, acknowledge, retry, or lease production messages.
+## Soyuz worker API
 
-## Worker API
+Worker requests use `Authorization: Bearer <SOYUZ_WORKER_API_TOKEN>`, separate from client submission and Queue credentials. Success uses `{ "data": ..., "requestId": "..." }`; errors use `{ "error": { "code", "message", "requestId" } }`. Bodies are bounded, and error formatting never exposes response bodies.
 
-Every worker request uses `Authorization: Bearer <WORKER_API_TOKEN>`, separate from Soyuz's client submission token and Cloudflare Queue token. Success responses use `{ "data": ..., "requestId": "..." }`. Errors use `{ "error": { "code", "message", "requestId" } }`. The Rust client never includes remote messages or raw bodies in error display.
+| Operation | Phase 2A behavior |
+| --- | --- |
+| `GET /v1/worker/runs/:runId` | Read canonical status, cancellation, worker, current claim fence and health. Required before authorization and at the final handoff gate. |
+| `POST /claim` | Compare-and-set claim with stable callback ID, worker ID and optional lease (30–300 seconds). A successful response yields a private-field proof. Uncertain responses reconcile with canonical run ownership/fence. |
+| `POST /started` | Sent only after durable claim proof and stable start callback ID. Successful response or exact canonical `running` state can yield start evidence. Cancellation cannot reconcile as authorization. |
+| `POST /events` | Bounded operational callback with stable event ID, worker and current claim fence. Event types use contract spellings such as `stage.changed`, `progress.updated`, and `worker.heartbeat`. |
+| `POST /completed`, `/failed`, `/cancelled` | Full bounded request models, including mandatory failure class/message, completion metadata and optional outcome summary. Durable outbox replay sends the exact stored logical payload and ID. |
 
-| Operation | Current contract behavior | Phase 1 status |
-| --- | --- | --- |
-| `GET /v1/worker/runs/:id` | Read canonical `runId`, `displayId`, exact status, cancellation, claim, heartbeat and health fields before start and during execution. | Typed request/response and cancellation-read model; mock tested. |
-| `POST /v1/worker/runs/:id/claim` | Compare-and-set `queued` to `claimed`; body includes v1, callback ID, worker ID, optional lease 30–300 seconds (default 120). The callback ID is also the claim fencing token. | Typed client; no production call. |
-| `POST /v1/worker/runs/:id/started` | Authorizes the start for the owned live claim. A worker must wait for success before launch. | Typed client returns a private-field authorization proof only on successful response. |
-| `POST /v1/worker/runs/:id/events` | Bounded operational event, at most 12 KiB; event ID and claim ID remain stable across retries. | Typed model/client, bounded and mock tested. |
-| Heartbeat | Sent as a `heartbeat` operational event; refreshes liveness, does not change lifecycle status. | Typed helper through the events endpoint. |
-| `POST /v1/worker/runs/:id/completed` | Reports bounded terminal completion fields. | Typed callback request; no live execution or callback delivery. |
-| `POST /v1/worker/runs/:id/failed` | Reports a bounded failure class/message, including a valid pre-start failure on an owned live claim. | Typed callback request; no live execution or callback delivery. |
-| `POST /v1/worker/runs/:id/cancelled` | Confirms cancellation after local cleanup. | Typed callback request; no live execution or callback delivery. |
+The client does not create a new callback ID on retry. Only retryable network, timeout, rate-limit and service-unavailable outcomes are retried automatically by outbox replay. A stale claim, conflict, authentication rejection, missing run, invalid request or protocol mismatch becomes blocked for operator review. A callback is marked delivered only after Soyuz returns success.
 
-The response reader caps bodies at 96 KiB. The client classifies timeout, network, authentication, authorization, missing run, stale claim, conflict, rate-limit, and service-unavailable outcomes. It does not automatically retry a non-idempotent operation. Callers supply persisted callback/event IDs so an explicit retry reuses the same identity.
+## Persistence, retry and cancellation
 
-## External statuses and cancellation
+- Claim intent and ID commit before `/claim`; the accepted/reconciled proof is required before `/started`.
+- Start callback ID commits before `/started`; accepted/reconciled proof and the complete request descriptor are required before reserving the local slot.
+- The final gate requires canonical `running`, matching run/worker/claim, and no `cancelRequestedAt`.
+- Queue ack follows durable handoff reservation. A failed ack redelivers, and the durable run record prevents another authorization/handoff attempt.
+- Queue and local recovery are at-least-once. Rusty-Fossil does not claim exactly-once execution across independent systems.
+- Callback attempt count and a capped exponential retry deadline with stable per-event jitter are persisted before network I/O. Pending plus blocked outbox entries are bounded at 1,000; full capacity fails enqueue and applies backpressure.
+- Terminal local state, terminal callback intent and slot release can be committed together. A blocked callback remains visible in recovery diagnostics and prevents descriptor cleanup.
+- A queued cancellation is already terminal in Soyuz and is skipped. A claimed run cancelled before launch cannot cross the execution gate. During future execution, cancellation must stop and clean up the worker before `/cancelled` is acknowledged.
 
-Rusty-Fossil accepts only current contract-v1 statuses: `admitting`, `queued`, `claimed`, `running`, `cancel_requested`, `completed`, `failed`, `cancelled`, and `admission_failed`. Unknown values fail deserialization. These statuses are separate from the local controller lifecycle.
+## Configuration boundary
 
-Queued cancellation becomes terminal in Soyuz, so a later delivery must be skipped. A claimed-but-not-started run may be cancelled before Docker starts. A running cancellation becomes `cancel_requested`; the worker observes canonical state, stops its process, performs cleanup, then reports `/cancelled`. If completion wins, completion remains terminal. A stale or mismatched claim cannot authorize launch or confirm state for a different attempt.
+`SOYUZ_API_ORIGIN`, `SOYUZ_WORKER_ID`, and either `SOYUZ_WORKER_API_TOKEN_FILE` or `SOYUZ_WORKER_API_TOKEN` configure the Soyuz worker client. `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUE_ID`, either `CLOUDFLARE_QUEUE_TOKEN_FILE` or `CLOUDFLARE_QUEUE_TOKEN`, and `CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS` configure Queue access. The default visibility timeout is 60 seconds and accepted range is 1 second to 12 hours. `RUSTY_FOSSIL_POLL_INTERVAL_SECONDS` and `RUSTY_FOSSIL_REQUEST_TIMEOUT_SECONDS` configure transport timing. Secret files are preferred for deployment; Queue and Soyuz credentials are separate and redacted from debug output.
 
-## Idempotency, fencing, and outages
+## Readiness and operational limitations
 
-- Queue redelivery is expected; local uniqueness is by canonical `runId`.
-- The local claim intent and callback ID are committed before any future claim request. An uncertain network response is reconciled against Soyuz; it does not create a second claim ID or run.
-- The local start authorization is committed only from a `StartedAuthorization` returned by a successful `/started` response or a canonical read confirming matching `runId`, worker ID, claim ID, and active status.
-- Replacing the persisted claim fence is rejected. The initial Phase 1 store does not implement claim renewal or a later attempt; a future phase must add explicit supersession history before any new claim can be authorized.
-- Callback outbox IDs and payloads are stable across retries. Reusing an ID with different payload is rejected. Outbox records contain typed, bounded operational fields, not prompts, credentials, repository contents, or raw logs.
-- Soyuz unavailability prevents new execution. The current Rust process has no fallback to direct local execution and no independent retry queue.
+The diagnostics API is read-only. `/ready` reports state-store health, configuration validity, Queue transport health (unprobed unless an explicit probe is supplied), recovery backlog, handoff readiness, and runtime limitations. Readiness checks do not pull Queue messages, create claims or invoke inference. The production binary does not construct the coordinator or poller, so complete configuration does not enable production intake. Execution readiness remains false because no Docker runtime exists.
 
-## Out of scope
+Queue, coordinator and outbox counters are low-cardinality. They do not label runs, message bodies, prompts, repository names, callback text, secrets, or leases. The service exposes only `/health`, `/ready` and `/metrics`; there is no submission or task-starting endpoint.
 
-The current Soyuz contract also defines artifact upload (25,000,000 bytes per file and at most 100 artifacts), run history, client submission, D1 retention, dashboards, and other public routes. Rusty-Fossil Phase 1 does not upload artifacts, submit runs, read the client API, use a `/next-job` route, connect to production Queues, or modify Soyuz or Kaseki.
+## Senku boundary for Phase 2A-S
+
+Senku is a later advisory decision service. A follow-on `fossil-senku` crate may support the Kaseki-owned profiles `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Advisory results cannot replace deterministic validation or Soyuz authorization. Do not add JEV or direct OpenRouter calls here; Senku availability will not be required to accept a valid Soyuz authorization.
+
+## Phase 2B Docker prerequisites
+
+The future supervisor must accept only a locally persisted descriptor plus an exact durable start/gate proof. It must use one slot, non-root workers, strict CPU/memory/PID/disk/network/time limits, bounded output, cancellation cleanup and explicit restart policy. Keep Docker socket access out of the controller image and do not auto-launch after ambiguous restart state.
