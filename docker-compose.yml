@@ -1,0 +1,31 @@
+services:
+  rusty-fossil:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      RUSTY_FOSSIL_ENV: development
+      RUSTY_FOSSIL_BIND: 0.0.0.0:8080
+      RUSTY_FOSSIL_STATE_DIR: /var/lib/rusty-fossil
+      RUSTY_FOSSIL_LOG_LEVEL: info
+      SOYUZ_API_ORIGIN: ${SOYUZ_API_ORIGIN:-}
+      SOYUZ_WORKER_ID: ${SOYUZ_WORKER_ID:-}
+      SOYUZ_WORKER_API_TOKEN_FILE: /run/secrets/soyuz_worker_api_token
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_QUEUE_ID: ${CLOUDFLARE_QUEUE_ID:-}
+      CLOUDFLARE_QUEUE_TOKEN_FILE: /run/secrets/cloudflare_queue_token
+    secrets:
+      - soyuz_worker_api_token
+      - cloudflare_queue_token
+    volumes:
+      - rusty-fossil-state:/var/lib/rusty-fossil
+    restart: unless-stopped
+
+secrets:
+  soyuz_worker_api_token:
+    file: ./secrets/soyuz_worker_api_token
+  cloudflare_queue_token:
+    file: ./secrets/cloudflare_queue_token
+
+volumes:
+  rusty-fossil-state:
