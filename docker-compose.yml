@@ -14,6 +14,7 @@ services:
       CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
       CLOUDFLARE_QUEUE_ID: ${CLOUDFLARE_QUEUE_ID:-}
       CLOUDFLARE_QUEUE_TOKEN_FILE: /run/secrets/cloudflare_queue_token
+      CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS: ${CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS:-60000}
     secrets:
       - soyuz_worker_api_token
       - cloudflare_queue_token

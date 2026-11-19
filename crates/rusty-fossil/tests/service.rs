@@ -52,7 +52,9 @@ fn phase_one_limitations_block_execution_readiness_even_with_complete_configurat
     assert!(report.soyuz_configured);
     assert!(report.queue_configured);
     assert!(!report.ready);
+    assert!(!report.execution_handoff_ready);
     assert!(!report.execution_ready);
+    assert_eq!(report.queue_transport_healthy, None);
     assert!(
         report
             .limitations
@@ -131,7 +133,7 @@ fn mounted_secret_file_takes_precedence_and_blank_files_remain_missing() {
 // Soyuz requirement: HEALTH-DB-01.
 async fn health_ready_and_metrics_are_distinct_and_task_routes_do_not_exist() {
     let directory = tempdir().unwrap();
-    let store = SqliteStore::open(directory.path().join("state.sqlite3")).unwrap();
+    let store = SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
     let app = router(ApiState::new(config(&[]).unwrap(), store));
 
     let health = app
@@ -160,6 +162,9 @@ async fn health_ready_and_metrics_are_distinct_and_task_routes_do_not_exist() {
     let body = ready.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["executionReady"], false);
+    assert_eq!(json["executionHandoffReady"], false);
+    assert_eq!(json["queueTransportHealthy"], serde_json::Value::Null);
+    assert_eq!(json["recoveryBacklogHealthy"], true);
 
     for path in ["/runs", "/execute", "/v1/runs"] {
         let response = app

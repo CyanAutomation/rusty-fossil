@@ -21,14 +21,20 @@ pub enum SoyuzRunStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum OperationalEventType {
+    #[serde(rename = "stage.changed")]
     StageChanged,
+    #[serde(rename = "step.changed")]
     StepChanged,
+    #[serde(rename = "progress.updated")]
     ProgressUpdate,
+    #[serde(rename = "worker.heartbeat")]
     Heartbeat,
+    #[serde(rename = "validation.completed")]
     ValidationCompleted,
+    #[serde(rename = "publish.completed")]
     PublicationCompleted,
+    #[serde(rename = "artifacts.uploaded")]
     ArtifactsUploaded,
 }
 

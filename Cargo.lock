@@ -371,6 +371,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fossil-queue"
+version = "0.1.0"
+dependencies = [
+ "fossil-core",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "fossil-soyuz"
 version = "0.1.0"
 dependencies = [
@@ -1251,6 +1265,8 @@ dependencies = [
  "axum",
  "clap",
  "fossil-core",
+ "fossil-queue",
+ "fossil-soyuz",
  "fossil-storage",
  "http-body-util",
  "secrecy",
@@ -1258,11 +1274,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]

@@ -21,4 +21,4 @@ Soyuz is mandatory. Missing configuration or an unavailable control plane preven
 
 ## Consequences
 
-The Phase 1 service is diagnostics-only and reports not-ready. Queue models are tested with fixtures, but no production Queue is consumed. Future changes that can launch a worker must receive the unforgeable authorization value produced by the Soyuz client and a matching durable record.
+Phase 2A implements mockable Queue transport and a durable coordinator but does not enable production polling or launch a worker. Future launch code must receive the unforgeable authorization value produced by the Soyuz client and a matching durable record.
