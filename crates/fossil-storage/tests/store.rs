@@ -570,6 +570,79 @@ async fn callback_outbox_reuses_event_ids_and_tracks_delivery() {
 }
 
 #[tokio::test]
+async fn marking_a_missing_callback_as_delivered_reports_callback_ineligibility() {
+    let directory = tempdir().unwrap();
+    let (store, _) = authorized_store(&state_path(directory.path())).await;
+    let event_id = EventId::parse("fa870068-6723-4b70-9e9f-53b8271e032d").unwrap();
+    let authorization = callback_delivery_authorization_for(
+        run_id(),
+        event_id,
+        worker_id(),
+        ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133").unwrap(),
+    )
+    .await;
+
+    assert!(matches!(
+        store.mark_callback_delivered(authorization),
+        Err(StoreError::CallbackNotEligible)
+    ));
+}
+
+#[tokio::test]
+async fn callback_attempt_counts_are_atomic_across_store_handles() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, _) = authorized_store(&path).await;
+    let event_id = EventId::parse("fa870068-6723-4b70-9e9f-53b8271e032d").unwrap();
+    store
+        .enqueue_callback(CallbackOutboxRecord::new(
+            event_id,
+            run_id(),
+            CallbackPayload::Completed {
+                worker_id: worker_id(),
+                claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                    .unwrap(),
+                completed_at_ms: 1_798_000_000_000,
+                exit_code: Some(0),
+                summary: None,
+                published_url: None,
+                changed_file_count: None,
+                outcome_summary: None,
+            },
+        ))
+        .unwrap();
+
+    const THREADS: usize = 6;
+    const ATTEMPTS_PER_THREAD: usize = 100;
+    let stores = (0..THREADS)
+        .map(|_| SqliteStore::open(&path).unwrap())
+        .collect::<Vec<_>>();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let workers = stores
+        .into_iter()
+        .map(|store| {
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (0..ATTEMPTS_PER_THREAD)
+                    .map(|_| store.begin_callback_attempt(event_id, 0, 0).unwrap())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut returned_attempts = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    returned_attempts.sort_unstable();
+
+    assert_eq!(
+        returned_attempts,
+        (1..=(THREADS * ATTEMPTS_PER_THREAD) as u32).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn callback_outbox_blocks_permanent_failures_and_rejects_mismatched_fences() {
     let directory = tempdir().unwrap();
     let path = state_path(directory.path());
