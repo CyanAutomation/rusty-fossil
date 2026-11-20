@@ -20,9 +20,11 @@ impl LocalLifecycleState {
         let valid = matches!(
             (self, to),
             (Self::QueueObserved, Self::MessageValidated)
+                | (Self::QueueObserved, Self::ExecutionTerminal)
                 | (Self::MessageValidated, Self::CanonicalRunChecked)
+                | (Self::MessageValidated, Self::ExecutionTerminal)
                 | (Self::CanonicalRunChecked, Self::ClaimIntentPersisted)
-                | (Self::ClaimIntentPersisted, Self::ClaimAuthorized)
+                | (Self::CanonicalRunChecked, Self::ExecutionTerminal)
                 | (Self::ClaimAuthorized, Self::StartAuthorizationPersisted)
                 | (Self::StartAuthorizationPersisted, Self::ExecutionActive)
                 | (Self::ExecutionActive, Self::CancellationRequested)
@@ -30,6 +32,7 @@ impl LocalLifecycleState {
                 | (Self::CancellationRequested, Self::ExecutionTerminal)
                 | (Self::ClaimIntentPersisted, Self::ExecutionTerminal)
                 | (Self::ClaimAuthorized, Self::ExecutionTerminal)
+                | (Self::StartAuthorizationPersisted, Self::ExecutionTerminal)
         );
         if valid {
             Ok(to)
@@ -45,6 +48,7 @@ pub enum CallbackDeliveryState {
     NotRequired,
     Pending,
     Delivered,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

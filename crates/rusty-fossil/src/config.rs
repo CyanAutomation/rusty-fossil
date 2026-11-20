@@ -1,4 +1,5 @@
 use fossil_core::ids::WorkerId;
+use fossil_queue::CloudflareQueueConfig;
 use secrecy::SecretString;
 use std::collections::HashMap;
 use std::fmt;
@@ -86,6 +87,7 @@ pub struct AppConfig {
     pub cloudflare_account_id: Option<String>,
     pub cloudflare_queue_id: Option<String>,
     pub cloudflare_queue_token: Option<SecretString>,
+    pub cloudflare_queue_visibility_timeout_ms: u32,
     pub worker_id: Option<WorkerId>,
     pub polling_interval: Duration,
     pub request_timeout: Duration,
@@ -119,6 +121,10 @@ impl fmt::Debug for AppConfig {
                 &self.cloudflare_queue_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("worker_id_configured", &self.worker_id.is_some())
+            .field(
+                "cloudflare_queue_visibility_timeout_ms",
+                &self.cloudflare_queue_visibility_timeout_ms,
+            )
             .field("polling_interval", &self.polling_interval)
             .field("request_timeout", &self.request_timeout)
             .field(
@@ -135,9 +141,12 @@ impl fmt::Debug for AppConfig {
 pub struct ReadinessReport {
     pub ready: bool,
     pub execution_ready: bool,
+    pub execution_handoff_ready: bool,
     pub state_store_ready: bool,
     pub soyuz_configured: bool,
     pub queue_configured: bool,
+    pub queue_transport_healthy: Option<bool>,
+    pub recovery_backlog_healthy: bool,
     pub missing_dependencies: Vec<String>,
     pub limitations: Vec<String>,
 }
@@ -182,6 +191,13 @@ impl AppConfig {
                 WorkerId::parse(value).map_err(|_| ConfigError::InvalidValue("SOYUZ_WORKER_ID"))
             })
             .transpose()?;
+        let cloudflare_queue_visibility_timeout_ms = parse_bounded_u32(
+            get("CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS"),
+            60_000,
+            1_000,
+            43_200_000,
+            "CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS",
+        )?;
         let polling_interval = parse_seconds(
             get("RUSTY_FOSSIL_POLL_INTERVAL_SECONDS"),
             5,
@@ -210,6 +226,7 @@ impl AppConfig {
             cloudflare_account_id,
             cloudflare_queue_id,
             cloudflare_queue_token,
+            cloudflare_queue_visibility_timeout_ms,
             worker_id,
             polling_interval,
             request_timeout,
@@ -220,6 +237,34 @@ impl AppConfig {
     }
 
     pub fn readiness_report(&self, state_store_ready: bool) -> ReadinessReport {
+        self.readiness_report_with_state(state_store_ready, false, None)
+    }
+
+    pub fn cloudflare_queue_config(&self) -> Result<Option<CloudflareQueueConfig>, ConfigError> {
+        let (Some(account_id), Some(queue_id), Some(api_token)) = (
+            self.cloudflare_account_id.as_ref(),
+            self.cloudflare_queue_id.as_ref(),
+            self.cloudflare_queue_token.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        CloudflareQueueConfig::new(
+            account_id.clone(),
+            queue_id.clone(),
+            api_token.clone(),
+            self.request_timeout,
+            self.cloudflare_queue_visibility_timeout_ms,
+        )
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidValue("Cloudflare Queue configuration"))
+    }
+
+    pub fn readiness_report_with_state(
+        &self,
+        state_store_ready: bool,
+        recovery_backlog_healthy: bool,
+        queue_transport_healthy: Option<bool>,
+    ) -> ReadinessReport {
         let soyuz_configured = self.soyuz_api_origin.is_some()
             && self.worker_api_token.is_some()
             && self.worker_id.is_some();
@@ -250,16 +295,27 @@ impl AppConfig {
         }
         let limitations = vec![
             "production_queue_intake_disabled".to_owned(),
+            "queue_transport_not_probed".to_owned(),
             "execution_runtime_not_implemented".to_owned(),
         ];
-        // Phase 1 limitations are hard blockers for accepting execution work.
-        let ready = state_store_ready && missing_dependencies.is_empty() && limitations.is_empty();
+        let execution_handoff_ready = state_store_ready
+            && soyuz_configured
+            && queue_configured
+            && recovery_backlog_healthy
+            && queue_transport_healthy == Some(true)
+            && !limitations.contains(&"production_queue_intake_disabled".to_owned());
+        let execution_ready = execution_handoff_ready
+            && !limitations.contains(&"execution_runtime_not_implemented".to_owned());
+        let ready = state_store_ready && execution_ready;
         ReadinessReport {
             ready,
-            execution_ready: ready,
+            execution_ready,
+            execution_handoff_ready,
             state_store_ready,
             soyuz_configured,
             queue_configured,
+            queue_transport_healthy,
+            recovery_backlog_healthy,
             missing_dependencies,
             limitations,
         }
@@ -308,7 +364,7 @@ fn is_loopback(url: &Url) -> bool {
 
 fn parse_resource_id(value: &str, name: &'static str) -> Result<String, ConfigError> {
     if value.is_empty()
-        || value.len() > 128
+        || value.len() > 32
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
@@ -334,6 +390,25 @@ fn parse_seconds(
         return Err(ConfigError::InvalidValue(name));
     }
     Ok(Duration::from_secs(parsed))
+}
+
+fn parse_bounded_u32(
+    value: Option<&str>,
+    default: u32,
+    minimum: u32,
+    maximum: u32,
+    name: &'static str,
+) -> Result<u32, ConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| ConfigError::InvalidValue(name))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(ConfigError::InvalidValue(name));
+    }
+    Ok(parsed)
 }
 
 fn read_secret(
@@ -420,5 +495,55 @@ mod tests {
             ))
         ));
         assert_eq!(reader.bytes_read, MAX_SECRET_BYTES + 1);
+    }
+
+    #[test]
+    fn queue_visibility_timeout_uses_a_bounded_configurable_default() {
+        let default = AppConfig::from_pairs([]).unwrap();
+        assert_eq!(default.cloudflare_queue_visibility_timeout_ms, 60_000);
+
+        let configured = AppConfig::from_pairs([(
+            "CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS".to_owned(),
+            "90000".to_owned(),
+        )])
+        .unwrap();
+        assert_eq!(configured.cloudflare_queue_visibility_timeout_ms, 90_000);
+        assert!(matches!(
+            AppConfig::from_pairs([(
+                "CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS".to_owned(),
+                "999".to_owned(),
+            )]),
+            Err(ConfigError::InvalidValue(
+                "CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS"
+            ))
+        ));
+    }
+
+    #[test]
+    fn queue_transport_configuration_uses_the_dedicated_token_and_timeout() {
+        let config = AppConfig::from_pairs([
+            ("CLOUDFLARE_ACCOUNT_ID".to_owned(), "account-123".to_owned()),
+            ("CLOUDFLARE_QUEUE_ID".to_owned(), "queue-123".to_owned()),
+            (
+                "CLOUDFLARE_QUEUE_TOKEN".to_owned(),
+                "separate-queue-token".to_owned(),
+            ),
+            (
+                "CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS".to_owned(),
+                "90000".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let queue_config = config.cloudflare_queue_config().unwrap().unwrap();
+        let debug = format!("{queue_config:?}");
+        assert!(debug.contains("visibility_timeout_ms: 90000"));
+        assert!(!debug.contains("separate-queue-token"));
+        assert!(
+            AppConfig::from_pairs([])
+                .unwrap()
+                .cloudflare_queue_config()
+                .unwrap()
+                .is_none()
+        );
     }
 }

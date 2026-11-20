@@ -9,7 +9,7 @@ The first controller runs one execution slot per host. It needs atomic local cla
 
 ## Decision
 
-Use a migration-managed SQLite database in the configured durable state directory. Enable WAL, a busy timeout, foreign-key checks, transactional compare-and-set transitions, and explicit schema-version rejection. Bundle SQLite through `rusqlite` so the runtime does not depend on a host library. Persist only Soyuz-owned run identity and bounded recovery/callback metadata.
+Use a migration-managed SQLite database in the configured durable state directory. Enable WAL, a busy timeout, foreign-key checks, transactional compare-and-set transitions, and explicit schema-version rejection. Bundle SQLite through `rusqlite` so the runtime does not depend on a host library. Persist Soyuz-owned run identity, complete normalized execution descriptors required for restart recovery, bounded recovery metadata, and typed callback payloads. Restrict local state directory/database permissions and remove descriptors only after terminal state and callback delivery.
 
 ## Suitability assessment
 
@@ -18,7 +18,7 @@ SQLite is embedded, transactional, and adequate for one process with one active 
 ## Rejected alternatives
 
 - A JSON state file: no transactions or database-enforced uniqueness for callback/claim IDs.
-- Postgres or another network database: adds an operational dependency without a Phase 1 multi-host shared-state requirement.
+- Postgres or another network database: adds an operational dependency without a single-host execution-slot requirement. SQLite is not a multi-host lock or scheduler.
 - In-memory state: loses claim intent, authorization, and callback recovery on restart.
 - Importing Kaseki state: couples a clean implementation to legacy formats and is explicitly outside this phase.
 

@@ -28,6 +28,22 @@ fn valid_contract_v1_queue_envelope_deserializes_without_confusing_identifiers()
 }
 
 #[test]
+fn worker_id_policy_is_1_to_64_ascii_alphanumeric_hyphen_or_underscore() {
+    let maximum = "w".repeat(64);
+    assert_eq!(WorkerId::parse(maximum.clone()).unwrap().as_str(), maximum);
+    assert!(WorkerId::parse("w".repeat(65)).is_err());
+    for invalid in ["host.name", "host:name", "host name", "høst"] {
+        assert!(WorkerId::parse(invalid).is_err(), "accepted {invalid:?}");
+    }
+    let worker = WorkerId::parse("fossil_host-01").unwrap();
+    let serialized = serde_json::to_string(&worker).unwrap();
+    assert_eq!(
+        serde_json::from_str::<WorkerId>(&serialized).unwrap(),
+        worker
+    );
+}
+
+#[test]
 // Soyuz requirement: QUEUE-MESSAGE-01.
 fn unknown_contract_versions_are_rejected() {
     assert!(matches!(
@@ -42,6 +58,135 @@ fn malformed_or_non_https_queue_messages_are_not_validated_work() {
     assert!(QueueEnvelope::parse(b"{not-json").is_err());
 
     assert!(QueueEnvelope::parse(include_bytes!("fixtures/queue-v1-invalid-url.json")).is_err());
+}
+
+#[test]
+// Soyuz requirements: CONTRACT-VERSION-01, QUEUE-MESSAGE-01, RUN-VALIDATE-01.
+fn minimal_request_uses_soyuz_normalized_defaults() {
+    let value = serde_json::json!({
+        "contractVersion": "1",
+        "runId": RUN_ID,
+        "createdAt": "2026-10-02T12:00:00.000Z",
+        "correlationId": "15870068-6723-4b70-9e9f-53b8271e032d",
+        "requestId": "7867a1e3-ed9d-4f23-81b0-0b47c6831cdd",
+        "request": {
+            "repoUrl": "https://github.com/example/service",
+            "taskPrompt": "Add a health endpoint."
+        }
+    });
+
+    let envelope = QueueEnvelope::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let request = serde_json::to_value(envelope.request).unwrap();
+    assert_eq!(request["ref"], "main");
+    assert_eq!(request["taskMode"], "patch");
+    assert_eq!(request["publishMode"], "pr");
+    assert!(request.get("projectName").is_none());
+    assert!(request.get("allowlist").is_none());
+}
+
+#[test]
+fn absent_optional_allowlist_fields_remain_absent_when_persisted() {
+    let fixture = include_str!("fixtures/queue-v1-valid.json").replace(
+        "\"taskMode\":\"patch\"",
+        "\"allowlist\":{},\"taskMode\":\"patch\"",
+    );
+    let message = QueueEnvelope::parse(fixture.as_bytes()).unwrap();
+    let serialized = serde_json::to_value(&message.request).unwrap();
+    assert_eq!(serialized["allowlist"], serde_json::json!({}));
+}
+
+#[test]
+// Soyuz requirements: RUN-VALIDATE-01 and QUEUE-MESSAGE-01.
+fn fully_populated_request_preserves_supported_execution_options() {
+    let envelope = QueueEnvelope::parse(include_bytes!("fixtures/queue-v1-full.json")).unwrap();
+    let request = serde_json::to_value(envelope.request).unwrap();
+    assert_eq!(request["projectName"], "example-service");
+    assert_eq!(request["changedFilesAllowlist"][0], "src/**");
+    assert_eq!(request["allowlist"]["include"][0], "README.md");
+    assert_eq!(request["maxDiffBytes"], 200_000);
+    assert_eq!(request["validation"]["autoLintCleanup"]["enabled"], true);
+    assert_eq!(request["goalSetting"]["model"], "gpt-test");
+    assert_eq!(request["scouting"]["timeoutSeconds"], 60);
+    assert_eq!(request["goalCheck"]["maxRetries"], 2);
+    assert_eq!(request["runEvaluation"]["enabled"], true);
+    assert_eq!(request["startupCheckMode"], "baseline-validation");
+    assert_eq!(request["timeoutSeconds"], 3600);
+    assert_eq!(
+        request["tracing"]["correlationId"],
+        "15870068-6723-4b70-9e9f-53b8271e032d"
+    );
+    assert_eq!(
+        request["idempotencyKey"],
+        "d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133"
+    );
+}
+
+#[test]
+// Soyuz requirements: RUN-VALIDATE-01 and QUEUE-MESSAGE-01.
+fn unsupported_and_unknown_request_options_fail_closed() {
+    let fixture = include_str!("fixtures/queue-v1-valid.json");
+    let with_webhook = fixture.replace(
+        "\"request\":{",
+        "\"request\":{\"webhookConfig\":{\"secret\":\"must-not-be-kept\"},",
+    );
+    let with_unknown_security_option =
+        fixture.replace("\"request\":{", "\"request\":{\"skipAuthorization\":true,");
+    assert!(QueueEnvelope::parse(with_webhook.as_bytes()).is_err());
+    assert!(QueueEnvelope::parse(with_unknown_security_option.as_bytes()).is_err());
+}
+
+#[test]
+// Soyuz requirement: RUN-VALIDATE-01.
+fn invalid_modes_nested_settings_and_missing_fields_are_rejected() {
+    let fixture = include_str!("fixtures/queue-v1-valid.json");
+    for invalid in [
+        fixture.replace("\"taskMode\":\"patch\"", "\"taskMode\":\"unrestricted\""),
+        fixture.replace(
+            "\"publishMode\":\"pr\"",
+            "\"publishMode\":\"upload_everything\"",
+        ),
+        fixture.replace(
+            "\"taskMode\":\"patch\"",
+            "\"validationCommands\":[\"\"],\"taskMode\":\"patch\"",
+        ),
+        fixture.replace(
+            "\"taskMode\":\"patch\"",
+            "\"goalCheck\":{\"maxRetries\":6},\"taskMode\":\"patch\"",
+        ),
+        fixture.replace(
+            ",\"taskPrompt\":\"Add a health endpoint and update the API documentation.\"",
+            "",
+        ),
+        fixture.replace("\"repoUrl\":\"https://github.com/example/service\",", ""),
+        fixture.replace("https://github.com/example/service", "file:///tmp/repo"),
+    ] {
+        assert!(QueueEnvelope::parse(invalid.as_bytes()).is_err());
+    }
+}
+
+#[test]
+// Soyuz requirement: RUN-VALIDATE-01.
+fn nested_string_and_collection_limits_are_enforced() {
+    let fixture = include_str!("fixtures/queue-v1-valid.json");
+    let request_prefix = &fixture[..fixture.find("\"request\":{").unwrap() + "\"request\":{".len()];
+    let commands = vec!["\"x\""; 51].join(",");
+    let request_suffix = &fixture[fixture.find("\"repoUrl\"").unwrap()..];
+    let too_many_commands =
+        format!("{request_prefix}\"validationCommands\":[{commands}],{request_suffix}");
+    let too_long_model = fixture.replace(
+        "\"taskMode\":\"patch\"",
+        &format!(
+            "\"goalSetting\":{{\"model\":\"{}\"}},\"taskMode\":\"patch\"",
+            "m".repeat(201)
+        ),
+    );
+    let invalid_allowlist = include_str!("fixtures/queue-v1-full.json").replace(
+        "\"changedFilesAllowlist\":[\"src/**\"]",
+        "\"changedFilesAllowlist\":[\"\"]",
+    );
+    assert!(QueueEnvelope::parse(too_many_commands.as_bytes()).is_err());
+    assert!(QueueEnvelope::parse(too_long_model.as_bytes()).is_err());
+    assert!(QueueEnvelope::parse(invalid_allowlist.as_bytes()).is_err());
 }
 
 #[test]
@@ -73,10 +218,6 @@ fn lifecycle_accepts_only_the_ordered_authorized_path() {
         LocalLifecycleState::MessageValidated,
         LocalLifecycleState::CanonicalRunChecked,
         LocalLifecycleState::ClaimIntentPersisted,
-        LocalLifecycleState::ClaimAuthorized,
-        LocalLifecycleState::StartAuthorizationPersisted,
-        LocalLifecycleState::ExecutionActive,
-        LocalLifecycleState::ExecutionTerminal,
     ];
     for pair in states.windows(2) {
         assert!(
@@ -86,6 +227,10 @@ fn lifecycle_accepts_only_the_ordered_authorized_path() {
             pair[1]
         );
     }
+    assert!(matches!(
+        LocalLifecycleState::ClaimIntentPersisted.transition(LocalLifecycleState::ClaimAuthorized),
+        Err(LifecycleError::InvalidTransition { .. })
+    ));
 }
 
 #[test]
