@@ -1,7 +1,7 @@
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_soyuz::{
-    OperationalEvent, SoyuzApi, SoyuzClient, SoyuzClientConfig, SoyuzClientError, SoyuzRunRead,
-    StartAuthorizationSource, StartedRequest, WorkerClaimRequest,
+    CompletedCallback, OperationalEvent, SoyuzApi, SoyuzClient, SoyuzClientConfig,
+    SoyuzClientError, SoyuzRunRead, StartAuthorizationSource, StartedRequest, WorkerClaimRequest,
 };
 use secrecy::SecretString;
 use serde_json::json;
@@ -251,6 +251,40 @@ async fn uncertain_start_reconciliation_requires_matching_canonical_worker_and_c
 }
 
 #[tokio::test]
+// Soyuz requirements: WORKER-START-01 and CANCEL-RUNNING-01.
+async fn cancel_requested_canonical_state_never_reconciles_as_start_authorization() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/worker/runs/{RUN_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "runId": RUN_ID,
+                "displayId": "soyuz-213",
+                "status": "cancel_requested",
+                "cancelRequestedAt": "2026-10-02T12:00:01.000Z",
+                "claimExpiresAt": "2026-10-02T12:02:00.000Z",
+                "workerId": WORKER_ID,
+                "claimCallbackId": CLAIM_ID,
+                "stage": "running",
+                "updatedAt": "2026-10-02T12:00:01.000Z",
+                "lastHeartbeatAt": "2026-10-02T12:00:00.000Z",
+                "operationalHealth": "healthy"
+            },
+            "requestId": "request-cancelled"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = SoyuzClient::new(client_config(&server, Duration::from_secs(1))).unwrap();
+    assert!(matches!(
+        client
+            .reconcile_started(run_id(), event_id(), worker_id(), claim_id())
+            .await,
+        Err(SoyuzClientError::Conflict)
+    ));
+}
+
+#[tokio::test]
 // Soyuz requirements: WORKER-EVENT-01 and CALLBACK-IDEMPOTENCY-01.
 async fn callback_retry_reuses_event_id_and_event_payload() {
     let server = MockServer::start().await;
@@ -261,7 +295,7 @@ async fn callback_retry_reuses_event_id_and_event_payload() {
             "eventId": EVENT_ID,
             "workerId": WORKER_ID,
             "claimCallbackId": CLAIM_ID,
-            "type": "progress_update",
+            "type": "progress.updated",
             "stage": "validation",
             "timestamp": "2026-10-02T12:00:00.000Z"
         })))
@@ -287,4 +321,86 @@ async fn callback_retry_reuses_event_id_and_event_payload() {
     };
     client.event(event.clone()).await.unwrap();
     client.event(event).await.unwrap();
+}
+
+#[tokio::test]
+// Soyuz requirements: WORKER-COMPLETE-01 and CALLBACK-IDEMPOTENCY-01.
+async fn completed_callback_sends_bounded_outcome_summary_with_stable_fence() {
+    let server = MockServer::start().await;
+    let outcome_summary = json!({
+        "schemaVersion": 1,
+        "evaluation": {
+            "assessment": "good",
+            "reviewerConfidence": "high",
+            "taskCompletionScore": 4,
+            "improvementCategories": []
+        }
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/worker/runs/{RUN_ID}/completed")))
+        .and(body_json(json!({
+            "contractVersion": "1",
+            "callbackId": EVENT_ID,
+            "workerId": WORKER_ID,
+            "claimCallbackId": CLAIM_ID,
+            "completedAt": "2026-10-02T12:00:00.000Z",
+            "exitCode": 0,
+            "summary": "Changes validated",
+            "publishedUrl": "https://example.test/pull/7",
+            "changedFileCount": 3,
+            "outcomeSummary": outcome_summary
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"status": "completed"},
+            "requestId": "completed-request"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = SoyuzClient::new(client_config(&server, Duration::from_secs(1))).unwrap();
+    client
+        .completed(CompletedCallback {
+            run_id: run_id(),
+            callback_id: event_id(),
+            worker_id: worker_id(),
+            claim_callback_id: Some(claim_id()),
+            completed_at: Some("2026-10-02T12:00:00.000Z".to_owned()),
+            exit_code: Some(0),
+            summary: Some("Changes validated".to_owned()),
+            published_url: Some(url::Url::parse("https://example.test/pull/7").unwrap()),
+            changed_file_count: Some(3),
+            outcome_summary: Some(outcome_summary),
+        })
+        .await
+        .unwrap();
+}
+
+#[test]
+fn outcome_summary_schema_rejects_unknown_fields_and_malformed_values() {
+    assert!(fossil_soyuz::valid_outcome_summary(&json!({
+        "schemaVersion": 1,
+        "evaluation": {
+            "assessment": "good",
+            "reviewerConfidence": "high",
+            "improvementCategories": []
+        }
+    })));
+    assert!(!fossil_soyuz::valid_outcome_summary(&json!({
+        "schemaVersion": 1,
+        "evaluation": {
+            "assessment": "good",
+            "reviewerConfidence": "high",
+            "improvementCategories": [],
+            "ignoredControl": true
+        }
+    })));
+    assert!(!fossil_soyuz::valid_outcome_summary(&json!({
+        "schemaVersion": 1,
+        "evaluation": {
+            "assessment": "unrecognized",
+            "reviewerConfidence": "high",
+            "improvementCategories": []
+        }
+    })));
 }

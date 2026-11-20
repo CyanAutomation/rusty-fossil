@@ -1,56 +1,69 @@
 # Rusty-Fossil
 
-Rusty-Fossil is a clean-room Rust controller foundation for repository coding work. **Soyuz is the only run-control plane**: it authenticates submissions, assigns canonical run IDs, records run state, and publishes Queue messages. Soyuz is not the LLM gateway and does not run the coding agent.
+Rusty-Fossil is the host-side controller foundation for disposable repository workers. **Soyuz is the only run-control authority**: it accepts submissions, assigns canonical run IDs, owns lifecycle and cancellation state, and publishes Cloudflare Queue messages. Rusty-Fossil has no submission endpoint or local-run fallback.
 
-This Phase 0/1 prototype provides the architecture and contract baseline, a typed Soyuz worker client, a migration-managed SQLite store, and local health, readiness, and Prometheus metrics endpoints. It deliberately does not consume production Queue messages, create Docker workers, or execute coding tasks. Readiness stays false until a later phase supplies the protected intake and execution lifecycle.
-
-There is no Rusty-Fossil task-submission endpoint or local execution command. A local run record can represent only a run that Soyuz already owns.
+Phase 2A adds a Cloudflare Queue HTTP pull adapter, strict contract-v1 request validation, a durable authorization coordinator, restart-safe execution descriptors, fenced claim/start proofs, a single local handoff slot, and a retryable callback outbox. The transport and coordinator are implemented for mock-driven use, but the production service does not start Queue polling. Docker execution and coding-task execution are not implemented. `/ready` therefore remains false.
 
 ## Workspace
 
-- `crates/fossil-core` — canonical identifiers, contract-v1 Queue envelope, external statuses, and the local lifecycle rules.
-- `crates/fossil-soyuz` — typed worker requests and reads, bounded transport, error classification, and start-authorization proofs.
-- `crates/fossil-storage` — SQLite migrations, transactional lifecycle updates, claim fencing, recovery metadata, and a bounded callback outbox.
-- `crates/rusty-fossil` — controller binary and read-only diagnostics API.
-- `docs/` — contract findings, architecture, compatibility inventory, decisions, and roadmap.
+- `crates/fossil-core` — canonical IDs, normalized Soyuz request schema, Queue parsing, and local lifecycle rules.
+- `crates/fossil-queue` — Cloudflare HTTP pull, ack/retry, response bounds, backoff, shutdown handling, and transport counters.
+- `crates/fossil-soyuz` — worker API client, claim/start/canonical proofs, callback requests, and bounded error classification.
+- `crates/fossil-storage` — SQLite migrations, private local state, durable descriptors and intents, one-slot reservation, recovery, and callback outbox.
+- `crates/rusty-fossil` — controller configuration, authorization coordinator, read-only diagnostics, and callback replay logic.
+- `docs/` — contracts, architecture, compatibility evidence, decisions, and follow-on plan.
 
-## Requirements
+## Authorization path
 
-- Rust stable. The declared minimum is Rust 1.89; `rust-toolchain.toml` selects stable and `Cargo.lock` pins resolved dependencies.
-- Docker and Docker Compose only for building or running the packaged controller. The Phase 1 service does not need a Docker socket or daemon.
+```mermaid
+sequenceDiagram
+    participant Q as Cloudflare Queue
+    participant C as Rusty-Fossil coordinator
+    participant DB as Local SQLite
+    participant S as Soyuz
+    Q->>C: pull one leased message
+    C->>C: decode base64 and validate full contract-v1 request
+    C->>DB: persist observed run, descriptor and intake slot
+    C->>S: GET canonical run
+    C->>DB: persist claim intent and stable claim callback ID
+    C->>S: POST claim with worker ID and fence
+    S-->>C: accepted claim, or reconcile canonical owner/fence
+    C->>DB: persist claim proof and stable started callback ID
+    C->>S: POST started
+    S-->>C: start accepted
+    C->>DB: persist start proof
+    C->>S: final canonical authorization check
+    C->>DB: confirm durable proof against the reserved slot
+    C->>Q: ack lease only after durable authorized handoff
+    Note over C,Q: No worker is launched in Phase 2A.
+```
 
-There are no JavaScript or TypeScript sources in this phase.
+The canonical run UUID is the deduplication key. Queue message and lease IDs are transport identities only. The database retains the complete normalized request needed for restart recovery; SQLite files and their directory are restricted to the service account. Terminal callback intents are stored with local terminal transitions in one transaction.
 
-## Build and run
+## Build and local diagnostics
+
+Requirements: Rust stable (minimum 1.89). Docker/Compose can build and run the controller image, but the controller has no Docker socket access.
 
 ```sh
 cargo build --workspace --release --locked
 cargo run -p rusty-fossil
 ```
 
-The service binds to `127.0.0.1:8080` by default and creates `./state/fossil.sqlite3`. It can start without Soyuz credentials for local diagnostics; `/ready` reports the missing configuration and Phase 1 limitations with HTTP 503.
+The service binds to `127.0.0.1:8080` by default and creates `./state/fossil.sqlite3`.
 
-```sh
-curl -i http://127.0.0.1:8080/health
-curl -i http://127.0.0.1:8080/ready
-curl http://127.0.0.1:8080/metrics
-```
+- `GET /health` reports process liveness.
+- `GET /ready` reports configuration, local state, Queue probe, recovery backlog, handoff readiness, and missing execution capabilities. It returns 503 because Queue intake is disabled and Docker execution is absent.
+- `GET /metrics` reports read-only diagnostics, callback backlog, and local slot availability.
 
-Only these read-only HTTP routes exist:
-
-- `GET /health` — process liveness.
-- `GET /ready` — readiness for execution work; false in Phase 1.
-- `GET /metrics` — controller and diagnostic request counters.
-
-There are no `POST /runs`, `POST /execute`, retry, claim, or start routes.
+There are no `POST /runs`, `POST /execute`, retry, claim, or start routes. Queue intake must not be enabled in Compose or in a production deployment as part of Phase 2A.
 
 ## Configuration
 
-Use mounted files for `SOYUZ_WORKER_API_TOKEN` and `CLOUDFLARE_QUEUE_TOKEN`; environment values are supported for local tests. The worker token and Queue read/write token are separate. Client submission credentials are not accepted or required.
+Use mounted secret files for `SOYUZ_WORKER_API_TOKEN` and `CLOUDFLARE_QUEUE_TOKEN`; direct values are supported for local mock tests. The Soyuz worker token and Cloudflare Queue read/write token are separate. Configure `SOYUZ_API_ORIGIN`, `SOYUZ_WORKER_ID`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_QUEUE_ID` as needed. Worker IDs remain restricted to 1–64 ASCII letters, digits, `-`, or `_`.
 
-Start from `.env.example` and see [the configuration notes](docs/CONTRACTS.md#configuration-boundary). Soyuz and Queue values are optional only for running diagnostics: without all required values Rusty-Fossil cannot become execution-ready. Even with complete configuration, production intake and execution remain unavailable in this phase.
+See [Soyuz and Queue contract notes](docs/CONTRACTS.md#configuration-boundary) and `.env.example`. Configuration validity alone does not enable intake or mark coding execution ready.
 
-## Tests and checks
+## Checks
 
 ```sh
 cargo fmt --all -- --check
@@ -59,25 +72,12 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
-The deterministic Queue and worker protocol fixtures do not use production credentials. Mock HTTP integration tests use an ephemeral localhost port. CI also checks Linux AMD64 and ARM64 builds and runs `cargo audit` against the lockfile.
+Protocol and coordinator tests use local HTTP mocks and no production credentials, public network, paid inference, Docker daemon, or GitHub publication credentials. CI additionally checks Linux AMD64 and ARM64 builds and audits dependencies.
 
-## Local container
+## Design documents
 
-Create two secret files before using Compose:
-
-```sh
-mkdir -p secrets
-: > secrets/soyuz_worker_api_token
-: > secrets/cloudflare_queue_token
-docker compose up --build
-```
-
-The Compose port is published on host loopback and the state directory is persistent. It has no production Queue consumer configured or enabled. Readiness stays false while Phase 1 intake and execution are absent.
-
-## Design and compatibility
-
-- [Architecture and trust boundary](docs/ARCHITECTURE.md)
+- [Architecture and recovery boundaries](docs/ARCHITECTURE.md)
 - [Soyuz and Cloudflare contracts](docs/CONTRACTS.md)
-- [Kaseki compatibility inventory](docs/COMPATIBILITY.md)
+- [Compatibility inventory](docs/COMPATIBILITY.md)
 - [Architecture decisions](docs/DECISIONS/)
-- [Implementation plan](docs/IMPLEMENTATION-PLAN.md)
+- [Implementation plan and Phase 2A-S / 2B prerequisites](docs/IMPLEMENTATION-PLAN.md)

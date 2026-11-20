@@ -33,7 +33,10 @@ impl ApiState {
     }
 
     fn readiness(&self) -> ReadinessReport {
-        self.config.readiness_report(self.store.run_count().is_ok())
+        let state_store_ready = self.store.run_count().is_ok();
+        let recovery_backlog_healthy = self.store.execution_capacity_available().unwrap_or(false);
+        self.config
+            .readiness_report_with_state(state_store_ready, recovery_backlog_healthy, None)
     }
 }
 
@@ -47,9 +50,12 @@ struct HealthResponse {
 struct ReadyResponse {
     ready: bool,
     execution_ready: bool,
+    execution_handoff_ready: bool,
     state_store_ready: bool,
     soyuz_configured: bool,
     queue_configured: bool,
+    queue_transport_healthy: Option<bool>,
+    recovery_backlog_healthy: bool,
     missing_dependencies: Vec<String>,
     limitations: Vec<String>,
 }
@@ -59,9 +65,12 @@ impl From<ReadinessReport> for ReadyResponse {
         Self {
             ready: report.ready,
             execution_ready: report.execution_ready,
+            execution_handoff_ready: report.execution_handoff_ready,
             state_store_ready: report.state_store_ready,
             soyuz_configured: report.soyuz_configured,
             queue_configured: report.queue_configured,
+            queue_transport_healthy: report.queue_transport_healthy,
+            recovery_backlog_healthy: report.recovery_backlog_healthy,
             missing_dependencies: report.missing_dependencies,
             limitations: report.limitations,
         }
@@ -104,6 +113,10 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         .metrics_requests
         .fetch_add(1, Ordering::Relaxed);
     let ready = u8::from(state.readiness().execution_ready);
+    let (callbacks_pending, callbacks_blocked) =
+        state.store.callback_outbox_counts().unwrap_or_default();
+    let execution_slot_available =
+        u8::from(state.store.execution_capacity_available().unwrap_or(false));
     let body = format!(
         "# HELP fossil_controller_up Whether the Rusty-Fossil process is live.\n\
          # TYPE fossil_controller_up gauge\n\
@@ -115,10 +128,22 @@ async fn metrics(State(state): State<ApiState>) -> Response {
          # TYPE fossil_http_requests_total counter\n\
          fossil_http_requests_total{{route=\"health\"}} {}\n\
          fossil_http_requests_total{{route=\"ready\"}} {}\n\
-         fossil_http_requests_total{{route=\"metrics\"}} {}\n",
+         fossil_http_requests_total{{route=\"metrics\"}} {}\n\
+         # HELP fossil_callbacks_pending Number of callbacks awaiting delivery.\n\
+         # TYPE fossil_callbacks_pending gauge\n\
+         fossil_callbacks_pending {}\n\
+         # HELP fossil_callbacks_blocked Number of callbacks requiring operator review.\n\
+         # TYPE fossil_callbacks_blocked gauge\n\
+         fossil_callbacks_blocked {}\n\
+         # HELP fossil_execution_slot_available Whether local recovery state permits Queue intake.\n\
+         # TYPE fossil_execution_slot_available gauge\n\
+         fossil_execution_slot_available {}\n",
         state.metrics.health_requests.load(Ordering::Relaxed),
         state.metrics.readiness_requests.load(Ordering::Relaxed),
         state.metrics.metrics_requests.load(Ordering::Relaxed),
+        callbacks_pending,
+        callbacks_blocked,
+        execution_slot_available,
     );
     (
         [(
