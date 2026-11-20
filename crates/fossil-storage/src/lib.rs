@@ -1258,8 +1258,9 @@ impl SqliteStore {
         now_ms: i64,
         retry_at_ms: i64,
     ) -> Result<u32, StoreError> {
-        let connection = self.lock()?;
-        let changed = connection.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE callback_outbox
              SET attempts = attempts + 1, next_eligible_at_ms = ?3,
                  failure_class = NULL, updated_at_ms = ?2
@@ -1269,11 +1270,12 @@ impl SqliteStore {
         if changed != 1 {
             return Err(StoreError::CallbackNotEligible);
         }
-        let attempts = connection.query_row(
+        let attempts = transaction.query_row(
             "SELECT attempts FROM callback_outbox WHERE event_id = ?1",
             [event_id.to_string()],
             |row| row.get(0),
         )?;
+        transaction.commit()?;
         Ok(attempts)
     }
 
@@ -1358,7 +1360,7 @@ impl SqliteStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let (run_id, kind, delivery_state) = entry.ok_or(StoreError::RunNotFound)?;
+        let (run_id, kind, delivery_state) = entry.ok_or(StoreError::CallbackNotEligible)?;
         let operation_matches = match authorization.operation() {
             "event" => matches!(kind.as_str(), "event" | "heartbeat"),
             "completed" | "failed" | "cancelled" => kind == authorization.operation(),
