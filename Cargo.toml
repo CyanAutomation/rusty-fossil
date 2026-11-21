@@ -5,6 +5,7 @@ members = [
     "crates/fossil-soyuz",
     "crates/fossil-senku",
     "crates/fossil-queue",
+    "crates/fossil-supervisor",
     "crates/rusty-fossil",
 ]
 resolver = "2"

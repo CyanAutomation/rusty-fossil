@@ -4,7 +4,7 @@
 
 Rusty-Fossil is the host controller for a future disposable coding worker. Soyuz is the mandatory control plane and canonical run ledger. Soyuz authenticates submissions, assigns the canonical UUIDv7, owns lifecycle and cancellation state, and publishes the Queue message. Rusty-Fossil has no submission route and treats Queue data as untrusted input. It cannot start work without Soyuz claim and start evidence.
 
-Phase 2A.1 implements durable reconciliation and Queue/outbox hardening; Phase 2A-S adds the optional Senku advisory client. `AuthorizationCoordinator::run` supervises Queue polling and recovery together, while `RecoveryManager::run` can run reconciliation independently. The production service does not construct either loop. No Docker process or coding runtime exists in this phase.
+Phase 2A.1 implements durable reconciliation and Queue/outbox hardening; Phase 2A-S adds the optional Senku advisory client. `AuthorizationCoordinator::run` supervises Queue polling and recovery together, while `RecoveryManager::run` can run reconciliation independently. The production service does not construct either loop. The `fossil-supervisor` crate currently defines the proof-gated synthetic supervisor contract and deterministic mock only. It has no Docker Engine implementation, durable launch states, or production runtime wiring; a Docker supervisor process must independently revalidate the persisted handoff and fresh Soyuz state before this boundary can be used for real containers.
 
 ```mermaid
 flowchart LR
@@ -123,6 +123,7 @@ The descriptor includes `taskPrompt` and can contain repository configuration. I
 | `fossil-soyuz` | Worker API client, strict callback request models, canonical read and unforgeable claim/start/gate proofs. |
 | `fossil-storage` | SQLite migrations, secure local state, immutable execution descriptors and IDs, atomic slot reservation, recovery queries, bounded callback outbox. |
 | `fossil-senku` | Five Kaseki profile request types, bounded/redacted evidence, authenticated transport, strict response validation and per-profile client counters. |
+| `fossil-supervisor` | Proof-gated fixed synthetic scenario contract and deterministic mock. No Docker backend or IPC service is implemented yet. |
 | `rusty-fossil` | Configuration, coordinator, RecoveryManager, callback replay, advisory task-admission seam, and read-only Axum diagnostics. |
 
 ## SQLite and transaction boundaries
