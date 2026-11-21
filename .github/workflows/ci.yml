@@ -47,6 +47,36 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  synthetic-worker-multiplatform:
+    name: Build synthetic worker (AMD64 and ARM64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build both supported worker architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.synthetic-worker
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=oci,dest=/tmp/synthetic-worker.oci
+
+  docker-integration:
+    name: Run the Soyuz-gated worker on Docker Engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the synthetic worker for the runner
+        run: docker build --platform linux/amd64 -f Dockerfile.synthetic-worker -t rusty-fossil-synthetic-worker:test .
+      - name: Capture the immutable local image ID
+        run: echo "FOSSIL_SUPERVISOR_TEST_IMAGE=$(docker image inspect --format '{{.Id}}' rusty-fossil-synthetic-worker:test)" >> "$GITHUB_ENV"
+      - name: Run the authorized Docker lifecycle integration
+        run: cargo test -p fossil-supervisor --features test-support --test docker_engine --locked -- --ignored
+
   linux-targets:
     name: Cross build (${{ matrix.target }})
     runs-on: ubuntu-latest

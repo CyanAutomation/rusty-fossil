@@ -31,7 +31,7 @@ fn missing_soyuz_configuration_prevents_execution_readiness() {
     assert!(
         report
             .limitations
-            .contains(&"execution_runtime_not_implemented".to_owned())
+            .contains(&"synthetic_supervisor_not_wired".to_owned())
     );
 }
 
@@ -58,7 +58,7 @@ fn phase_one_limitations_block_execution_readiness_even_with_complete_configurat
     assert!(
         report
             .limitations
-            .contains(&"execution_runtime_not_implemented".to_owned())
+            .contains(&"synthetic_supervisor_not_wired".to_owned())
     );
 }
 
@@ -163,6 +163,9 @@ async fn health_ready_and_metrics_are_distinct_and_task_routes_do_not_exist() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["executionReady"], false);
     assert_eq!(json["executionHandoffReady"], false);
+    assert_eq!(json["dockerSupervisorAvailable"], serde_json::Value::Null);
+    assert_eq!(json["syntheticExecutionAvailable"], false);
+    assert_eq!(json["productionCodingExecutionReady"], false);
     assert_eq!(json["queueTransportHealthy"], serde_json::Value::Null);
     assert_eq!(json["recoveryBacklogHealthy"], true);
 
@@ -195,6 +198,10 @@ async fn health_ready_and_metrics_are_distinct_and_task_routes_do_not_exist() {
     let text = std::str::from_utf8(&body).unwrap();
     assert!(text.contains("fossil_controller_up 1"));
     assert!(text.contains("fossil_execution_ready 0"));
+    assert!(text.contains("fossil_docker_supervisor_probe_known 0"));
+    assert!(text.contains("fossil_docker_supervisor_available 0"));
+    assert!(text.contains("fossil_synthetic_execution_available 0"));
+    assert!(text.contains("fossil_production_coding_execution_ready 0"));
 }
 
 #[test]

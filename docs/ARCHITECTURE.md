@@ -4,7 +4,7 @@
 
 Rusty-Fossil is the host controller for a future disposable coding worker. Soyuz is the mandatory control plane and canonical run ledger. Soyuz authenticates submissions, assigns the canonical UUIDv7, owns lifecycle and cancellation state, and publishes the Queue message. Rusty-Fossil has no submission route and treats Queue data as untrusted input. It cannot start work without Soyuz claim and start evidence.
 
-Phase 2A.1 implements durable reconciliation and Queue/outbox hardening; Phase 2A-S adds the optional Senku advisory client. `AuthorizationCoordinator::run` supervises Queue polling and recovery together, while `RecoveryManager::run` can run reconciliation independently. The production service does not construct either loop. The `fossil-supervisor` crate currently defines the proof-gated synthetic supervisor contract and deterministic mock only. It has no Docker Engine implementation, durable launch states, or production runtime wiring; a Docker supervisor process must independently revalidate the persisted handoff and fresh Soyuz state before this boundary can be used for real containers.
+Phase 2A.1 implements durable reconciliation and Queue/outbox hardening; Phase 2A-S adds the optional Senku advisory client. Phase 2B adds a proof-gated Docker supervisor, durable container lifecycle journal, authenticated local IPC, and a fixed synthetic worker image. `AuthorizationCoordinator::run` remains opt-in, and the production service does not construct either Queue loop or supervisor client. Real containers start only when an explicitly configured supervisor receives an authenticated run-ID request and independently confirms durable local proof and fresh canonical Soyuz state.
 
 ```mermaid
 flowchart LR
@@ -16,9 +16,12 @@ flowchart LR
     Coordinator -.->|advisory task admission only| Senku[Senku decision API]
     Recovery[RecoveryManager] -->|canonical reconciliation| Soyuz
     Recovery --> SQLite
-    Coordinator -.->|Phase 2B proof-gated handoff| Supervisor[Worker supervisor]
-    Supervisor -.-> Worker[Disposable worker image]
-    Worker -.->|events, heartbeat, terminal result| Coordinator
+    Coordinator -->|authenticated run ID over private Unix socket| Supervisor[fossil-supervisord]
+    Supervisor -->|restricted Engine API calls| Docker[Docker Engine]
+    Docker --> Worker[Fixed synthetic worker image]
+    Supervisor -->|fresh canonical gate| Soyuz
+    Supervisor -->|durable terminal callback intent| SQLite
+    Coordinator -->|callback outbox replay| Soyuz
 ```
 
 ## Intake and authorization sequence
@@ -29,6 +32,9 @@ sequenceDiagram
     participant C as Coordinator
     participant D as SQLite
     participant S as Soyuz
+    participant I as Supervisor IPC
+    participant X as fossil-supervisord
+    participant E as Docker Engine
     Q->>C: pull one message and lease
     C->>C: base64 decode, cap and validate contract-v1
     C->>D: persist run, descriptor and exclusive intake slot
@@ -44,15 +50,84 @@ sequenceDiagram
     C->>D: persist accepted start proof
     C->>S: GET canonical state and verify run, worker and claim fence
     C->>D: confirm persisted start proof against the reserved slot
-    C->>Q: acknowledge only after durable authorized handoff
-    Note over C: Phase 2A does not launch a worker.
+    C->>I: authenticated launch(runId), only when configured
+    I->>X: narrow request; no prompt, image or command
+    X->>D: reload descriptor, proof, fence and reserved slot
+    X->>S: fresh canonical authorization
+    X->>D: persist deterministic launch intent and create request
+    X->>E: create fixed-profile container by exact image digest
+    E-->>X: persist container ID and effective profile
+    X->>S: recheck gate immediately before a new start
+    X->>E: start, inspect, monitor and stop exact container
+    E-->>X: bounded logs and exit/resource result
+    X->>D: persist terminal result and callback intent atomically
+    X->>E: remove only the exact labeled container
+    X->>D: release slot after confirmed cleanup
+    C->>S: replay terminal callback from outbox
+    C->>Q: acknowledge only after durable supervisor handoff
+    Note over C,X: Process startup does not poll Queue or launch work.
 ```
 
-The implementation persists claim and start callback IDs before the corresponding network request. After an uncertain result it reuses the same ID and reconciles against Soyuz; it does not generate a speculative replacement. The final gate requires canonical `running` state, matching worker and claim callback ID, and no cancellation timestamp. `ExecutionGateAuthorization` has private fields and storage checks the run, worker, claim, start callback, descriptor, and reserved slot before marking a handoff active.
+The implementation persists claim and start callback IDs before the corresponding network request. After an uncertain result it reuses the same ID and reconciles against Soyuz; it does not generate a speculative replacement. The final gate requires canonical `running` state, matching worker and claim callback ID, and no cancellation timestamp. `ExecutionGateAuthorization` has private fields and storage checks the run, worker, claim, start callback, descriptor, and reserved slot before marking a handoff active. The IPC request itself is not authorization: the supervisor reloads the persisted descriptor and proof and rereads Soyuz before creating or starting a container.
 
 ## Startup and periodic recovery
 
 The RecoveryManager enumerates nonterminal records and records with pending or blocked callbacks. It reloads the immutable descriptor and persisted identities, then enters the same canonical Soyuz validation and claim/start code used for a Queue delivery. The run can be invoked once at startup and on a timer without a Queue lease; callback replay runs on each supervisor cycle even when recovery blocks intake. The current service `main` does not construct this supervisor, so production recovery is not active until a controlled runtime rollout.
+
+`fossil-supervisord` runs a separate five-second reconciliation loop over Docker launch rows. It resumes only persisted launches, reattaches by deterministic name and stored container ID, and never repeats an ambiguous create. Confirmed running containers are monitored after restart; create/start uncertainty and missing or mismatched identity stay fenced for manual review. The controller and supervisor share the same private SQLite database under the same Unix account.
+
+```mermaid
+stateDiagram-v2
+    [*] --> LaunchIntentPersisted: proof and slot revalidated
+    LaunchIntentPersisted --> CreateRequested: persist create fence
+    CreateRequested --> ContainerCreated: inspect exact name and labels
+    CreateRequested --> ManualReviewRequired: missing after uncertainty window
+    ContainerCreated --> StartRequested: persist start fence
+    StartRequested --> ContainerRunning: fresh Soyuz gate and Docker inspection
+    StartRequested --> ContainerExited: worker exited before monitor attached
+    StartRequested --> ManualReviewRequired: identity or state ambiguous
+    ContainerRunning --> ContainerExited: Docker confirms exit
+    ContainerRunning --> StopRequested: persist cancellation, timeout or outage reason
+    StopRequested --> ContainerExited: Docker confirms stopped
+    StopRequested --> ManualReviewRequired: state cannot be proven
+    ContainerExited --> CleanupPending: terminal result and callback outbox commit
+    CleanupPending --> CleanupCompleted: exact container removed or already absent
+    CleanupPending --> CleanupPending: Docker unavailable; retain slot
+    ManualReviewRequired --> [*]: operator investigation only
+    CleanupCompleted --> [*]
+```
+
+`CreateRequested` and `StartRequested` are durable side-effect fences. Recovery inspects the same deterministic identity; it never creates a replacement when an earlier side effect may have succeeded. An absent container after a create/start/running fence is not proof that execution never happened, so the single slot stays reserved for review.
+
+```mermaid
+sequenceDiagram
+    participant X as fossil-supervisord
+    participant S as Soyuz
+    participant D as SQLite
+    participant E as Docker Engine
+    participant O as Callback outbox
+    X->>E: inspect exact running container
+    X->>S: read canonical run and claim fence
+    alt Soyuz requests cancellation
+        X->>D: persist stop_requested(cancelled)
+        X->>E: graceful stop within bounded grace
+        X->>E: force stop if still running; inspect terminal state
+        E-->>X: confirmed exit and timestamps
+        X->>D: persist cancelled result and stable callback ID
+    else runtime deadline reached
+        X->>D: persist stop_requested(timeout)
+        X->>E: graceful stop, then force stop if needed
+        E-->>X: confirmed exit and timestamps
+        X->>D: persist timeout failure and stable callback ID
+    else worker exits before stop intent
+        E-->>X: observed exit status wins race
+        X->>D: persist actual terminal result and callback ID
+    end
+    D->>O: terminal state and callback intent commit atomically
+    X->>E: remove only the matching managed container
+    X->>D: release slot after confirmed cleanup
+    Note over O: Existing controller callback replay delivers the stable event ID
+```
 
 ```mermaid
 sequenceDiagram
@@ -102,11 +177,17 @@ sequenceDiagram
 | Queue ack fails after handoff | Durable descriptor, authorization and slot | Redelivery recognizes local handoff and acknowledges without creating another handoff. |
 | Canonical owner is another worker | No local active execution | Mark superseded, release local slot, emit no callback, acknowledge duplicate. |
 | Restart with possibly active execution | Existing slot and nonterminal record | Do not launch a replacement automatically; operator/recovery policy must resolve it. |
+| Docker create request has uncertain outcome | `create_requested` and stable container name | Inspect that exact name and labels. Do not issue a second create; after the uncertainty window, require manual review. |
+| Docker start response is lost | `start_requested`, exact container identity | Inspect the same container. Reattach if running; if still created, recheck Soyuz before starting. |
+| Supervisor restarts during a confirmed run | Existing launch row, container name and ID | Reattach only to the matching container and continue cancellation, deadline and exit monitoring. |
+| Stop intent was persisted | `stop_requested` plus the first stop reason | Retry stop and inspection for that exact container, then finalize using that durable reason. |
+| Terminal result stored, cleanup incomplete | `cleanup_pending` and reserved slot | Retry exact-identity removal; do not admit another workload until cleanup completes. |
+| Expected container is missing after a side effect may have occurred | Create/start/running history remains | Mark manual review and never speculate a replacement. |
 | Callback result uncertain | Stable outbox event ID and payload | Retry after persisted deadline with the same logical request. |
 | Permanent callback rejection or stale fence | Outbox state `blocked`, classified failure | Surface in diagnostics and require operator review; do not mark delivered. |
 | Corrupt database or descriptor | Startup/read fails closed | Do not pull work; investigate or restore trusted state. |
 
-The target is at-most-once authorization per canonical run under the supported recovery assumptions. This is not an exactly-once guarantee across Cloudflare, Soyuz, SQLite, and a future Docker supervisor.
+The target is at-most-once container creation for one durably authorized run under the documented single-host SQLite and Docker identity assumptions. A lost Docker response is reconciled by deterministic name and immutable labels; if those observations cannot prove the container identity or state, execution remains fenced for manual review. This is not a distributed exactly-once guarantee across Cloudflare, Soyuz, SQLite and Docker.
 
 ## Request preservation and local state
 
@@ -123,7 +204,8 @@ The descriptor includes `taskPrompt` and can contain repository configuration. I
 | `fossil-soyuz` | Worker API client, strict callback request models, canonical read and unforgeable claim/start/gate proofs. |
 | `fossil-storage` | SQLite migrations, secure local state, immutable execution descriptors and IDs, atomic slot reservation, recovery queries, bounded callback outbox. |
 | `fossil-senku` | Five Kaseki profile request types, bounded/redacted evidence, authenticated transport, strict response validation and per-profile client counters. |
-| `fossil-supervisor` | Proof-gated fixed synthetic scenario contract and deterministic mock. No Docker backend or IPC service is implemented yet. |
+| `fossil-supervisor` | Proof-gated mock, Docker Engine backend, bounded container profile, crash recovery, authenticated Unix IPC server/client, and `fossil-supervisord` executable. |
+| `fossil-synthetic-worker` | Fixed Rust worker scenarios; no shell, repository checkout, credentials, network, or task-prompt interpretation. |
 | `rusty-fossil` | Configuration, coordinator, RecoveryManager, callback replay, advisory task-admission seam, and read-only Axum diagnostics. |
 
 ## SQLite and transaction boundaries
@@ -136,16 +218,17 @@ SQLite is appropriate for one controller host and one execution slot because loc
 | Claim | Stable claim intent is committed before network I/O. Soyuz proof is persisted before `/started`. |
 | Start | Stable start callback ID is committed before `/started`. Start proof is persisted only from client evidence or matching canonical read. |
 | Handoff | The unique slot is reserved before authorization to serialize different runs; the final canonical proof and persisted start proof are rechecked against that reservation before Queue ack. Generic lifecycle transitions cannot manufacture claim/start proofs. |
-| Terminal callback | Local terminal transition, callback payload and slot release can commit in one transaction. |
+| Docker launch | Deterministic container name, fixed scenario and authorization fence commit before the first Docker API side effect. A separate state row records create/start/stop/exit/cleanup progress. |
+| Terminal callback | Local terminal transition, stable callback payload and `cleanup_pending` commit atomically. The execution slot remains reserved until Docker removal or confirmed absence and cleanup completion. |
 | Callback attempt | Attempt count and next eligible timestamp are committed before network I/O. Delivery is marked only after a successful Soyuz response. |
 
 Outbox events have bounded typed payloads, worker identity, current claim fence, stable event ID, attempt count, next retry deadline and a low-cardinality failure class. Retry delay is capped exponential with stable per-event jitter. Permanent response classes and stale/conflicting claims become blocked for operator review. The outbox is limited to 1,000 pending or blocked entries; new intake stops at 999 outstanding entries to reserve one terminal callback slot. Existing run reservations are idempotently recoverable even after the threshold. Callback replay is independent of the execution slot; blocked entries are never deleted to clear backpressure. Successful delivery frees capacity. An operator may resolve a blocked entry only after verifying canonical Soyuz state and the exact callback identity.
 
 ## Readiness, metrics and service boundary
 
-`GET /health` reports process liveness. `GET /ready` distinguishes state-store health, Soyuz and Queue configuration, Queue transport probe state, recovery backlog, handoff readiness and the absence of an execution runtime. Readiness never calls inference, claims a run, or pulls a Queue message. Queue transport is shown as unprobed because the diagnostics server does not start the adapter.
+`GET /health` reports process liveness. `GET /ready` distinguishes state-store health, Soyuz and Queue configuration, Queue transport probe state, recovery backlog, handoff readiness and the absence of a production execution handoff. Readiness never calls inference, claims a run, or pulls a Queue message. Queue transport is shown as unprobed because the diagnostics server does not start the adapter. The Docker supervisor is packaged but the production controller does not construct its IPC client, Queue poller or callback replay loop; readiness reports `synthetic_supervisor_not_wired`.
 
-`GET /metrics` remains read-only and reports HTTP counters, callback pending/blocked counts and age, execution-slot availability, outbox and recovery intake blocking, recovery attempts/outcomes, ownership conflicts, ambiguous execution, and manual-review gauges. Recovery and Queue component snapshots expose more detailed counters. `fossil-senku` exposes per-profile attempts, successes, invalid responses, transport failures, degraded calls, and total duration. Senku and coordinator snapshots are not wired to the diagnostic endpoint while the production binary keeps both loops and the Senku client inactive. No metric labels contain prompts, request data, credentials, run IDs, or Queue leases.
+`GET /metrics` remains read-only and reports HTTP counters, callback pending/blocked counts and age, execution-slot availability, outbox and recovery intake blocking, recovery attempts/outcomes, ownership conflicts, ambiguous execution, and manual-review gauges. It also reports whether the controller has probed a supervisor, whether the supervisor is reachable, whether synthetic execution is wired, and whether production coding execution is ready. The probe remains unknown and the latter two gauges remain false while production `main` keeps the supervisor client inactive. Recovery and Queue component snapshots expose more detailed counters. `fossil-senku` exposes per-profile attempts, successes, invalid responses, transport failures, degraded calls, and total duration. Senku and coordinator snapshots are not wired to the diagnostic endpoint while the production binary keeps both loops and the Senku client inactive. No metric labels contain prompts, request data, credentials, run IDs, or Queue leases.
 
 The only service routes are `/health`, `/ready`, and `/metrics`. There is no submission, claim, retry, or execution route. The default listener is `127.0.0.1:8080`.
 
@@ -167,7 +250,11 @@ Senku is advisory. Its availability or result cannot authorize claims, starts, r
 
 ### Phase 2B: Docker worker execution
 
-Add a separate, narrowly scoped supervisor and non-root disposable worker image. The launch boundary must consume the durable start/gate proof and a descriptor reloaded from SQLite. Add CPU, memory, PID, disk, network, timeout and cleanup limits; cancellation must stop the child, collect bounded result fields, enqueue the terminal callback, then report it to Soyuz. Keep the Docker socket out of the controller container and do not auto-launch after ambiguous restart state.
+Implemented as a synthetic-only capability. `fossil-supervisord` is the only workspace process that opens the Docker Engine socket. It accepts only a canonical run ID over a private, token-authenticated Unix socket; the scenario and digest-pinned worker image come from supervisor runtime configuration. The controller can opt in through `AuthorizationCoordinator::with_supervisor_client`, but the service `main` does not construct the coordinator or poll Cloudflare Queue.
+
+The supervisor uses one durable execution slot, records deterministic launch identity before Docker create, verifies exact name/labels/image/effective security profile before start, checks Soyuz immediately before start, and reattaches only to that identity after restart. Missing or mismatched containers after a side effect may have happened become manual review. Cancellation and timeout persist stop intent before Docker's graceful stop signal, force-stop after a bounded grace period, persist the terminal result and outbox callback, then release the slot only after cleanup.
+
+The default resource profile is 500 millicores, 256 MiB memory with no swap, 32 PIDs, 16 MiB noexec/nosuid/nodev tmpfs, 15-minute maximum runtime, 5-second stop grace, no network, and Docker's default seccomp confinement with all capabilities dropped. A Docker-enabled CI job runs the real synthetic container. Production Queue polling, live Senku inference, Pi CLI, coding tasks and publication remain disabled.
 
 ## Rust and targets
 

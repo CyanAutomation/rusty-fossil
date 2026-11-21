@@ -80,7 +80,7 @@ The client does not create a new callback ID on retry. Only retryable network, t
 
 ## Readiness and operational limitations
 
-The diagnostics API is read-only. `/ready` reports state-store health, configuration validity, Queue transport health (unprobed unless an explicit probe is supplied), recovery backlog, handoff readiness, and runtime limitations. Readiness checks do not pull Queue messages, create claims or invoke inference. The production binary does not construct the coordinator or poller, so complete configuration does not enable production intake. Execution readiness remains false because no Docker runtime exists.
+The diagnostics API is read-only. `/ready` reports state-store health, configuration validity, Queue transport health (unprobed unless an explicit probe is supplied), recovery backlog, handoff readiness, optional Docker-supervisor availability, synthetic execution availability, production coding readiness, and runtime limitations. `dockerSupervisorAvailable: null` means this process has not probed the private supervisor IPC endpoint; it does not claim the daemon is healthy. Readiness checks do not pull Queue messages, create claims or invoke inference. Phase 2B adds a separate synthetic-only Docker supervisor, but production `main` does not construct the coordinator or poller, so complete configuration does not enable production intake. Readiness remains false for missing production runtime wiring and real coding execution. `/metrics` exports bounded gauges for supervisor probe state, synthetic availability and production coding readiness.
 
 Queue, coordinator and outbox counters are low-cardinality. They do not label runs, message bodies, prompts, repository names, callback text, secrets, or leases. The service exposes only `/health`, `/ready` and `/metrics`; there is no submission or task-starting endpoint.
 
@@ -124,6 +124,10 @@ Production Cloudflare Queue configuration is deliberately not modified here. Bef
 
 For a blocked callback, inspect the redacted failure class, pending age and stable callback/event ID, then verify current Soyuz state and worker fence. Do not delete a blocked row to clear capacity. Reconcile or resolve it through an operator-approved store procedure that preserves the callback's canonical identity; otherwise keep intake backpressured.
 
-## Phase 2B Docker prerequisites
+## Phase 2B Docker supervisor
 
-The future supervisor must accept only a locally persisted descriptor plus an exact durable start/gate proof. It must use one slot, non-root workers, strict CPU/memory/PID/disk/network/time limits, bounded output, cancellation cleanup and explicit restart policy. Keep Docker socket access out of the controller image and do not auto-launch after ambiguous restart state.
+The separate `fossil-supervisord` accepts an authenticated run ID over a private Unix socket. It reloads the descriptor, worker identity, claim fence, start authorization and reserved slot from the shared SQLite journal, then rereads canonical Soyuz state before creating a container and immediately before starting it. Queue acknowledgements and IPC requests are not launch authorization. The supervisor owns the Docker socket; the controller image does not receive it.
+
+Only the fixed synthetic worker image is accepted. The container runs as UID 65532 with a read-only root filesystem, all Linux capabilities dropped, `no-new-privileges`, no network, no host namespaces, no devices or mounts, capped tmpfs and JSON logs, bounded CPU/memory/PID/runtime/output, and no restart policy. Startup refuses a non-Linux Docker Engine or a daemon that does not report memory, CPU quota, PID and seccomp support. Each created container is inspected against the expected image and full effective profile before start and during reconciliation.
+
+Launch intent and deterministic name are committed before Docker create. The create and start request states fence uncertain responses; recovery inspects only that same name and labels and never retries an ambiguous create. Confirmed terminal state, typed result, stable callback ID and callback payload are persisted through the existing outbox before cleanup. The slot is released only after exact-container cleanup is confirmed. See the [Phase 2B operations guide](PHASE-2B-OPERATIONS.md) and ADRs 0007–0010 for setup, failure handling and limitations.

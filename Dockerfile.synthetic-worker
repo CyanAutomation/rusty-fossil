@@ -1,0 +1,19 @@
+# Build a static, multi-architecture Rust worker with no shell or package
+# manager in the runtime image.
+FROM --platform=$TARGETPLATFORM rust:1.89-alpine3.21 AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN apk add --no-cache musl-dev \
+    && cargo build --release --locked -p fossil-synthetic-worker \
+    && mkdir -p /out \
+    && cp target/release/fossil-synthetic-worker /out/worker
+
+FROM scratch
+ENV PATH=/
+LABEL org.opencontainers.image.title="Rusty-Fossil synthetic worker" \
+      org.opencontainers.image.description="Fixed Phase 2B lifecycle test workload" \
+      io.rusty-fossil.workload-version="synthetic-v1"
+COPY --from=builder --chown=65532:65532 /out/worker /synthetic-worker
+USER 65532:65532
+ENTRYPOINT ["/synthetic-worker"]

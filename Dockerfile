@@ -2,7 +2,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-RUN cargo build --locked --release -p rusty-fossil
+RUN cargo build --locked --release --workspace
 
 FROM debian:bookworm-slim AS runtime-directory
 RUN mkdir -p /var/lib/rusty-fossil \
@@ -12,6 +12,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=runtime-directory --chown=65532:65532 \
     /var/lib/rusty-fossil /var/lib/rusty-fossil
 COPY --from=build /workspace/target/release/rusty-fossil /usr/local/bin/rusty-fossil
+COPY --from=build /workspace/target/release/fossil-supervisord /usr/local/bin/fossil-supervisord
 ENV RUSTY_FOSSIL_STATE_DIR=/var/lib/rusty-fossil
 EXPOSE 8080
 USER nonroot:nonroot
