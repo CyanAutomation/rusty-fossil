@@ -13,6 +13,7 @@ fossil-queue.workspace = true
 fossil-soyuz.workspace = true
 fossil-senku.workspace = true
 fossil-storage.workspace = true
+fossil-supervisor.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

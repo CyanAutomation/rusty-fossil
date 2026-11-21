@@ -1,9 +1,8 @@
 //! Proof-gated synthetic execution contracts.
 //!
-//! This crate currently provides the authorization boundary and deterministic
-//! mock used by the controlled lifecycle harness. It intentionally does not
-//! expose Docker Engine access yet; that belongs in a separately privileged
-//! supervisor process with its own canonical Soyuz revalidation.
+//! Proof-gated disposable Docker execution. Docker Engine access is isolated in
+//! the `fossil-supervisord` process; callers communicate over a restricted
+//! Unix-domain socket and the supervisor reloads durable authorization state.
 
 use async_trait::async_trait;
 use fossil_core::ids::RunId;
@@ -12,15 +11,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyntheticScenario {
-    Success,
-    ControlledFailure,
-    Timeout,
-    Cancellation,
-    BoundedOutput,
-    UnexpectedTermination,
-}
+mod docker;
+mod docker_service;
+pub mod ipc;
+
+pub use docker::{
+    DockerConfigError, DockerRuntimeConfig, SupervisorLimitSettings, SupervisorLimits,
+};
+pub use docker_service::DockerSupervisor;
+pub use fossil_core::execution::SyntheticScenario;
+pub use ipc::{SupervisorIpcClient, SupervisorIpcError, SupervisorIpcServer, read_ipc_token_file};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedExecution {
@@ -49,6 +49,9 @@ pub enum TerminalReason {
     TimedOut,
     Cancelled,
     UnexpectedTermination,
+    DockerFailure,
+    ResourceLimitFailure,
+    ExecutionUncertain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,10 @@ pub struct ExecutionOutcome {
     pub reason: TerminalReason,
     pub diagnostic_summary: String,
     pub output_truncated: bool,
+    pub workload_id: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +93,16 @@ pub enum SupervisorError {
     AlreadyTerminal,
     #[error("execution state is poisoned and requires review")]
     StateUnavailable,
+    #[error("execution lacks a matching durable Soyuz-authorized handoff")]
+    AuthorizationRejected,
+    #[error("canonical Soyuz authorization is unavailable")]
+    SoyuzUnavailable,
+    #[error("Docker Engine is unavailable or rejected an operation")]
+    DockerUnavailable,
+    #[error("container identity or effective security profile is ambiguous")]
+    AmbiguousContainerState,
+    #[error("container cleanup is pending")]
+    CleanupPending,
 }
 
 #[async_trait]
@@ -289,6 +306,10 @@ fn outcome(
         reason,
         diagnostic_summary: diagnostic_summary.chars().take(256).collect(),
         output_truncated,
+        workload_id: "rusty-fossil-synthetic-v1".to_owned(),
+        started_at: None,
+        completed_at: None,
+        elapsed_ms: None,
     }
 }
 

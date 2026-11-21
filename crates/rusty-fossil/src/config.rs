@@ -162,6 +162,9 @@ pub struct ReadinessReport {
     pub callbacks_pending: u64,
     pub callbacks_blocked: u64,
     pub oldest_pending_callback_age_ms: Option<u64>,
+    pub docker_supervisor_available: Option<bool>,
+    pub synthetic_execution_available: bool,
+    pub production_coding_execution_ready: bool,
     pub senku_configured: bool,
     pub senku_advisory_healthy: Option<bool>,
     pub missing_dependencies: Vec<String>,
@@ -337,7 +340,7 @@ impl AppConfig {
         let limitations = vec![
             "production_queue_intake_disabled".to_owned(),
             "queue_transport_not_probed".to_owned(),
-            "execution_runtime_not_implemented".to_owned(),
+            "synthetic_supervisor_not_wired".to_owned(),
         ];
         let execution_handoff_ready = state_store_ready
             && soyuz_configured
@@ -346,7 +349,7 @@ impl AppConfig {
             && queue_transport_healthy == Some(true)
             && !limitations.contains(&"production_queue_intake_disabled".to_owned());
         let execution_ready = execution_handoff_ready
-            && !limitations.contains(&"execution_runtime_not_implemented".to_owned());
+            && !limitations.contains(&"synthetic_supervisor_not_wired".to_owned());
         let ready = state_store_ready && execution_ready;
         ReadinessReport {
             ready,
@@ -361,6 +364,9 @@ impl AppConfig {
             callbacks_pending: 0,
             callbacks_blocked: 0,
             oldest_pending_callback_age_ms: None,
+            docker_supervisor_available: None,
+            synthetic_execution_available: false,
+            production_coding_execution_ready: false,
             senku_configured: self.senku_api_origin.is_some() && self.senku_api_token.is_some(),
             senku_advisory_healthy: None,
             missing_dependencies,

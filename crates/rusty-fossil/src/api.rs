@@ -73,6 +73,9 @@ struct ReadyResponse {
     callbacks_pending: u64,
     callbacks_blocked: u64,
     oldest_pending_callback_age_ms: Option<u64>,
+    docker_supervisor_available: Option<bool>,
+    synthetic_execution_available: bool,
+    production_coding_execution_ready: bool,
     senku_configured: bool,
     senku_advisory_healthy: Option<bool>,
     missing_dependencies: Vec<String>,
@@ -94,6 +97,9 @@ impl From<ReadinessReport> for ReadyResponse {
             callbacks_pending: report.callbacks_pending,
             callbacks_blocked: report.callbacks_blocked,
             oldest_pending_callback_age_ms: report.oldest_pending_callback_age_ms,
+            docker_supervisor_available: report.docker_supervisor_available,
+            synthetic_execution_available: report.synthetic_execution_available,
+            production_coding_execution_ready: report.production_coding_execution_ready,
             senku_configured: report.senku_configured,
             senku_advisory_healthy: report.senku_advisory_healthy,
             missing_dependencies: report.missing_dependencies,
@@ -137,7 +143,10 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         .metrics
         .metrics_requests
         .fetch_add(1, Ordering::Relaxed);
-    let ready = u8::from(state.readiness().execution_ready);
+    let readiness = state.readiness();
+    let ready = u8::from(readiness.execution_ready);
+    let docker_supervisor_probe_known = u8::from(readiness.docker_supervisor_available.is_some());
+    let docker_supervisor_available = u8::from(readiness.docker_supervisor_available == Some(true));
     let outbox = state.store.callback_outbox_status().unwrap_or_default();
     let recovery = state.store.recovery_diagnostics().unwrap_or_default();
     let execution_slot_available =
@@ -150,6 +159,18 @@ async fn metrics(State(state): State<ApiState>) -> Response {
          # HELP fossil_execution_ready Whether the controller can safely accept execution work.\n\
          # TYPE fossil_execution_ready gauge\n\
          fossil_execution_ready {ready}\n\
+         # HELP fossil_docker_supervisor_probe_known Whether the controller has probed the supervisor IPC endpoint.\n\
+         # TYPE fossil_docker_supervisor_probe_known gauge\n\
+         fossil_docker_supervisor_probe_known {docker_supervisor_probe_known}\n\
+         # HELP fossil_docker_supervisor_available Whether the controller has a reachable Docker supervisor.\n\
+         # TYPE fossil_docker_supervisor_available gauge\n\
+         fossil_docker_supervisor_available {docker_supervisor_available}\n\
+         # HELP fossil_synthetic_execution_available Whether synthetic worker execution is wired in this process.\n\
+         # TYPE fossil_synthetic_execution_available gauge\n\
+         fossil_synthetic_execution_available {}\n\
+         # HELP fossil_production_coding_execution_ready Whether real coding execution is ready.\n\
+         # TYPE fossil_production_coding_execution_ready gauge\n\
+         fossil_production_coding_execution_ready {}\n\
          # HELP fossil_http_requests_total Requests served by diagnostic endpoints.\n\
          # TYPE fossil_http_requests_total counter\n\
          fossil_http_requests_total{{route=\"health\"}} {}\n\
@@ -197,6 +218,8 @@ async fn metrics(State(state): State<ApiState>) -> Response {
          # HELP fossil_recovery_ambiguous_execution_runs Runs with potentially active execution.\n\
          # TYPE fossil_recovery_ambiguous_execution_runs gauge\n\
          fossil_recovery_ambiguous_execution_runs {}\n",
+        u8::from(readiness.synthetic_execution_available),
+        u8::from(readiness.production_coding_execution_ready),
         state.metrics.health_requests.load(Ordering::Relaxed),
         state.metrics.readiness_requests.load(Ordering::Relaxed),
         state.metrics.metrics_requests.load(Ordering::Relaxed),
