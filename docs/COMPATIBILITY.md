@@ -40,6 +40,7 @@ Requirement IDs refer to current Soyuz `docs/TEST-REQUIREMENTS.md`. Tests are lo
 ## Preserved behaviors and explicit limits
 
 - Soyuz's canonical UUID is the only deduplication and run-identity key. Display IDs and Queue leases never authorize work.
+- The normalized `publishMode` is preserved; omitted values resolve to `pr`. Explicit non-`pr` modes are test-only exceptions under the shared publication policy. This controller does not publish to GitHub.
 - Queue data alone cannot authorize a claim/start; canonical state and private-field proofs are required.
 - A failed or uncertain Soyuz request does not enable direct local execution.
 - Unsupported normalized run settings fail closed rather than being discarded.

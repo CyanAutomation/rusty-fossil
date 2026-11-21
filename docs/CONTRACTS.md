@@ -45,6 +45,10 @@ The request model preserves the supported Soyuz run options:
 
 Fields are typed and `deny_unknown_fields` is applied recursively. In particular, unsupported execution/security controls such as a future webhook configuration are rejected, not silently dropped. The normalized descriptor persisted to SQLite preserves all listed fields and the envelope's run, time and correlation identities. It does not persist Cloudflare transport IDs.
 
+### Default publication mode policy
+
+Every normal run defaults to `publishMode: "pr"` in Soyuz. Rusty-Fossil mirrors that default when parsing a legacy or incomplete normalized queue request and otherwise preserves Soyuz's explicit value; it does not choose a mode or publish to GitHub itself. `none`, `branch`, and `auto` are rare, explicit exceptions for narrowly scoped tests, not routine run settings. See Kirisame's [cross-project publish mode policy](https://github.com/CyanAutomation/kirisame/blob/0ffdd11cdea1e63f7c7218f21969dfdb177a31c8/docs/PUBLISH-MODE-POLICY.md).
+
 ## Soyuz worker API
 
 Worker requests use `Authorization: Bearer <SOYUZ_WORKER_API_TOKEN>`, separate from client submission and Queue credentials. Success uses `{ "data": ..., "requestId": "..." }`; errors use `{ "error": { "code", "message", "requestId" } }`. Bodies are bounded, and error formatting never exposes response bodies.
