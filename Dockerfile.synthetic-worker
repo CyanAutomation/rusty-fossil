@@ -10,6 +10,7 @@ RUN apk add --no-cache musl-dev \
     && cp target/release/fossil-synthetic-worker /out/worker
 
 FROM scratch
+ENV PATH=/
 LABEL org.opencontainers.image.title="Rusty-Fossil synthetic worker" \
       org.opencontainers.image.description="Fixed Phase 2B lifecycle test workload" \
       io.rusty-fossil.workload-version="synthetic-v1"

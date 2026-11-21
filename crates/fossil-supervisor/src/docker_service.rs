@@ -257,9 +257,8 @@ impl DockerSupervisor {
         let limits = self.config.limits();
         let memory = (limits.memory_mib * 1024 * 1024) as i64;
         let nano_cpus = (limits.cpu_millicores * 1_000_000) as i64;
-        let expected_env = [format!("FOSSIL_SCENARIO={}", launch.scenario.as_str())];
         let profile_ok = config.image.as_deref() == Some(self.config.image())
-            && config.env.as_deref() == Some(expected_env.as_slice())
+            && safe_worker_environment(config.env.as_deref(), launch.scenario)
             && config.stop_timeout == Some(limits.cancellation_grace.as_secs() as i64)
             && config.user.as_deref() == Some("65532:65532")
             && host.privileged == Some(false)
@@ -280,7 +279,9 @@ impl DockerSupervisor {
             && host.memory_swap == Some(memory)
             && host.nano_cpus == Some(nano_cpus)
             && host.pids_limit == Some(limits.pid_limit as i64)
-            && host.oom_kill_disable == Some(false)
+            // Docker omits false-valued fields from inspect responses on some
+            // Engine versions; only an explicit true means OOM killing is disabled.
+            && host.oom_kill_disable != Some(true)
             && host.auto_remove == Some(false)
             && host.restart_policy.as_ref().is_none_or(|policy| {
                 policy
@@ -1279,6 +1280,17 @@ fn outcome_from_launch(
     })
 }
 
+fn safe_worker_environment(env: Option<&[String]>, scenario: SyntheticScenario) -> bool {
+    let Some(env) = env else {
+        return false;
+    };
+    env.len() == 2
+        && env
+            .iter()
+            .any(|value| value == &format!("FOSSIL_SCENARIO={}", scenario.as_str()))
+        && env.iter().any(|value| value == "PATH=/")
+}
+
 fn docker_timestamp_ms(value: &str) -> Option<i64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
@@ -1318,8 +1330,11 @@ fn supports_required_resource_controls(info: &SystemInfo) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{supports_required_resource_controls, unix_nanos_to_millis};
+    use super::{
+        safe_worker_environment, supports_required_resource_controls, unix_nanos_to_millis,
+    };
     use bollard::models::SystemInfo;
+    use fossil_core::execution::SyntheticScenario;
 
     fn docker_info(os_type: &str, memory: bool, cpu: bool, pids: bool) -> SystemInfo {
         serde_json::from_value(serde_json::json!({
@@ -1377,5 +1392,31 @@ mod tests {
             unix_nanos_to_millis((i128::from(i64::MAX) + 1) * 1_000_000),
             None
         );
+    }
+
+    #[test]
+    fn worker_environment_is_limited_to_scenario_and_minimal_path() {
+        let allowed = vec!["PATH=/".to_owned(), "FOSSIL_SCENARIO=success".to_owned()];
+        assert!(safe_worker_environment(
+            Some(&allowed),
+            SyntheticScenario::Success
+        ));
+        let default_path = vec![
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+            "FOSSIL_SCENARIO=success".to_owned(),
+        ];
+        assert!(!safe_worker_environment(
+            Some(&default_path),
+            SyntheticScenario::Success
+        ));
+        let with_extra = vec![
+            "PATH=/".to_owned(),
+            "FOSSIL_SCENARIO=success".to_owned(),
+            "LD_PRELOAD=/tmp/evil.so".to_owned(),
+        ];
+        assert!(!safe_worker_environment(
+            Some(&with_extra),
+            SyntheticScenario::Success
+        ));
     }
 }
