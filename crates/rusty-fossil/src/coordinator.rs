@@ -41,6 +41,12 @@ struct CoordinatorMetrics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeSource {
+    QueueDelivery,
+    Recovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorMetricsSnapshot {
     pub message_validation_failures: u64,
     pub duplicate_deliveries: u64,
@@ -373,16 +379,24 @@ impl AuthorizationCoordinator {
                 return retry_for(message.attempts);
             }
         };
-        self.process_envelope(envelope, message.attempts).await
+        self.process_envelope(envelope, message.attempts, EnvelopeSource::QueueDelivery)
+            .await
     }
 
-    async fn process_envelope(&self, envelope: QueueEnvelope, attempts: u32) -> QueueDisposition {
+    async fn process_envelope(
+        &self,
+        envelope: QueueEnvelope,
+        attempts: u32,
+        source: EnvelopeSource,
+    ) -> QueueDisposition {
         let run_id = envelope.run_id;
         let (mut record, newly_observed) = match self.store.get_run(run_id) {
             Ok(record) => {
-                self.metrics
-                    .duplicate_deliveries
-                    .fetch_add(1, Ordering::Relaxed);
+                if source == EnvelopeSource::QueueDelivery {
+                    self.metrics
+                        .duplicate_deliveries
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 (record, false)
             }
             Err(fossil_storage::StoreError::RunNotFound) => {
@@ -1075,7 +1089,7 @@ impl RecoveryManager {
         };
         let disposition = self
             .coordinator
-            .process_envelope(envelope, record.recovery_attempts)
+            .process_envelope(envelope, record.recovery_attempts, EnvelopeSource::Recovery)
             .await;
         let latest = match self.coordinator.store.get_run(run_id) {
             Ok(record) => record,
@@ -1493,7 +1507,7 @@ mod tests {
             LocalLifecycleState::MessageValidated
         );
 
-        let recovery = RecoveryManager::new(coordinator);
+        let recovery = RecoveryManager::new(Arc::clone(&coordinator));
         assert_eq!(
             recovery
                 .reconcile_run(RunId::parse(RUN_ID_TEXT).unwrap())
@@ -1506,6 +1520,7 @@ mod tests {
             LocalLifecycleState::StartAuthorizationPersisted
         );
         assert!(record.start_authorized);
+        assert_eq!(coordinator.metrics().duplicate_deliveries, 0);
     }
 
     #[tokio::test]
@@ -1583,6 +1598,7 @@ mod tests {
         assert_eq!(record.recovery_action, RecoveryAction::ManualReview);
         assert_eq!(record.recovery_attempts, 1);
         assert!(record.claim_callback_id.is_none());
+        assert_eq!(coordinator.metrics().duplicate_deliveries, 1);
     }
 
     #[tokio::test]
