@@ -64,6 +64,13 @@ impl ExecutionDescriptor {
 pub enum RecoveryAction {
     None,
     ReconcileWithSoyuz,
+    AwaitingSoyuz,
+    ClaimResultUncertain,
+    StartResultUncertain,
+    Recovered,
+    OwnedElsewhere,
+    TerminalReconciled,
+    AmbiguousExecution,
     RetryCallback,
     ManualReview,
 }
@@ -73,6 +80,13 @@ impl RecoveryAction {
         match self {
             Self::None => "none",
             Self::ReconcileWithSoyuz => "reconcile_with_soyuz",
+            Self::AwaitingSoyuz => "awaiting_soyuz",
+            Self::ClaimResultUncertain => "claim_result_uncertain",
+            Self::StartResultUncertain => "start_result_uncertain",
+            Self::Recovered => "recovered",
+            Self::OwnedElsewhere => "owned_elsewhere",
+            Self::TerminalReconciled => "terminal_reconciled",
+            Self::AmbiguousExecution => "ambiguous_execution",
             Self::RetryCallback => "retry_callback",
             Self::ManualReview => "manual_review",
         }
@@ -82,6 +96,13 @@ impl RecoveryAction {
         match value {
             "none" => Ok(Self::None),
             "reconcile_with_soyuz" => Ok(Self::ReconcileWithSoyuz),
+            "awaiting_soyuz" => Ok(Self::AwaitingSoyuz),
+            "claim_result_uncertain" => Ok(Self::ClaimResultUncertain),
+            "start_result_uncertain" => Ok(Self::StartResultUncertain),
+            "recovered" => Ok(Self::Recovered),
+            "owned_elsewhere" => Ok(Self::OwnedElsewhere),
+            "terminal_reconciled" => Ok(Self::TerminalReconciled),
+            "ambiguous_execution" => Ok(Self::AmbiguousExecution),
             "retry_callback" => Ok(Self::RetryCallback),
             "manual_review" => Ok(Self::ManualReview),
             _ => Err(StoreError::InvalidStoredValue("recovery action")),
@@ -344,6 +365,35 @@ pub struct RunRecord {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallbackOutboxStatus {
+    pub pending: u64,
+    pub blocked: u64,
+    pub oldest_pending_age_ms: Option<u64>,
+    pub intake_backpressured: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryDiagnostics {
+    pub unresolved_runs: u64,
+    pub attempts: u64,
+    pub recovered_runs: u64,
+    pub awaiting_soyuz_runs: u64,
+    pub owned_elsewhere: u64,
+    pub manual_review_runs: u64,
+    pub ambiguous_execution_runs: u64,
+}
+
+struct RecoveryDiagnosticRow {
+    unresolved: Option<i64>,
+    attempts: Option<i64>,
+    recovered: Option<i64>,
+    awaiting_soyuz: Option<i64>,
+    owned_elsewhere: Option<i64>,
+    manual_review: Option<i64>,
+    ambiguous: Option<i64>,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("SQLite operation failed: {0}")]
@@ -396,6 +446,8 @@ pub enum StoreError {
     CallbackAuthorizationMismatch,
     #[error("callback outbox reached its configured capacity")]
     CallbackOutboxCapacityExceeded,
+    #[error("intake is paused to reserve mandatory callback capacity")]
+    OutboxBackpressure,
     #[error("callback is not pending or is not yet eligible for delivery")]
     CallbackNotEligible,
     #[error("callback payload exceeds 12 KiB or contains invalid data")]
@@ -749,6 +801,12 @@ impl SqliteStore {
             transaction.commit()?;
             return Ok(current);
         }
+        if !matches!(
+            current.lifecycle_state,
+            LocalLifecycleState::ClaimAuthorized | LocalLifecycleState::StartIntentPersisted
+        ) {
+            return Err(StoreError::StartAuthorizationMismatch);
+        }
         current
             .lifecycle_state
             .transition(LocalLifecycleState::StartAuthorizationPersisted)?;
@@ -759,7 +817,7 @@ impl SqliteStore {
                  start_authorized = 1, updated_at_ms = ?4
              WHERE run_id = ?1 AND worker_id = ?5 AND claim_callback_id = ?6
                AND start_callback_id = ?2
-               AND lifecycle_state = 'claim_authorized'",
+               AND lifecycle_state IN ('claim_authorized', 'start_intent_persisted')",
             params![
                 run_id.to_string(),
                 authorization.callback_id().to_string(),
@@ -863,14 +921,27 @@ impl SqliteStore {
             Some(_) => return Err(StoreError::StartCallbackConflict),
             None => {}
         }
-        if current.lifecycle_state != LocalLifecycleState::ClaimAuthorized {
+        if !matches!(
+            current.lifecycle_state,
+            LocalLifecycleState::ClaimAuthorized | LocalLifecycleState::StartIntentPersisted
+        ) {
             return Err(StoreError::StartAuthorizationMismatch);
         }
+        let next_state = if current.lifecycle_state == LocalLifecycleState::ClaimAuthorized {
+            LocalLifecycleState::StartIntentPersisted
+        } else {
+            current.lifecycle_state
+        };
         let updated = transaction.execute(
-            "UPDATE run_records SET start_callback_id = ?2, updated_at_ms = ?3
+            "UPDATE run_records SET start_callback_id = ?2, lifecycle_state = ?4, updated_at_ms = ?3
              WHERE run_id = ?1 AND start_callback_id IS NULL
-               AND lifecycle_state = 'claim_authorized'",
-            params![run_id.to_string(), callback_id.to_string(), now_ms()],
+               AND lifecycle_state IN ('claim_authorized', 'start_intent_persisted')",
+            params![
+                run_id.to_string(),
+                callback_id.to_string(),
+                now_ms(),
+                lifecycle_state_str(next_state)
+            ],
         )?;
         if updated != 1 {
             return Err(StoreError::StartCallbackConflict);
@@ -931,6 +1002,24 @@ impl SqliteStore {
             "UPDATE run_records
              SET recovery_attempts = recovery_attempts + 1, recovery_action = ?2, updated_at_ms = ?3
              WHERE run_id = ?1",
+            params![run_id.to_string(), action.as_str(), now_ms()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::RunNotFound);
+        }
+        Ok(())
+    }
+
+    /// Persists a reconciliation outcome without treating the outcome itself
+    /// as another recovery attempt.
+    pub fn set_recovery_action(
+        &self,
+        run_id: RunId,
+        action: RecoveryAction,
+    ) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+        let updated = connection.execute(
+            "UPDATE run_records SET recovery_action = ?2, updated_at_ms = ?3 WHERE run_id = ?1",
             params![run_id.to_string(), action.as_str(), now_ms()],
         )?;
         if updated != 1 {
@@ -1039,6 +1128,14 @@ impl SqliteStore {
             }
             return Err(StoreError::ExecutionSlotOccupied);
         }
+        let outstanding_callbacks: u32 = transaction.query_row(
+            "SELECT COUNT(*) FROM callback_outbox WHERE delivery_state IN ('pending', 'blocked')",
+            [],
+            |row| row.get(0),
+        )?;
+        if outstanding_callbacks >= MAX_PENDING_CALLBACKS.saturating_sub(1) {
+            return Err(StoreError::OutboxBackpressure);
+        }
         let unresolved_run: Option<String> = transaction
             .query_row(
                 "SELECT run_id FROM run_records
@@ -1119,6 +1216,40 @@ impl SqliteStore {
         if record.lifecycle_state != LocalLifecycleState::ExecutionTerminal {
             return Err(StoreError::ExecutionSlotReleaseDenied);
         }
+        transaction.execute(
+            "DELETE FROM execution_slot WHERE slot_id = 1 AND run_id = ?1",
+            [run_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Closes a local intake record after a fresh canonical read proves that a
+    /// different worker owns the run. Active or cancellation-pending local
+    /// execution is never discarded by this path.
+    pub fn supersede_run_owned_elsewhere(&self, run_id: RunId) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = load_run(&transaction, run_id)?;
+        if matches!(
+            record.lifecycle_state,
+            LocalLifecycleState::ExecutionActive | LocalLifecycleState::CancellationRequested
+        ) {
+            return Err(StoreError::ExecutionSlotReleaseDenied);
+        }
+        if record.lifecycle_state != LocalLifecycleState::ExecutionTerminal {
+            record
+                .lifecycle_state
+                .transition(LocalLifecycleState::ExecutionTerminal)?;
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE run_records
+             SET lifecycle_state = 'execution_terminal', recovery_action = 'owned_elsewhere',
+                 recovery_attempts = recovery_attempts + 1, updated_at_ms = ?2
+             WHERE run_id = ?1",
+            params![run_id.to_string(), now],
+        )?;
         transaction.execute(
             "DELETE FROM execution_slot WHERE slot_id = 1 AND run_id = ?1",
             [run_id.to_string()],
@@ -1346,6 +1477,31 @@ impl SqliteStore {
         Ok((pending.unwrap_or(0) as u64, blocked.unwrap_or(0) as u64))
     }
 
+    pub fn callback_outbox_status(&self) -> Result<CallbackOutboxStatus, StoreError> {
+        let connection = self.lock()?;
+        let (pending, blocked, oldest_pending): (Option<i64>, Option<i64>, Option<i64>) =
+            connection.query_row(
+                "SELECT
+                    SUM(CASE WHEN delivery_state = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN delivery_state = 'blocked' THEN 1 ELSE 0 END),
+                    MIN(CASE WHEN delivery_state = 'pending' THEN created_at_ms END)
+                 FROM callback_outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let pending = pending.unwrap_or(0).max(0) as u64;
+        let blocked = blocked.unwrap_or(0).max(0) as u64;
+        let oldest_pending_age_ms =
+            oldest_pending.map(|created| now_ms().saturating_sub(created).max(0) as u64);
+        Ok(CallbackOutboxStatus {
+            pending,
+            blocked,
+            oldest_pending_age_ms,
+            intake_backpressured: pending.saturating_add(blocked)
+                >= u64::from(MAX_PENDING_CALLBACKS.saturating_sub(1)),
+        })
+    }
+
     pub fn mark_callback_delivered(
         &self,
         authorization: CallbackDeliveryAuthorization,
@@ -1395,9 +1551,13 @@ impl SqliteStore {
         Ok(count as u64)
     }
 
-    /// Callback replay is independent from execution capacity. Only unresolved
-    /// run recovery state or a reserved single slot prevents another pull.
+    /// Callback replay remains independent of intake. Intake also reserves one
+    /// outbox entry for the active run's mandatory terminal callback.
     pub fn execution_capacity_available(&self) -> Result<bool, StoreError> {
+        self.intake_capacity_available()
+    }
+
+    pub fn intake_capacity_available(&self) -> Result<bool, StoreError> {
         let connection = self.lock()?;
         let blocked: bool = connection.query_row(
             "SELECT EXISTS(
@@ -1408,7 +1568,60 @@ impl SqliteStore {
             [],
             |row| row.get(0),
         )?;
+        let outstanding_callbacks: u32 = connection.query_row(
+            "SELECT COUNT(*) FROM callback_outbox WHERE delivery_state IN ('pending', 'blocked')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(!blocked && outstanding_callbacks < MAX_PENDING_CALLBACKS.saturating_sub(1))
+    }
+
+    pub fn recovery_backlog_available(&self) -> Result<bool, StoreError> {
+        let connection = self.lock()?;
+        let blocked: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM run_records WHERE lifecycle_state != 'execution_terminal'
+             ) OR EXISTS(SELECT 1 FROM execution_slot)",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(!blocked)
+    }
+
+    pub fn recovery_diagnostics(&self) -> Result<RecoveryDiagnostics, StoreError> {
+        let connection = self.lock()?;
+        let row = connection.query_row(
+            "SELECT
+                SUM(CASE WHEN lifecycle_state != 'execution_terminal' THEN 1 ELSE 0 END),
+                SUM(recovery_attempts),
+                SUM(CASE WHEN recovery_action = 'recovered' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN recovery_action = 'awaiting_soyuz' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN recovery_action = 'owned_elsewhere' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN recovery_action = 'manual_review' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN recovery_action = 'ambiguous_execution' THEN 1 ELSE 0 END)
+             FROM run_records",
+            [],
+            |row| {
+                Ok(RecoveryDiagnosticRow {
+                    unresolved: row.get(0)?,
+                    attempts: row.get(1)?,
+                    recovered: row.get(2)?,
+                    awaiting_soyuz: row.get(3)?,
+                    owned_elsewhere: row.get(4)?,
+                    manual_review: row.get(5)?,
+                    ambiguous: row.get(6)?,
+                })
+            },
+        )?;
+        Ok(RecoveryDiagnostics {
+            unresolved_runs: row.unresolved.unwrap_or(0).max(0) as u64,
+            attempts: row.attempts.unwrap_or(0).max(0) as u64,
+            recovered_runs: row.recovered.unwrap_or(0).max(0) as u64,
+            awaiting_soyuz_runs: row.awaiting_soyuz.unwrap_or(0).max(0) as u64,
+            owned_elsewhere: row.owned_elsewhere.unwrap_or(0).max(0) as u64,
+            manual_review_runs: row.manual_review.unwrap_or(0).max(0) as u64,
+            ambiguous_execution_runs: row.ambiguous.unwrap_or(0).max(0) as u64,
+        })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
@@ -1505,6 +1718,7 @@ fn parse_lifecycle_state(
         "canonical_run_checked" => Ok(LocalLifecycleState::CanonicalRunChecked),
         "claim_intent_persisted" => Ok(LocalLifecycleState::ClaimIntentPersisted),
         "claim_authorized" => Ok(LocalLifecycleState::ClaimAuthorized),
+        "start_intent_persisted" => Ok(LocalLifecycleState::StartIntentPersisted),
         "start_authorization_persisted" => Ok(LocalLifecycleState::StartAuthorizationPersisted),
         "execution_active" => Ok(LocalLifecycleState::ExecutionActive),
         "cancellation_requested" => Ok(LocalLifecycleState::CancellationRequested),
@@ -1649,6 +1863,7 @@ fn lifecycle_state_str(value: LocalLifecycleState) -> &'static str {
         LocalLifecycleState::CanonicalRunChecked => "canonical_run_checked",
         LocalLifecycleState::ClaimIntentPersisted => "claim_intent_persisted",
         LocalLifecycleState::ClaimAuthorized => "claim_authorized",
+        LocalLifecycleState::StartIntentPersisted => "start_intent_persisted",
         LocalLifecycleState::StartAuthorizationPersisted => "start_authorization_persisted",
         LocalLifecycleState::ExecutionActive => "execution_active",
         LocalLifecycleState::CancellationRequested => "cancellation_requested",

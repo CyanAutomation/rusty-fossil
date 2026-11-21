@@ -4,7 +4,7 @@
 
 Rusty-Fossil is the host controller for a future disposable coding worker. Soyuz is the mandatory control plane and canonical run ledger. Soyuz authenticates submissions, assigns the canonical UUIDv7, owns lifecycle and cancellation state, and publishes the Queue message. Rusty-Fossil has no submission route and treats Queue data as untrusted input. It cannot start work without Soyuz claim and start evidence.
 
-Phase 2A implements Queue transport, request preservation, durable claim/start authorization, and recovery. The service does not construct or run the poller in production. No Docker process or coding runtime exists in this phase.
+Phase 2A.1 implements durable reconciliation and Queue/outbox hardening; Phase 2A-S adds the optional Senku advisory client. `AuthorizationCoordinator::run` supervises Queue polling and recovery together, while `RecoveryManager::run` can run reconciliation independently. The production service does not construct either loop. No Docker process or coding runtime exists in this phase.
 
 ```mermaid
 flowchart LR
@@ -13,6 +13,9 @@ flowchart LR
     Queue -->|one leased message, when enabled| Coordinator[Rusty-Fossil coordinator]
     Coordinator -->|canonical read, claim, started, callbacks| Soyuz
     Coordinator --> SQLite[(Private local SQLite journal)]
+    Coordinator -.->|advisory task admission only| Senku[Senku decision API]
+    Recovery[RecoveryManager] -->|canonical reconciliation| Soyuz
+    Recovery --> SQLite
     Coordinator -.->|Phase 2B proof-gated handoff| Supervisor[Worker supervisor]
     Supervisor -.-> Worker[Disposable worker image]
     Worker -.->|events, heartbeat, terminal result| Coordinator
@@ -47,6 +50,43 @@ sequenceDiagram
 
 The implementation persists claim and start callback IDs before the corresponding network request. After an uncertain result it reuses the same ID and reconciles against Soyuz; it does not generate a speculative replacement. The final gate requires canonical `running` state, matching worker and claim callback ID, and no cancellation timestamp. `ExecutionGateAuthorization` has private fields and storage checks the run, worker, claim, start callback, descriptor, and reserved slot before marking a handoff active.
 
+## Startup and periodic recovery
+
+The RecoveryManager enumerates nonterminal records and records with pending or blocked callbacks. It reloads the immutable descriptor and persisted identities, then enters the same canonical Soyuz validation and claim/start code used for a Queue delivery. The run can be invoked once at startup and on a timer without a Queue lease; callback replay runs on each supervisor cycle even when recovery blocks intake. The current service `main` does not construct this supervisor, so production recovery is not active until a controlled runtime rollout.
+
+```mermaid
+sequenceDiagram
+    participant R as RecoveryManager
+    participant D as SQLite
+    participant S as Soyuz
+    participant O as Callback outbox
+    R->>D: enumerate unresolved runs and callbacks
+    R->>D: load descriptor and stable claim/start IDs
+    R->>S: read canonical run and current fence
+    alt safe queued or current-owner state
+        R->>S: resume only the persisted claim/start operation
+        R->>D: persist proof and reconciliation outcome
+    else another worker owns canonical run
+        R->>D: terminalize local superseded intake and release slot
+        Note over R,D: No false callback and no takeover
+    else run may already be active locally
+        R->>D: persist ambiguous execution for review
+        Note over R,S: Never launch a replacement
+    end
+    R->>O: replay eligible durable callbacks independent of slot
+```
+
+| Canonical Soyuz observation | Local execution may be active? | Local action | Queue lease policy |
+| --- | --- | --- | --- |
+| Queued and unclaimed | No | Reuse persisted claim ID and ask Soyuz to claim | Ack only after durable authorization handoff; otherwise bounded retry |
+| Claimed by this worker with matching persisted fence | No | Reconcile the matching claim and stable start ID | Same as above |
+| Claimed by another worker | No | Mark local intake superseded and release its slot; emit no terminal callback | Acknowledge duplicate delivery |
+| Running by another worker | No | Supersede local intake; never take over | Acknowledge duplicate delivery |
+| Current worker but fence differs or claim expired | Unknown | Manual review; Soyuz must establish any new claim/fence | Acknowledge after durable review state |
+| Cancelled or terminal | No | Reconcile terminal state and any required callback intent | Ack after durable local transition |
+| Canonical read unavailable | Any | Persist awaiting/reconcile state; keep safe local state | Bounded retry on delivery; periodic recovery independent of delivery |
+| Canonical run is running and local state is `ExecutionActive` | Yes or unknown | Persist ambiguous execution, do not release authorization or relaunch | Ack after durable ambiguity state |
+
 ## Failure and recovery matrix
 
 | Failure point | Durable state | Recovery behavior |
@@ -60,6 +100,7 @@ The implementation persists claim and start callback IDs before the correspondin
 | Cancellation before handoff | Local run remains non-active | Keep execution gate closed; reconcile terminal/cancel state. |
 | Final canonical gate fails | Start proof remains journaled | Retry/reconcile, or stop on terminal/cancellation; no handoff. |
 | Queue ack fails after handoff | Durable descriptor, authorization and slot | Redelivery recognizes local handoff and acknowledges without creating another handoff. |
+| Canonical owner is another worker | No local active execution | Mark superseded, release local slot, emit no callback, acknowledge duplicate. |
 | Restart with possibly active execution | Existing slot and nonterminal record | Do not launch a replacement automatically; operator/recovery policy must resolve it. |
 | Callback result uncertain | Stable outbox event ID and payload | Retry after persisted deadline with the same logical request. |
 | Permanent callback rejection or stale fence | Outbox state `blocked`, classified failure | Surface in diagnostics and require operator review; do not mark delivered. |
@@ -81,7 +122,8 @@ The descriptor includes `taskPrompt` and can contain repository configuration. I
 | `fossil-queue` | One-message Cloudflare HTTP pull, ack/retry, bounded response decode, shutdown loop, jitter, low-cardinality counters. |
 | `fossil-soyuz` | Worker API client, strict callback request models, canonical read and unforgeable claim/start/gate proofs. |
 | `fossil-storage` | SQLite migrations, secure local state, immutable execution descriptors and IDs, atomic slot reservation, recovery queries, bounded callback outbox. |
-| `rusty-fossil` | Configuration, coordinator, callback replay, and read-only Axum diagnostics. |
+| `fossil-senku` | Five Kaseki profile request types, bounded/redacted evidence, authenticated transport, strict response validation and per-profile client counters. |
+| `rusty-fossil` | Configuration, coordinator, RecoveryManager, callback replay, advisory task-admission seam, and read-only Axum diagnostics. |
 
 ## SQLite and transaction boundaries
 
@@ -96,13 +138,13 @@ SQLite is appropriate for one controller host and one execution slot because loc
 | Terminal callback | Local terminal transition, callback payload and slot release can commit in one transaction. |
 | Callback attempt | Attempt count and next eligible timestamp are committed before network I/O. Delivery is marked only after a successful Soyuz response. |
 
-Outbox events have bounded typed payloads, worker identity, current claim fence, stable event ID, attempt count, next retry deadline and a low-cardinality failure class. Retry delay is capped exponential with stable per-event jitter. Permanent response classes and stale/conflicting claims become blocked for operator review. The outbox is limited to 1,000 pending or blocked entries; enqueue fails under backpressure. Callback replay is independent of the execution slot.
+Outbox events have bounded typed payloads, worker identity, current claim fence, stable event ID, attempt count, next retry deadline and a low-cardinality failure class. Retry delay is capped exponential with stable per-event jitter. Permanent response classes and stale/conflicting claims become blocked for operator review. The outbox is limited to 1,000 pending or blocked entries; new intake stops at 999 outstanding entries to reserve one terminal callback slot. Existing run reservations are idempotently recoverable even after the threshold. Callback replay is independent of the execution slot; blocked entries are never deleted to clear backpressure. Successful delivery frees capacity. An operator may resolve a blocked entry only after verifying canonical Soyuz state and the exact callback identity.
 
 ## Readiness, metrics and service boundary
 
 `GET /health` reports process liveness. `GET /ready` distinguishes state-store health, Soyuz and Queue configuration, Queue transport probe state, recovery backlog, handoff readiness and the absence of an execution runtime. Readiness never calls inference, claims a run, or pulls a Queue message. Queue transport is shown as unprobed because the diagnostics server does not start the adapter.
 
-`GET /metrics` remains read-only and reports HTTP counters, callback pending/blocked counts and execution-slot availability. The Queue adapter and coordinator expose their own bounded counters for pull/ack/retry, validation, claim/start, duplicate and recovery events. No metric labels contain prompts, request data, credentials, run IDs, or Queue leases.
+`GET /metrics` remains read-only and reports HTTP counters, callback pending/blocked counts and age, execution-slot availability, outbox and recovery intake blocking, recovery attempts/outcomes, ownership conflicts, ambiguous execution, and manual-review gauges. Recovery and Queue component snapshots expose more detailed counters. `fossil-senku` exposes per-profile attempts, successes, invalid responses, transport failures, degraded calls, and total duration. Senku and coordinator snapshots are not wired to the diagnostic endpoint while the production binary keeps both loops and the Senku client inactive. No metric labels contain prompts, request data, credentials, run IDs, or Queue leases.
 
 The only service routes are `/health`, `/ready`, and `/metrics`. There is no submission, claim, retry, or execution route. The default listener is `127.0.0.1:8080`.
 
@@ -110,7 +152,17 @@ The only service routes are `/health`, `/ready`, and `/metrics`. There is no sub
 
 ### Phase 2A-S: Senku advisory decisions
 
-Create a separate `fossil-senku` crate and typed client for `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Senku produces advisory data only. Deterministic policy and Soyuz claim/start remain authoritative. Do not add JEV, call OpenRouter directly, make Senku availability mandatory, or create a Senku job-control path.
+Implemented in this worktree: the `fossil-senku` client supports `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Requests use `/v1/profiles/{profileId}/evaluate`, schema version `1`, a separate bearer token, redirect refusal, bounded body reads and profile-specific validation. Context routing and goal-check dynamic answers are validated against submitted evidence/criteria. Task-admission can be attached to the coordinator but its output is telemetry only; the client is not instantiated by production `main`.
+
+Senku is advisory. Its availability or result cannot authorize claims, starts, retries, validation bypass, execution or publication. Deterministic rules and Soyuz remain authoritative. Senku currently grants these profiles to the Kaseki identity. Rusty-Fossil must be provisioned a suitable separate credential only through an authorized process; a dedicated Rusty-Fossil identity requires a separately reviewed Senku permission change. Never reuse the Soyuz worker token. Do not add JEV or direct OpenRouter calls.
+
+| Profile | Rust type | Degradation rule |
+| --- | --- | --- |
+| `task_admission_v1` | `TaskAdmissionInput` | Deterministic request validation remains mandatory; unavailable advisory is recorded as degraded and cannot grant safety. |
+| `kaseki_context_routing_v1` | `ContextRoutingInput` | Keep required context; do not drop uncertain content or block initialization. |
+| `validation_recovery_v1` | `ValidationRecoveryInput` | Preserve failure; no retry is authorized solely by missing advice. |
+| `kaseki_goal_check_v1` | `GoalCheckInput` | Unavailable is not success; deterministic completion/publication gates remain. |
+| `kaseki_run_evaluation_v1` | `RunEvaluationInput` | Record degraded evaluation without fabricating score or confidence. |
 
 ### Phase 2B: Docker worker execution
 

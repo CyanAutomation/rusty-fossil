@@ -3,6 +3,10 @@ use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::LocalLifecycleState;
 use fossil_core::queue::{CloudflareQueueMessage, QueueEnvelope};
 use fossil_queue::{CloudflareQueueClient, QueueDisposition, retry_delay_seconds};
+use fossil_senku::{
+    AgentStageSettings as SenkuStageSettings, DecisionService, ProfileEvaluation,
+    PublishMode as SenkuPublishMode, TaskAdmissionInput, TaskMode as SenkuTaskMode,
+};
 use fossil_soyuz::{
     CallbackDeliveryAuthorization, CancelledCallback, CompletedCallback, FailedCallback,
     OperationalEvent, SoyuzApi, SoyuzClientError, SoyuzRunRead, StartedAuthorization,
@@ -16,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 
 #[derive(Default)]
 struct CoordinatorMetrics {
@@ -31,6 +35,9 @@ struct CoordinatorMetrics {
     callbacks_delivered: AtomicU64,
     callbacks_retried: AtomicU64,
     callbacks_blocked: AtomicU64,
+    senku_task_admission_attempts: AtomicU64,
+    senku_task_admission_successes: AtomicU64,
+    senku_task_admission_degraded: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +53,9 @@ pub struct CoordinatorMetricsSnapshot {
     pub callbacks_delivered: u64,
     pub callbacks_retried: u64,
     pub callbacks_blocked: u64,
+    pub senku_task_admission_attempts: u64,
+    pub senku_task_admission_successes: u64,
+    pub senku_task_admission_degraded: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,6 +66,29 @@ pub struct CallbackReplaySummary {
     pub blocked: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    Recovered,
+    AwaitingSoyuz,
+    OwnedElsewhere,
+    CancellationPending,
+    TerminalReconciled,
+    AmbiguousExecution,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    pub inspected: u64,
+    pub recovered: u64,
+    pub awaiting_soyuz: u64,
+    pub owned_elsewhere: u64,
+    pub cancellation_pending: u64,
+    pub terminal_reconciled: u64,
+    pub ambiguous_execution: u64,
+    pub manual_review_required: u64,
+}
+
 /// Owns the single Soyuz authorization path from a validated Queue message to
 /// a durable descriptor, claim, and start authorization. This coordinator is
 /// intentionally not constructed by the production service yet.
@@ -64,6 +97,8 @@ pub struct AuthorizationCoordinator {
     store: SqliteStore,
     worker_id: WorkerId,
     metrics: Arc<CoordinatorMetrics>,
+    processing_lock: Arc<AsyncMutex<()>>,
+    decision_service: Option<Arc<dyn DecisionService>>,
 }
 
 impl AuthorizationCoordinator {
@@ -73,7 +108,16 @@ impl AuthorizationCoordinator {
             store,
             worker_id,
             metrics: Arc::new(CoordinatorMetrics::default()),
+            processing_lock: Arc::new(AsyncMutex::new(())),
+            decision_service: None,
         }
+    }
+
+    /// Attaches the optional advisory integration. Its output is recorded only
+    /// as service telemetry and is never an authorization input.
+    pub fn with_decision_service(mut self, service: Arc<dyn DecisionService>) -> Self {
+        self.decision_service = Some(service);
+        self
     }
 
     pub fn metrics(&self) -> CoordinatorMetricsSnapshot {
@@ -92,6 +136,18 @@ impl AuthorizationCoordinator {
             callbacks_delivered: self.metrics.callbacks_delivered.load(Ordering::Relaxed),
             callbacks_retried: self.metrics.callbacks_retried.load(Ordering::Relaxed),
             callbacks_blocked: self.metrics.callbacks_blocked.load(Ordering::Relaxed),
+            senku_task_admission_attempts: self
+                .metrics
+                .senku_task_admission_attempts
+                .load(Ordering::Relaxed),
+            senku_task_admission_successes: self
+                .metrics
+                .senku_task_admission_successes
+                .load(Ordering::Relaxed),
+            senku_task_admission_degraded: self
+                .metrics
+                .senku_task_admission_degraded
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -290,22 +346,24 @@ impl AuthorizationCoordinator {
     ) {
         let store = self.store.clone();
         let coordinator = Arc::clone(&self);
-        queue
-            .run(
-                poll_interval,
-                shutdown,
-                move || store.execution_capacity_available().unwrap_or(false),
-                move |message| {
-                    let coordinator = Arc::clone(&coordinator);
-                    async move { coordinator.process(message).await }
-                },
-            )
-            .await;
+        let recovery = RecoveryManager::new(Arc::clone(&self));
+        let queue_loop = queue.run(
+            poll_interval,
+            shutdown.clone(),
+            move || store.intake_capacity_available().unwrap_or(false),
+            move |message| {
+                let coordinator = Arc::clone(&coordinator);
+                async move { coordinator.process(message).await }
+            },
+        );
+        let recovery_loop = recovery.run(poll_interval, shutdown);
+        tokio::join!(queue_loop, recovery_loop);
     }
 
     /// Processes one leased delivery. The Queue layer performs the returned
     /// ack/retry operation; this method never treats Queue data as authorization.
     pub async fn process(&self, message: CloudflareQueueMessage) -> QueueDisposition {
+        let _guard = self.processing_lock.lock().await;
         let envelope = match message.decode_envelope() {
             Ok(envelope) => envelope,
             Err(_) => {
@@ -315,24 +373,40 @@ impl AuthorizationCoordinator {
                 return retry_for(message.attempts);
             }
         };
+        self.process_envelope(envelope, message.attempts).await
+    }
+
+    async fn process_envelope(&self, envelope: QueueEnvelope, attempts: u32) -> QueueDisposition {
         let run_id = envelope.run_id;
-        let mut record = match self.store.get_run(run_id) {
+        let (mut record, newly_observed) = match self.store.get_run(run_id) {
             Ok(record) => {
                 self.metrics
                     .duplicate_deliveries
                     .fetch_add(1, Ordering::Relaxed);
-                record
+                (record, false)
             }
             Err(fossil_storage::StoreError::RunNotFound) => {
                 match self.store.observe_run(run_id, self.worker_id.clone()) {
-                    Ok(record) => record,
-                    Err(_) => return retry_for(message.attempts),
+                    Ok(record) => (record, true),
+                    Err(_) => return retry_for(attempts),
                 }
             }
-            Err(_) => return retry_for(message.attempts),
+            Err(_) => return retry_for(attempts),
         };
+        if matches!(
+            record.recovery_action,
+            RecoveryAction::ManualReview | RecoveryAction::AmbiguousExecution
+        ) {
+            return QueueDisposition::Acknowledge;
+        }
         if record.worker_id != self.worker_id {
-            return retry_for(message.attempts);
+            let _ = self
+                .store
+                .record_recovery_action(run_id, RecoveryAction::ManualReview);
+            return QueueDisposition::Acknowledge;
+        }
+        if newly_observed {
+            self.evaluate_task_admission(&envelope).await;
         }
         if record.lifecycle_state == LocalLifecycleState::ExecutionTerminal {
             return QueueDisposition::Acknowledge;
@@ -344,7 +418,7 @@ impl AuthorizationCoordinator {
                 .transition(run_id, LocalLifecycleState::MessageValidated)
             {
                 Ok(record) => record,
-                Err(_) => return retry_for(message.attempts),
+                Err(_) => return retry_for(attempts),
             };
         }
         if self
@@ -352,30 +426,27 @@ impl AuthorizationCoordinator {
             .persist_execution_descriptor(ExecutionDescriptor::from(&envelope))
             .is_err()
         {
-            let _ = self
-                .store
-                .record_recovery_action(run_id, RecoveryAction::ManualReview);
-            return retry_for(message.attempts);
+            return self.require_manual_review(run_id, attempts);
         }
         if self.store.reserve_intake_slot(run_id).is_err() {
-            return self.recover_and_retry(run_id, message.attempts);
+            return self.recover_and_retry(run_id, attempts);
         }
 
         let canonical = match self.soyuz.get_run(run_id).await {
             Ok(run) if run.run_id == run_id => run,
-            _ => return self.recover_and_retry(run_id, message.attempts),
+            _ => return self.recover_and_retry(run_id, attempts),
         };
 
         if canonical.cancellation_requested() || canonical.status == SoyuzRunStatus::CancelRequested
         {
-            return self.handle_cancellation(record, message.attempts);
+            return self.handle_cancellation(record, attempts);
         }
         if is_terminal(canonical.status) {
             return self.handle_terminal(record);
         }
 
         match canonical.status {
-            SoyuzRunStatus::Admitting => self.recover_and_retry(run_id, message.attempts),
+            SoyuzRunStatus::Admitting => self.recover_and_retry(run_id, attempts),
             SoyuzRunStatus::Queued => {
                 if record.lifecycle_state == LocalLifecycleState::MessageValidated {
                     record = match self
@@ -383,37 +454,46 @@ impl AuthorizationCoordinator {
                         .transition(run_id, LocalLifecycleState::CanonicalRunChecked)
                     {
                         Ok(record) => record,
-                        Err(_) => return retry_for(message.attempts),
+                        Err(_) => return retry_for(attempts),
                     };
                 }
                 if matches!(
                     record.lifecycle_state,
                     LocalLifecycleState::ClaimAuthorized
+                        | LocalLifecycleState::StartIntentPersisted
                         | LocalLifecycleState::StartAuthorizationPersisted
                         | LocalLifecycleState::ExecutionActive
                 ) {
-                    let _ = self
-                        .store
-                        .record_recovery_action(run_id, RecoveryAction::ManualReview);
-                    return retry_for(message.attempts);
+                    return self.require_manual_review(run_id, attempts);
                 }
-                self.claim_and_authorize(envelope, record, message.attempts)
-                    .await
+                self.claim_and_authorize(envelope, record, attempts).await
             }
             SoyuzRunStatus::Claimed => {
-                self.reconcile_claim_and_authorize(envelope, record, canonical, message.attempts)
+                if canonical.worker_id.as_ref() != Some(&self.worker_id) {
+                    return self.handle_owned_elsewhere(record, attempts);
+                }
+                if canonical.claim_callback_id != record.claim_callback_id {
+                    return self.require_manual_review(run_id, attempts);
+                }
+                self.reconcile_claim_and_authorize(envelope, record, canonical, attempts)
                     .await
             }
             SoyuzRunStatus::Running => {
                 if canonical.worker_id.as_ref() != Some(&self.worker_id) {
-                    return self.handle_terminal(record);
+                    return self.handle_owned_elsewhere(record, attempts);
+                }
+                if canonical.claim_callback_id != record.claim_callback_id {
+                    return self.require_manual_review(run_id, attempts);
                 }
                 if record.lifecycle_state == LocalLifecycleState::ExecutionActive {
                     // A restart must not launch a replacement for work that may
                     // already be running. The durable local state owns recovery.
+                    let _ = self
+                        .store
+                        .record_recovery_action(run_id, RecoveryAction::AmbiguousExecution);
                     return QueueDisposition::Acknowledge;
                 }
-                self.reconcile_started_and_handoff(envelope, record, canonical, message.attempts)
+                self.reconcile_started_and_handoff(envelope, record, canonical, attempts)
                     .await
             }
             SoyuzRunStatus::CancelRequested
@@ -421,6 +501,83 @@ impl AuthorizationCoordinator {
             | SoyuzRunStatus::Failed
             | SoyuzRunStatus::Cancelled
             | SoyuzRunStatus::AdmissionFailed => unreachable!("handled above"),
+        }
+    }
+
+    async fn evaluate_task_admission(&self, envelope: &QueueEnvelope) {
+        let Some(service) = &self.decision_service else {
+            return;
+        };
+        let request = &envelope.request;
+        let input = TaskAdmissionInput {
+            repo_url: request.repo_url.as_str().to_owned(),
+            ref_name: Some(request.git_ref.clone()),
+            task_prompt: request.task_prompt.clone(),
+            validation_commands: request.validation_commands.clone().or_else(|| {
+                request
+                    .validation
+                    .as_ref()
+                    .and_then(|validation| validation.commands.clone())
+            }),
+            changed_files_allowlist: request.changed_files_allowlist.clone().or_else(|| {
+                request
+                    .allowlist
+                    .as_ref()
+                    .and_then(|allowlist| allowlist.include.clone())
+            }),
+            task_mode: Some(match &request.task_mode {
+                fossil_core::queue::TaskMode::Patch => SenkuTaskMode::Patch,
+                fossil_core::queue::TaskMode::Inspect => SenkuTaskMode::Inspect,
+            }),
+            publish_mode: Some(match &request.publish_mode {
+                fossil_core::queue::PublishMode::Auto => SenkuPublishMode::Auto,
+                fossil_core::queue::PublishMode::None => SenkuPublishMode::None,
+                fossil_core::queue::PublishMode::Branch => SenkuPublishMode::Branch,
+                fossil_core::queue::PublishMode::Pr => SenkuPublishMode::Pr,
+            }),
+            startup_check: request.startup_check,
+            scouting: request
+                .scouting
+                .as_ref()
+                .map(|settings| SenkuStageSettings {
+                    enabled: settings.enabled,
+                    model: settings.model.clone(),
+                    timeout_seconds: settings.timeout_seconds,
+                }),
+            goal_setting: request
+                .goal_setting
+                .as_ref()
+                .map(|settings| SenkuStageSettings {
+                    enabled: settings.enabled,
+                    model: settings.model.clone(),
+                    timeout_seconds: settings.timeout_seconds,
+                }),
+        };
+        let evaluation = match ProfileEvaluation::task_admission(input) {
+            Ok(evaluation) => evaluation,
+            Err(_) => {
+                self.metrics
+                    .senku_task_admission_degraded
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        self.metrics
+            .senku_task_admission_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        match service.evaluate(evaluation).await {
+            Ok(_advisory) => {
+                self.metrics
+                    .senku_task_admission_successes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                // The classification is advisory. A missing or invalid answer
+                // never changes Soyuz authorization or deterministic admission.
+                self.metrics
+                    .senku_task_admission_degraded
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -536,6 +693,7 @@ impl AuthorizationCoordinator {
                 return self.recover_with_action(run_id, attempts, RecoveryAction::ManualReview);
             }
         } else if record.lifecycle_state != LocalLifecycleState::ClaimAuthorized
+            && record.lifecycle_state != LocalLifecycleState::StartIntentPersisted
             && record.lifecycle_state != LocalLifecycleState::StartAuthorizationPersisted
         {
             return self.recover_with_action(run_id, attempts, RecoveryAction::ManualReview);
@@ -640,7 +798,10 @@ impl AuthorizationCoordinator {
             Ok(proof) => proof,
             Err(_) => return self.recover_and_retry(run_id, attempts),
         };
-        if record.lifecycle_state == LocalLifecycleState::ClaimAuthorized {
+        if matches!(
+            record.lifecycle_state,
+            LocalLifecycleState::ClaimAuthorized | LocalLifecycleState::StartIntentPersisted
+        ) {
             if self
                 .store
                 .record_start_authorization(run_id, started.clone())
@@ -772,6 +933,33 @@ impl AuthorizationCoordinator {
         QueueDisposition::Acknowledge
     }
 
+    fn handle_owned_elsewhere(
+        &self,
+        record: fossil_storage::RunRecord,
+        attempts: u32,
+    ) -> QueueDisposition {
+        if matches!(
+            record.lifecycle_state,
+            LocalLifecycleState::ExecutionActive | LocalLifecycleState::CancellationRequested
+        ) {
+            return self.require_manual_review(record.run_id, attempts);
+        }
+        match self.store.supersede_run_owned_elsewhere(record.run_id) {
+            Ok(()) => QueueDisposition::Acknowledge,
+            Err(_) => self.require_manual_review(record.run_id, attempts),
+        }
+    }
+
+    fn require_manual_review(&self, run_id: RunId, _attempts: u32) -> QueueDisposition {
+        self.metrics
+            .recovery_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .store
+            .record_recovery_action(run_id, RecoveryAction::ManualReview);
+        QueueDisposition::Acknowledge
+    }
+
     fn recover_and_retry(&self, run_id: RunId, attempts: u32) -> QueueDisposition {
         self.recover_with_action(run_id, attempts, RecoveryAction::ReconcileWithSoyuz)
     }
@@ -786,7 +974,179 @@ impl AuthorizationCoordinator {
             .recovery_operations
             .fetch_add(1, Ordering::Relaxed);
         let _ = self.store.record_recovery_action(run_id, action);
-        retry_for(attempts)
+        if matches!(
+            action,
+            RecoveryAction::ManualReview | RecoveryAction::AmbiguousExecution
+        ) {
+            QueueDisposition::Acknowledge
+        } else {
+            retry_for(attempts)
+        }
+    }
+}
+
+/// Runs durable reconciliation independently from Queue deliveries. It is
+/// supervised alongside the opt-in Queue poller and can also be invoked
+/// directly by deterministic tests and maintenance tools inside the crate.
+pub struct RecoveryManager {
+    coordinator: Arc<AuthorizationCoordinator>,
+}
+
+impl RecoveryManager {
+    pub fn new(coordinator: Arc<AuthorizationCoordinator>) -> Self {
+        Self { coordinator }
+    }
+
+    pub async fn reconcile_pending(&self) -> RecoverySummary {
+        let candidates = match self.coordinator.store.recovery_candidates() {
+            Ok(candidates) => candidates,
+            Err(_) => return RecoverySummary::default(),
+        };
+        let mut summary = RecoverySummary::default();
+        for record in candidates {
+            summary.inspected += 1;
+            let outcome = self.reconcile_run(record.run_id).await;
+            match outcome {
+                RecoveryOutcome::Recovered => summary.recovered += 1,
+                RecoveryOutcome::AwaitingSoyuz => summary.awaiting_soyuz += 1,
+                RecoveryOutcome::OwnedElsewhere => summary.owned_elsewhere += 1,
+                RecoveryOutcome::CancellationPending => summary.cancellation_pending += 1,
+                RecoveryOutcome::TerminalReconciled => summary.terminal_reconciled += 1,
+                RecoveryOutcome::AmbiguousExecution => summary.ambiguous_execution += 1,
+                RecoveryOutcome::ManualReviewRequired => summary.manual_review_required += 1,
+            }
+        }
+        summary
+    }
+
+    pub async fn reconcile_run(&self, run_id: RunId) -> RecoveryOutcome {
+        let _guard = self.coordinator.processing_lock.lock().await;
+        let record = match self.coordinator.store.get_run(run_id) {
+            Ok(record) => record,
+            Err(_) => return RecoveryOutcome::ManualReviewRequired,
+        };
+        if record.lifecycle_state == LocalLifecycleState::ExecutionTerminal {
+            return if record.recovery_action == RecoveryAction::OwnedElsewhere {
+                RecoveryOutcome::OwnedElsewhere
+            } else {
+                let _ = self
+                    .coordinator
+                    .store
+                    .set_recovery_action(run_id, RecoveryAction::TerminalReconciled);
+                RecoveryOutcome::TerminalReconciled
+            };
+        }
+        match record.recovery_action {
+            RecoveryAction::ManualReview => return RecoveryOutcome::ManualReviewRequired,
+            RecoveryAction::AmbiguousExecution => return RecoveryOutcome::AmbiguousExecution,
+            _ => {}
+        }
+        if record.lifecycle_state == LocalLifecycleState::ExecutionActive {
+            let _ = self
+                .coordinator
+                .store
+                .record_recovery_action(run_id, RecoveryAction::AmbiguousExecution);
+            return RecoveryOutcome::AmbiguousExecution;
+        }
+        if record.lifecycle_state == LocalLifecycleState::CancellationRequested {
+            let _ = self
+                .coordinator
+                .store
+                .record_recovery_action(run_id, RecoveryAction::AwaitingSoyuz);
+            return RecoveryOutcome::CancellationPending;
+        }
+        let descriptor = match self.coordinator.store.execution_descriptor(run_id) {
+            Ok(Some(descriptor)) => descriptor,
+            _ => {
+                let _ = self
+                    .coordinator
+                    .store
+                    .record_recovery_action(run_id, RecoveryAction::ManualReview);
+                return RecoveryOutcome::ManualReviewRequired;
+            }
+        };
+        let envelope = QueueEnvelope {
+            contract_version: descriptor.contract_version,
+            run_id: descriptor.run_id,
+            created_at: descriptor.created_at,
+            correlation_id: descriptor.correlation_id,
+            request_id: descriptor.request_id,
+            request: descriptor.request,
+        };
+        let disposition = self
+            .coordinator
+            .process_envelope(envelope, record.recovery_attempts)
+            .await;
+        let latest = match self.coordinator.store.get_run(run_id) {
+            Ok(record) => record,
+            Err(_) => return RecoveryOutcome::ManualReviewRequired,
+        };
+        match latest.recovery_action {
+            RecoveryAction::OwnedElsewhere => RecoveryOutcome::OwnedElsewhere,
+            RecoveryAction::ManualReview => RecoveryOutcome::ManualReviewRequired,
+            RecoveryAction::AmbiguousExecution => RecoveryOutcome::AmbiguousExecution,
+            _ if latest.lifecycle_state == LocalLifecycleState::ExecutionTerminal => {
+                let _ = self
+                    .coordinator
+                    .store
+                    .set_recovery_action(run_id, RecoveryAction::TerminalReconciled);
+                RecoveryOutcome::TerminalReconciled
+            }
+            _ if latest.lifecycle_state == LocalLifecycleState::CancellationRequested => {
+                let _ = self
+                    .coordinator
+                    .store
+                    .set_recovery_action(run_id, RecoveryAction::AwaitingSoyuz);
+                RecoveryOutcome::CancellationPending
+            }
+            _ if latest.lifecycle_state == LocalLifecycleState::StartAuthorizationPersisted
+                && disposition == QueueDisposition::Acknowledge =>
+            {
+                let _ = self
+                    .coordinator
+                    .store
+                    .set_recovery_action(run_id, RecoveryAction::Recovered);
+                RecoveryOutcome::Recovered
+            }
+            _ => {
+                let _ = self
+                    .coordinator
+                    .store
+                    .set_recovery_action(run_id, RecoveryAction::AwaitingSoyuz);
+                RecoveryOutcome::AwaitingSoyuz
+            }
+        }
+    }
+
+    pub async fn run(self, interval: Duration, mut shutdown: watch::Receiver<bool>) {
+        let interval = interval.max(Duration::from_millis(100));
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            let summary = self.reconcile_pending().await;
+            let callbacks = self.coordinator.replay_pending_callbacks(100).await;
+            tracing::info!(
+                inspected = summary.inspected,
+                recovered = summary.recovered,
+                awaiting_soyuz = summary.awaiting_soyuz,
+                owned_elsewhere = summary.owned_elsewhere,
+                manual_review = summary.manual_review_required,
+                ambiguous_execution = summary.ambiguous_execution,
+                callbacks_attempted = callbacks.attempted,
+                callbacks_delivered = callbacks.delivered,
+                callbacks_blocked = callbacks.blocked,
+                "recovery reconciliation cycle completed"
+            );
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
     }
 }
 
@@ -840,6 +1200,9 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use fossil_core::queue::{CloudflarePullResponse, CloudflareQueueMessage};
+    use fossil_senku::{
+        DecisionAnswer, DecisionError, ProfileId, ProviderUsage, ValidatedDecision,
+    };
     use fossil_soyuz::{SoyuzClient, SoyuzClientConfig};
     use secrecy::SecretString;
     use std::sync::Mutex;
@@ -849,6 +1212,76 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     const RUN_ID_TEXT: &str = "f8a0c4c5-d628-7b93-a7cf-4b4629a28853";
+
+    struct FixedDecisionService {
+        response: Result<ValidatedDecision, DecisionError>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DecisionService for FixedDecisionService {
+        async fn evaluate(
+            &self,
+            _request: ProfileEvaluation,
+        ) -> Result<ValidatedDecision, DecisionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.response.clone()
+        }
+    }
+
+    fn favourable_admission() -> ValidatedDecision {
+        let mut answers = std::collections::BTreeMap::new();
+        answers.insert(
+            "contains_credentials".to_owned(),
+            DecisionAnswer::Noul {
+                noul: 0.01,
+                probabilities: [("false".to_owned(), 0.99), ("true".to_owned(), 0.01)].into(),
+            },
+        );
+        answers.insert(
+            "changes_permissions".to_owned(),
+            DecisionAnswer::Noul {
+                noul: 0.01,
+                probabilities: [("false".to_owned(), 0.99), ("true".to_owned(), 0.01)].into(),
+            },
+        );
+        answers.insert(
+            "crosses_security_boundary".to_owned(),
+            DecisionAnswer::Noul {
+                noul: 0.01,
+                probabilities: [("false".to_owned(), 0.99), ("true".to_owned(), 0.01)].into(),
+            },
+        );
+        for (answer_id, value) in [
+            ("risk_level", "low"),
+            ("task_type", "feature"),
+            ("validation_focus", "integration_tests"),
+        ] {
+            answers.insert(
+                answer_id.to_owned(),
+                DecisionAnswer::Choice {
+                    choice: value.to_owned(),
+                    probabilities: [(value.to_owned(), 1.0)].into(),
+                    confidence: Some(1.0),
+                },
+            );
+        }
+        ValidatedDecision {
+            profile_id: ProfileId::TaskAdmission,
+            profile_version: "1".to_owned(),
+            request_id: "test-advisory".to_owned(),
+            provider: "jev".to_owned(),
+            model: "test/mock".to_owned(),
+            answers,
+            usage: Some(ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                cost_micros: None,
+            }),
+            duration_ms: 1,
+        }
+    }
 
     struct RunReadSequence {
         reads: AtomicUsize,
@@ -886,6 +1319,46 @@ mod tests {
                     "operationalHealth": "healthy"
                 },
                 "requestId": format!("read-{index}")
+            }))
+        }
+    }
+
+    struct RecoverAfterOutageResponder {
+        reads: AtomicUsize,
+        claim_callback_id: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Respond for RecoverAfterOutageResponder {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            let index = self.reads.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                return ResponseTemplate::new(503).set_body_string("temporarily unavailable");
+            }
+            let status = ["queued", "claimed", "running"]
+                .get(index.saturating_sub(1))
+                .copied()
+                .unwrap_or("running");
+            let claim_callback_id = self
+                .claim_callback_id
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133".to_owned());
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "runId": RUN_ID_TEXT,
+                    "displayId": "soyuz-213",
+                    "status": status,
+                    "cancelRequestedAt": null,
+                    "claimExpiresAt": "2026-12-02T12:02:00.000Z",
+                    "workerId": "fossil-host-01",
+                    "claimCallbackId": claim_callback_id,
+                    "stage": "running",
+                    "updatedAt": "2026-12-02T12:00:00.000Z",
+                    "lastHeartbeatAt": "2026-12-02T12:00:00.000Z",
+                    "operationalHealth": "healthy"
+                },
+                "requestId": format!("recovery-read-{index}")
             }))
         }
     }
@@ -960,6 +1433,210 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn recovery_reconciles_a_transient_soyuz_outage_without_queue_redelivery() {
+        let server = MockServer::start().await;
+        let claim_callback_id = Arc::new(Mutex::new(None));
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/worker/runs/{RUN_ID_TEXT}")))
+            .respond_with(RecoverAfterOutageResponder {
+                reads: AtomicUsize::new(0),
+                claim_callback_id: Arc::clone(&claim_callback_id),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/worker/runs/{RUN_ID_TEXT}/claim")))
+            .respond_with(move |request: &Request| {
+                if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    && let Some(callback_id) = body.get("callbackId").and_then(|v| v.as_str())
+                {
+                    *claim_callback_id.lock().unwrap() = Some(callback_id.to_owned());
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {"accepted": true},
+                    "requestId": "claim-request"
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/worker/runs/{RUN_ID_TEXT}/started")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {},
+                "requestId": "start-request"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempdir().unwrap();
+        let store =
+            SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
+        let coordinator = Arc::new(AuthorizationCoordinator::new(
+            soyuz_client(&server),
+            store.clone(),
+            WorkerId::parse("fossil-host-01").unwrap(),
+        ));
+        assert!(matches!(
+            coordinator.process(queue_message()).await,
+            QueueDisposition::Retry { .. }
+        ));
+        assert_eq!(
+            store
+                .get_run(RunId::parse(RUN_ID_TEXT).unwrap())
+                .unwrap()
+                .lifecycle_state,
+            LocalLifecycleState::MessageValidated
+        );
+
+        let recovery = RecoveryManager::new(coordinator);
+        assert_eq!(
+            recovery
+                .reconcile_run(RunId::parse(RUN_ID_TEXT).unwrap())
+                .await,
+            RecoveryOutcome::Recovered
+        );
+        let record = store.get_run(RunId::parse(RUN_ID_TEXT).unwrap()).unwrap();
+        assert_eq!(
+            record.lifecycle_state,
+            LocalLifecycleState::StartAuthorizationPersisted
+        );
+        assert!(record.start_authorized);
+    }
+
+    #[tokio::test]
+    async fn senku_outage_stays_advisory_and_cannot_authorize_without_soyuz() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/worker/runs/{RUN_ID_TEXT}")))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempdir().unwrap();
+        let store =
+            SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
+        let senku = Arc::new(FixedDecisionService {
+            response: Err(DecisionError::Timeout),
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = AuthorizationCoordinator::new(
+            soyuz_client(&server),
+            store.clone(),
+            WorkerId::parse("fossil-host-01").unwrap(),
+        )
+        .with_decision_service(senku.clone());
+
+        assert!(matches!(
+            coordinator.process(queue_message()).await,
+            QueueDisposition::Retry { .. }
+        ));
+        let record = store.get_run(RunId::parse(RUN_ID_TEXT).unwrap()).unwrap();
+        assert_eq!(
+            record.lifecycle_state,
+            LocalLifecycleState::MessageValidated
+        );
+        assert!(record.claim_callback_id.is_none());
+        assert!(!record.start_authorized);
+        assert_eq!(senku.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(coordinator.metrics().senku_task_admission_degraded, 1);
+    }
+
+    #[tokio::test]
+    async fn redelivery_preserves_manual_review_and_does_not_resume_authorization() {
+        let directory = tempdir().unwrap();
+        let store =
+            SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
+        store
+            .observe_run(
+                RunId::parse(RUN_ID_TEXT).unwrap(),
+                WorkerId::parse("fossil-host-01").unwrap(),
+            )
+            .unwrap();
+        store
+            .record_recovery_action(
+                RunId::parse(RUN_ID_TEXT).unwrap(),
+                RecoveryAction::ManualReview,
+            )
+            .unwrap();
+        let config = SoyuzClientConfig::new(
+            url::Url::parse("http://127.0.0.1:1").unwrap(),
+            SecretString::from("test-worker-token".to_owned()),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let coordinator = AuthorizationCoordinator::new(
+            Arc::new(SoyuzClient::new(config).unwrap()),
+            store.clone(),
+            WorkerId::parse("fossil-host-01").unwrap(),
+        );
+
+        assert_eq!(
+            coordinator.process(queue_message()).await,
+            QueueDisposition::Acknowledge
+        );
+        let record = store.get_run(RunId::parse(RUN_ID_TEXT).unwrap()).unwrap();
+        assert_eq!(record.recovery_action, RecoveryAction::ManualReview);
+        assert_eq!(record.recovery_attempts, 1);
+        assert!(record.claim_callback_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_other_worker_ownership_releases_local_capacity_without_callback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/worker/runs/{RUN_ID_TEXT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "runId": RUN_ID_TEXT,
+                    "displayId": "soyuz-213",
+                    "status": "running",
+                    "cancelRequestedAt": null,
+                    "claimExpiresAt": "2026-12-02T12:02:00.000Z",
+                    "workerId": "another-host",
+                    "claimCallbackId": "d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133",
+                    "stage": "running",
+                    "updatedAt": "2026-12-02T12:00:00.000Z",
+                    "lastHeartbeatAt": "2026-12-02T12:00:00.000Z",
+                    "operationalHealth": "healthy"
+                },
+                "requestId": "other-owner-read"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempdir().unwrap();
+        let store =
+            SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
+        let senku = Arc::new(FixedDecisionService {
+            response: Ok(favourable_admission()),
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = AuthorizationCoordinator::new(
+            soyuz_client(&server),
+            store.clone(),
+            WorkerId::parse("fossil-host-01").unwrap(),
+        )
+        .with_decision_service(senku.clone());
+        assert_eq!(
+            coordinator.process(queue_message()).await,
+            QueueDisposition::Acknowledge
+        );
+        let record = store.get_run(RunId::parse(RUN_ID_TEXT).unwrap()).unwrap();
+        assert_eq!(
+            record.lifecycle_state,
+            LocalLifecycleState::ExecutionTerminal
+        );
+        assert_eq!(record.recovery_action, RecoveryAction::OwnedElsewhere);
+        assert!(store.pending_callbacks().unwrap().is_empty());
+        assert!(store.intake_capacity_available().unwrap());
+        assert_eq!(senku.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(coordinator.metrics().senku_task_admission_successes, 1);
     }
 
     #[tokio::test]

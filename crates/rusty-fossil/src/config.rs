@@ -1,6 +1,7 @@
 use fossil_core::ids::WorkerId;
 use fossil_queue::CloudflareQueueConfig;
-use secrecy::SecretString;
+use fossil_senku::{SenkuClient, SenkuClientConfig};
+use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
@@ -89,6 +90,8 @@ pub struct AppConfig {
     pub cloudflare_queue_token: Option<SecretString>,
     pub cloudflare_queue_visibility_timeout_ms: u32,
     pub worker_id: Option<WorkerId>,
+    pub senku_api_origin: Option<Url>,
+    pub senku_api_token: Option<SecretString>,
     pub polling_interval: Duration,
     pub request_timeout: Duration,
     pub state_dir: PathBuf,
@@ -122,6 +125,14 @@ impl fmt::Debug for AppConfig {
             )
             .field("worker_id_configured", &self.worker_id.is_some())
             .field(
+                "senku_api_origin_configured",
+                &self.senku_api_origin.is_some(),
+            )
+            .field(
+                "senku_api_token",
+                &self.senku_api_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
                 "cloudflare_queue_visibility_timeout_ms",
                 &self.cloudflare_queue_visibility_timeout_ms,
             )
@@ -147,6 +158,12 @@ pub struct ReadinessReport {
     pub queue_configured: bool,
     pub queue_transport_healthy: Option<bool>,
     pub recovery_backlog_healthy: bool,
+    pub outbox_backpressured: bool,
+    pub callbacks_pending: u64,
+    pub callbacks_blocked: u64,
+    pub oldest_pending_callback_age_ms: Option<u64>,
+    pub senku_configured: bool,
+    pub senku_advisory_healthy: Option<bool>,
     pub missing_dependencies: Vec<String>,
     pub limitations: Vec<String>,
 }
@@ -191,6 +208,17 @@ impl AppConfig {
                 WorkerId::parse(value).map_err(|_| ConfigError::InvalidValue("SOYUZ_WORKER_ID"))
             })
             .transpose()?;
+        let senku_api_origin = get("SENKU_API_ORIGIN")
+            .map(|value| parse_senku_api_origin(value, mode))
+            .transpose()?;
+        let senku_api_token = read_secret(&values, "SENKU_API_TOKEN_FILE", "SENKU_API_TOKEN")?;
+        if senku_api_token.as_ref().is_some_and(|token| {
+            let token = token.expose_secret();
+            !(32..=1_024).contains(&token.len())
+                || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        }) {
+            return Err(ConfigError::InvalidValue("SENKU_API_TOKEN"));
+        }
         let cloudflare_queue_visibility_timeout_ms = parse_bounded_u32(
             get("CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS"),
             60_000,
@@ -228,6 +256,8 @@ impl AppConfig {
             cloudflare_queue_token,
             cloudflare_queue_visibility_timeout_ms,
             worker_id,
+            senku_api_origin,
+            senku_api_token,
             polling_interval,
             request_timeout,
             state_dir,
@@ -257,6 +287,17 @@ impl AppConfig {
         )
         .map(Some)
         .map_err(|_| ConfigError::InvalidValue("Cloudflare Queue configuration"))
+    }
+
+    pub fn senku_client(&self) -> Result<Option<SenkuClient>, ConfigError> {
+        let (Some(origin), Some(token)) = (&self.senku_api_origin, &self.senku_api_token) else {
+            return Ok(None);
+        };
+        let config = SenkuClientConfig::new(origin.clone(), token.clone(), self.request_timeout)
+            .map_err(|_| ConfigError::InvalidValue("SENKU_API_CONFIGURATION"))?;
+        SenkuClient::new(config)
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidValue("SENKU_API_CONFIGURATION"))
     }
 
     pub fn readiness_report_with_state(
@@ -316,6 +357,12 @@ impl AppConfig {
             queue_configured,
             queue_transport_healthy,
             recovery_backlog_healthy,
+            outbox_backpressured: false,
+            callbacks_pending: 0,
+            callbacks_blocked: 0,
+            oldest_pending_callback_age_ms: None,
+            senku_configured: self.senku_api_origin.is_some() && self.senku_api_token.is_some(),
+            senku_advisory_healthy: None,
             missing_dependencies,
             limitations,
         }
@@ -347,6 +394,24 @@ fn parse_api_origin(value: &str, mode: DeploymentMode) -> Result<Url, ConfigErro
         || url.fragment().is_some()
     {
         return Err(ConfigError::InvalidValue("SOYUZ_API_ORIGIN"));
+    }
+    Ok(url)
+}
+
+fn parse_senku_api_origin(value: &str, mode: DeploymentMode) -> Result<Url, ConfigError> {
+    let url = Url::parse(value).map_err(|_| ConfigError::InvalidValue("SENKU_API_ORIGIN"))?;
+    let https = url.scheme() == "https";
+    let development_loopback =
+        mode == DeploymentMode::Development && url.scheme() == "http" && is_loopback(&url);
+    if (!https && !development_loopback)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidValue("SENKU_API_ORIGIN"));
     }
     Ok(url)
 }
@@ -544,6 +609,59 @@ mod tests {
                 .cloudflare_queue_config()
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn senku_configuration_is_optional_separate_and_redacted() {
+        let absent = AppConfig::from_pairs([]).unwrap();
+        assert!(!absent.readiness_report(true).senku_configured);
+        assert!(absent.senku_client().unwrap().is_none());
+
+        let configured = AppConfig::from_pairs([
+            (
+                "SENKU_API_ORIGIN".to_owned(),
+                "https://senku.example.test".to_owned(),
+            ),
+            (
+                "SENKU_API_TOKEN".to_owned(),
+                "synthetic-senku-token-000000000000".to_owned(),
+            ),
+        ])
+        .unwrap();
+        assert!(configured.readiness_report(true).senku_configured);
+        assert!(configured.senku_client().unwrap().is_some());
+        assert!(!format!("{configured:?}").contains("synthetic-senku-token"));
+        assert!(
+            !configured
+                .readiness_report(true)
+                .missing_dependencies
+                .contains(&"senku".to_owned())
+        );
+    }
+
+    #[test]
+    fn senku_rejects_remote_loopback_http_and_malformed_credentials() {
+        assert!(matches!(
+            AppConfig::from_pairs([(
+                "SENKU_API_ORIGIN".to_owned(),
+                "http://senku.example.test".to_owned(),
+            )]),
+            Err(ConfigError::InvalidValue("SENKU_API_ORIGIN"))
+        ));
+        assert!(matches!(
+            AppConfig::from_pairs([("SENKU_API_TOKEN".to_owned(), "too-short".to_owned(),)]),
+            Err(ConfigError::InvalidValue("SENKU_API_TOKEN"))
+        ));
+        assert!(
+            AppConfig::from_pairs([
+                ("RUSTY_FOSSIL_ENV".to_owned(), "development".to_owned()),
+                (
+                    "SENKU_API_ORIGIN".to_owned(),
+                    "http://127.0.0.1:8787".to_owned()
+                ),
+            ])
+            .is_ok()
         );
     }
 }

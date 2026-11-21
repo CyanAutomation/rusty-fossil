@@ -1,0 +1,13 @@
+# Optional overlay for enabling Senku advisory calls in a local or mock setup.
+# Start with: docker compose -f docker-compose.yml -f docker-compose.senku.yml up
+services:
+  rusty-fossil:
+    environment:
+      SENKU_API_ORIGIN: ${SENKU_API_ORIGIN:-https://senku.scheimann.workers.dev}
+      SENKU_API_TOKEN_FILE: /run/secrets/senku_api_token
+    secrets:
+      - senku_api_token
+
+secrets:
+  senku_api_token:
+    file: ./secrets/senku_api_token
