@@ -47,7 +47,7 @@ Fields are typed and `deny_unknown_fields` is applied recursively. In particular
 
 ### Default publication mode policy
 
-Every normal run defaults to `publishMode: "pr"` in Soyuz. Rusty-Fossil mirrors that default when parsing a legacy or incomplete normalized queue request and otherwise preserves Soyuz's explicit value; it does not choose a mode or publish to GitHub itself. `none`, `branch`, and `auto` are rare, explicit exceptions for narrowly scoped tests, not routine run settings. See Kirisame's [cross-project publish mode policy](https://github.com/CyanAutomation/kirisame/blob/codex/phase-0-architecture-contracts/docs/PUBLISH-MODE-POLICY.md).
+Every normal run defaults to `publishMode: "pr"` in Soyuz. Rusty-Fossil mirrors that default when parsing a legacy or incomplete normalized queue request and otherwise preserves Soyuz's explicit value; it does not choose a mode or publish to GitHub itself. `none`, `branch`, and `auto` are rare, explicit exceptions for narrowly scoped tests, not routine run settings. See Kirisame's [cross-project publish mode policy](https://github.com/CyanAutomation/kirisame/blob/0ffdd11cdea1e63f7c7218f21969dfdb177a31c8/docs/PUBLISH-MODE-POLICY.md).
 
 ## Soyuz worker API
 
