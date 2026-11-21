@@ -110,6 +110,7 @@ struct QueueMetrics {
     ack_failures: AtomicU64,
     retry_attempts: AtomicU64,
     retry_failures: AtomicU64,
+    polling_suspensions: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,7 @@ pub struct QueueMetricsSnapshot {
     pub ack_failures: u64,
     pub retry_attempts: u64,
     pub retry_failures: u64,
+    pub polling_suspensions: u64,
 }
 
 #[derive(Clone)]
@@ -257,6 +259,7 @@ impl CloudflareQueueClient {
             ack_failures: self.metrics.ack_failures.load(Ordering::Relaxed),
             retry_attempts: self.metrics.retry_attempts.load(Ordering::Relaxed),
             retry_failures: self.metrics.retry_failures.load(Ordering::Relaxed),
+            polling_suspensions: self.metrics.polling_suspensions.load(Ordering::Relaxed),
         }
     }
 
@@ -290,10 +293,25 @@ impl CloudflareQueueClient {
                     let lease_id = message.lease_id.clone();
                     match process(message).await {
                         QueueDisposition::Acknowledge => {
-                            let _ = self.acknowledge(lease_id).await;
+                            if let Err(error) = self.acknowledge(lease_id).await {
+                                tracing::warn!(
+                                    operation = "acknowledge",
+                                    error = %error,
+                                    delivery_state = "uncertain",
+                                    "Cloudflare Queue acknowledgement failed"
+                                );
+                            }
                         }
                         QueueDisposition::Retry { delay_seconds } => {
-                            let _ = self.retry(lease_id, delay_seconds).await;
+                            if let Err(error) = self.retry(lease_id, delay_seconds).await {
+                                tracing::warn!(
+                                    operation = "retry",
+                                    error = %error,
+                                    retry_delay_seconds = delay_seconds,
+                                    delivery_state = "uncertain",
+                                    "Cloudflare Queue retry request failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -304,14 +322,22 @@ impl CloudflareQueueClient {
                     // permanent failures stop this poller instead of hot-looping.
                     // Queue delivery remains leased and will become visible again.
                     if !error.is_retryable() {
+                        self.metrics
+                            .polling_suspensions
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            error = %error,
+                            "Cloudflare Queue polling suspended after a permanent failure"
+                        );
                         return;
                     }
-                    if !wait_for_poll(
-                        &mut shutdown,
-                        Duration::from_secs(u64::from(retry_delay_seconds(failure_count))),
-                    )
-                    .await
-                    {
+                    let delay = retry_delay_seconds(failure_count);
+                    tracing::warn!(
+                        error = %error,
+                        retry_delay_seconds = delay,
+                        "Cloudflare Queue pull failed; polling will resume after bounded backoff"
+                    );
+                    if !wait_for_poll(&mut shutdown, Duration::from_secs(u64::from(delay))).await {
                         return;
                     }
                 }
