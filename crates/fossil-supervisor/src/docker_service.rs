@@ -1282,7 +1282,11 @@ fn outcome_from_launch(
 fn docker_timestamp_ms(value: &str) -> Option<i64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
-        .map(|timestamp| (timestamp.unix_timestamp_nanos() / 1_000_000) as i64)
+        .and_then(|timestamp| unix_nanos_to_millis(timestamp.unix_timestamp_nanos()))
+}
+
+fn unix_nanos_to_millis(value: i128) -> Option<i64> {
+    i64::try_from(value / 1_000_000).ok()
 }
 
 fn format_timestamp_ms(value: i64) -> Option<String> {
@@ -1292,7 +1296,8 @@ fn format_timestamp_ms(value: i64) -> Option<String> {
 }
 
 fn now_ms() -> i64 {
-    OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000
+    unix_nanos_to_millis(OffsetDateTime::now_utc().unix_timestamp_nanos())
+        .expect("current Unix millisecond timestamp fits in i64")
 }
 
 fn supports_required_resource_controls(info: &SystemInfo) -> bool {
@@ -1313,7 +1318,7 @@ fn supports_required_resource_controls(info: &SystemInfo) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::supports_required_resource_controls;
+    use super::{supports_required_resource_controls, unix_nanos_to_millis};
     use bollard::models::SystemInfo;
 
     fn docker_info(os_type: &str, memory: bool, cpu: bool, pids: bool) -> SystemInfo {
@@ -1360,5 +1365,17 @@ mod tests {
         .unwrap();
 
         assert!(!supports_required_resource_controls(&info));
+    }
+
+    #[test]
+    fn unix_nanoseconds_convert_to_milliseconds_before_range_check() {
+        assert_eq!(
+            unix_nanos_to_millis(1_760_000_000_123_456_789),
+            Some(1_760_000_000_123)
+        );
+        assert_eq!(
+            unix_nanos_to_millis((i128::from(i64::MAX) + 1) * 1_000_000),
+            None
+        );
     }
 }

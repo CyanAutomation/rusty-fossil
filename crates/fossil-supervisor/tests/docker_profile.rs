@@ -106,7 +106,7 @@ fn container_image_must_be_pinned_by_digest() {
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "/var/run/docker.sock"
         )
-        .is_ok()
+        .is_err()
     );
 }
 

@@ -75,7 +75,7 @@ jobs:
       - name: Capture the immutable local image ID
         run: echo "FOSSIL_SUPERVISOR_TEST_IMAGE=$(docker image inspect --format '{{.Id}}' rusty-fossil-synthetic-worker:test)" >> "$GITHUB_ENV"
       - name: Run the authorized Docker lifecycle integration
-        run: cargo test -p fossil-supervisor --test docker_engine --locked -- --ignored
+        run: cargo test -p fossil-supervisor --features test-support --test docker_engine --locked -- --ignored
 
   linux-targets:
     name: Cross build (${{ matrix.target }})

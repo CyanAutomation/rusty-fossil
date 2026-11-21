@@ -138,10 +138,31 @@ impl DockerRuntimeConfig {
         limits: SupervisorLimits,
     ) -> Result<Self, DockerConfigError> {
         let image = image.into();
-        let socket_path = socket_path.into();
         if !is_digest_pinned_image(&image) {
             return Err(DockerConfigError::ImageNotPinned);
         }
+        Self::build(image, socket_path.into(), limits)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_test_image_id(
+        image_id: impl Into<String>,
+        socket_path: impl Into<PathBuf>,
+        limits: SupervisorLimits,
+    ) -> Result<Self, DockerConfigError> {
+        let image_id = image_id.into();
+        if !is_local_image_id(&image_id) {
+            return Err(DockerConfigError::ImageNotPinned);
+        }
+        Self::build(image_id, socket_path.into(), limits)
+    }
+
+    fn build(
+        image: String,
+        socket_path: PathBuf,
+        limits: SupervisorLimits,
+    ) -> Result<Self, DockerConfigError> {
         if !socket_path.is_absolute()
             || socket_path.to_string_lossy().contains('\0')
             || !matches!(socket_path.to_string_lossy().as_ref(), path if path.starts_with('/'))
@@ -248,15 +269,19 @@ impl DockerRuntimeConfig {
 }
 
 fn is_digest_pinned_image(image: &str) -> bool {
-    if let Some(digest) = image.strip_prefix("sha256:") {
-        return digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
-    }
     let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
         return false;
     };
-    repository == TRUSTED_WORKER_IMAGE
-        && digest.len() == 64
-        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    repository == TRUSTED_WORKER_IMAGE && valid_sha256(digest)
+}
+
+#[cfg(feature = "test-support")]
+fn is_local_image_id(image: &str) -> bool {
+    image.strip_prefix("sha256:").is_some_and(valid_sha256)
+}
+
+fn valid_sha256(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub(crate) fn outcome_for_exit(exit_code: i32) -> (Option<i32>, &'static str, &'static str) {
@@ -328,16 +353,38 @@ mod tests {
     }
 
     #[test]
-    fn only_the_fixed_worker_repository_or_immutable_ci_image_id_is_accepted() {
+    fn only_the_fixed_worker_repository_digest_is_accepted() {
         let digest = "a".repeat(64);
         let trusted = format!("{TRUSTED_WORKER_IMAGE}@sha256:{digest}");
         assert!(DockerRuntimeConfig::new(trusted, "/var/run/docker.sock").is_ok());
         assert!(
-            DockerRuntimeConfig::new(format!("sha256:{digest}"), "/var/run/docker.sock").is_ok()
+            DockerRuntimeConfig::new(format!("sha256:{digest}"), "/var/run/docker.sock").is_err()
         );
         assert_eq!(
             DockerRuntimeConfig::new("alpine:latest", "/var/run/docker.sock").unwrap_err(),
             DockerConfigError::ImageNotPinned
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_support_accepts_only_an_immutable_local_image_id() {
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        assert!(
+            DockerRuntimeConfig::with_test_image_id(
+                image_id,
+                "/var/run/docker.sock",
+                SupervisorLimits::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            DockerRuntimeConfig::with_test_image_id(
+                "rusty-fossil-synthetic-worker:test",
+                "/var/run/docker.sock",
+                SupervisorLimits::default()
+            )
+            .is_err()
         );
     }
 }
