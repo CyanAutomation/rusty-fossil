@@ -168,10 +168,41 @@ async fn abrupt_worker_termination_is_not_reported_as_success() {
 async fn launch(harness: &DockerHarness, scenario: SyntheticScenario) -> ExecutionOutcome {
     let result: Result<ExecutionOutcome, _> =
         harness.supervisor.launch(harness.run_id, scenario).await;
-    if result.is_err() {
+    if let Err(error) = &result {
+        eprintln!("Docker integration launch failed: {error:?}");
+        diagnose_container(harness).await;
         cleanup_owned_container(&harness.store, harness.run_id, &harness.docker_socket).await;
     }
     result.unwrap()
+}
+
+async fn diagnose_container(harness: &DockerHarness) {
+    use bollard::Docker;
+
+    let Ok(docker) =
+        Docker::connect_with_socket(&harness.docker_socket, 30, bollard::API_DEFAULT_VERSION)
+    else {
+        return;
+    };
+    let Ok(docker) = docker.negotiate_version().await else {
+        return;
+    };
+    let Ok(Some(launch)) = harness.store.container_launch(harness.run_id) else {
+        return;
+    };
+    let Ok(inspect) = docker
+        .inspect_container(
+            &launch.container_name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    else {
+        return;
+    };
+    eprintln!(
+        "Docker integration inspect state: launch={:?}, config={:?}, host_config={:?}, state={:?}",
+        launch.state, inspect.config, inspect.host_config, inspect.state
+    );
 }
 
 async fn authorized_harness(limits: SupervisorLimits) -> DockerHarness {
