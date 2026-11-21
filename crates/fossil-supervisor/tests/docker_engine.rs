@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 use fossil_core::execution::SyntheticScenario;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::LocalLifecycleState;
@@ -282,7 +284,8 @@ async fn authorized_harness(limits: SupervisorLimits) -> DockerHarness {
     store.record_start_authorization(run_id, started).unwrap();
     store.reserve_execution_slot(run_id).unwrap();
 
-    let docker_config = DockerRuntimeConfig::with_limits(image, &docker_socket, limits).unwrap();
+    let docker_config =
+        DockerRuntimeConfig::with_test_image_id(image, &docker_socket, limits).unwrap();
     let supervisor = DockerSupervisor::connect(docker_config, store.clone(), soyuz, worker_id)
         .await
         .unwrap();

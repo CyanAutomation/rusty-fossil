@@ -490,10 +490,17 @@ async fn recover_pending(
         }
     };
     for launch in launches {
-        if launch.state != ContainerLaunchState::ManualReviewRequired {
+        if should_resume(launch.state) {
             spawn_resume(launch.run_id, supervisor.clone(), active.clone()).await;
         }
     }
+}
+
+fn should_resume(state: ContainerLaunchState) -> bool {
+    !matches!(
+        state,
+        ContainerLaunchState::CleanupCompleted | ContainerLaunchState::ManualReviewRequired
+    )
 }
 
 async fn read_request(stream: &mut UnixStream) -> Result<Request, SupervisorIpcError> {
@@ -544,10 +551,12 @@ fn valid_token(token: &str) -> bool {
 
 fn secure_eq(left: &str, right: &str) -> bool {
     let width = left.len().max(right.len());
-    let mut difference = (left.len() ^ right.len()) as u8;
+    let mut difference = left.len() ^ right.len();
     for index in 0..width {
-        difference |= left.as_bytes().get(index).copied().unwrap_or(0)
-            ^ right.as_bytes().get(index).copied().unwrap_or(0);
+        difference |= usize::from(
+            left.as_bytes().get(index).copied().unwrap_or(0)
+                ^ right.as_bytes().get(index).copied().unwrap_or(0),
+        );
     }
     difference == 0
 }
@@ -666,6 +675,14 @@ mod tests {
         ));
         assert!(!valid_token("too-short"));
         assert!(valid_token(&"x".repeat(32)));
+        assert!(!secure_eq("x", &format!("x{}", "\0".repeat(256))));
+    }
+
+    #[test]
+    fn recovery_skips_completed_and_manual_review_launches() {
+        assert!(!should_resume(ContainerLaunchState::CleanupCompleted));
+        assert!(!should_resume(ContainerLaunchState::ManualReviewRequired));
+        assert!(should_resume(ContainerLaunchState::ContainerRunning));
     }
 
     #[test]
