@@ -17,7 +17,7 @@ repository = "https://github.com/CyanAutomation/rusty-fossil"
 [workspace.dependencies]
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http1", "json", "tokio"] }
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 fossil-core = { path = "crates/fossil-core" }
 fossil-soyuz = { path = "crates/fossil-soyuz" }
