@@ -11,6 +11,7 @@ clap.workspace = true
 fossil-core.workspace = true
 fossil-queue.workspace = true
 fossil-soyuz.workspace = true
+fossil-senku.workspace = true
 fossil-storage.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -27,3 +28,4 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 wiremock = "0.6"
+async-trait.workspace = true

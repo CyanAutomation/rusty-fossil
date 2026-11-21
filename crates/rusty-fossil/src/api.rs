@@ -34,9 +34,22 @@ impl ApiState {
 
     fn readiness(&self) -> ReadinessReport {
         let state_store_ready = self.store.run_count().is_ok();
-        let recovery_backlog_healthy = self.store.execution_capacity_available().unwrap_or(false);
-        self.config
-            .readiness_report_with_state(state_store_ready, recovery_backlog_healthy, None)
+        let recovery_backlog_healthy = self.store.recovery_backlog_available().unwrap_or(false);
+        let mut report = self.config.readiness_report_with_state(
+            state_store_ready,
+            recovery_backlog_healthy,
+            None,
+        );
+        if let Ok(outbox) = self.store.callback_outbox_status() {
+            report.outbox_backpressured = outbox.intake_backpressured;
+            report.callbacks_pending = outbox.pending;
+            report.callbacks_blocked = outbox.blocked;
+            report.oldest_pending_callback_age_ms = outbox.oldest_pending_age_ms;
+            if report.outbox_backpressured {
+                report.execution_handoff_ready = false;
+            }
+        }
+        report
     }
 }
 
@@ -56,6 +69,12 @@ struct ReadyResponse {
     queue_configured: bool,
     queue_transport_healthy: Option<bool>,
     recovery_backlog_healthy: bool,
+    outbox_backpressured: bool,
+    callbacks_pending: u64,
+    callbacks_blocked: u64,
+    oldest_pending_callback_age_ms: Option<u64>,
+    senku_configured: bool,
+    senku_advisory_healthy: Option<bool>,
     missing_dependencies: Vec<String>,
     limitations: Vec<String>,
 }
@@ -71,6 +90,12 @@ impl From<ReadinessReport> for ReadyResponse {
             queue_configured: report.queue_configured,
             queue_transport_healthy: report.queue_transport_healthy,
             recovery_backlog_healthy: report.recovery_backlog_healthy,
+            outbox_backpressured: report.outbox_backpressured,
+            callbacks_pending: report.callbacks_pending,
+            callbacks_blocked: report.callbacks_blocked,
+            oldest_pending_callback_age_ms: report.oldest_pending_callback_age_ms,
+            senku_configured: report.senku_configured,
+            senku_advisory_healthy: report.senku_advisory_healthy,
             missing_dependencies: report.missing_dependencies,
             limitations: report.limitations,
         }
@@ -113,10 +138,11 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         .metrics_requests
         .fetch_add(1, Ordering::Relaxed);
     let ready = u8::from(state.readiness().execution_ready);
-    let (callbacks_pending, callbacks_blocked) =
-        state.store.callback_outbox_counts().unwrap_or_default();
+    let outbox = state.store.callback_outbox_status().unwrap_or_default();
+    let recovery = state.store.recovery_diagnostics().unwrap_or_default();
     let execution_slot_available =
-        u8::from(state.store.execution_capacity_available().unwrap_or(false));
+        u8::from(state.store.intake_capacity_available().unwrap_or(false));
+    let outbox_backpressured = u8::from(outbox.intake_backpressured);
     let body = format!(
         "# HELP fossil_controller_up Whether the Rusty-Fossil process is live.\n\
          # TYPE fossil_controller_up gauge\n\
@@ -137,13 +163,57 @@ async fn metrics(State(state): State<ApiState>) -> Response {
          fossil_callbacks_blocked {}\n\
          # HELP fossil_execution_slot_available Whether local recovery state permits Queue intake.\n\
          # TYPE fossil_execution_slot_available gauge\n\
-         fossil_execution_slot_available {}\n",
+         fossil_execution_slot_available {}\n\
+         # HELP fossil_callbacks_oldest_pending_age_ms Age of the oldest pending callback.\n\
+         # TYPE fossil_callbacks_oldest_pending_age_ms gauge\n\
+         fossil_callbacks_oldest_pending_age_ms {}\n\
+         # HELP fossil_intake_outbox_backpressured Whether intake is paused to protect callback capacity.\n\
+         # TYPE fossil_intake_outbox_backpressured gauge\n\
+         fossil_intake_outbox_backpressured {}\n\
+         # HELP fossil_queue_intake_blocked_outbox Whether new intake is paused by callback capacity.\n\
+         # TYPE fossil_queue_intake_blocked_outbox gauge\n\
+         fossil_queue_intake_blocked_outbox {}\n\
+         # HELP fossil_queue_intake_blocked_recovery Whether new intake is paused by unresolved recovery state.\n\
+         # TYPE fossil_queue_intake_blocked_recovery gauge\n\
+         fossil_queue_intake_blocked_recovery {}\n\
+         # HELP fossil_recovery_unresolved_runs Number of nonterminal runs awaiting reconciliation.\n\
+         # TYPE fossil_recovery_unresolved_runs gauge\n\
+         fossil_recovery_unresolved_runs {}\n\
+         # HELP fossil_recovery_attempts_total Durable recovery attempts recorded by SQLite.\n\
+         # TYPE fossil_recovery_attempts_total counter\n\
+         fossil_recovery_attempts_total {}\n\
+         # HELP fossil_recovery_successful_runs Runs safely reconciled to a durable start authorization.\n\
+         # TYPE fossil_recovery_successful_runs gauge\n\
+         fossil_recovery_successful_runs {}\n\
+         # HELP fossil_recovery_awaiting_soyuz_runs Runs awaiting another canonical Soyuz read.\n\
+         # TYPE fossil_recovery_awaiting_soyuz_runs gauge\n\
+         fossil_recovery_awaiting_soyuz_runs {}\n\
+         # HELP fossil_recovery_owned_elsewhere_runs Local runs superseded after canonical ownership proof.\n\
+         # TYPE fossil_recovery_owned_elsewhere_runs gauge\n\
+         fossil_recovery_owned_elsewhere_runs {}\n\
+         # HELP fossil_recovery_manual_review_runs Runs requiring operator review.\n\
+         # TYPE fossil_recovery_manual_review_runs gauge\n\
+         fossil_recovery_manual_review_runs {}\n\
+         # HELP fossil_recovery_ambiguous_execution_runs Runs with potentially active execution.\n\
+         # TYPE fossil_recovery_ambiguous_execution_runs gauge\n\
+         fossil_recovery_ambiguous_execution_runs {}\n",
         state.metrics.health_requests.load(Ordering::Relaxed),
         state.metrics.readiness_requests.load(Ordering::Relaxed),
         state.metrics.metrics_requests.load(Ordering::Relaxed),
-        callbacks_pending,
-        callbacks_blocked,
+        outbox.pending,
+        outbox.blocked,
         execution_slot_available,
+        outbox.oldest_pending_age_ms.unwrap_or(0),
+        outbox_backpressured,
+        outbox_backpressured,
+        u8::from(recovery.unresolved_runs > 0),
+        recovery.unresolved_runs,
+        recovery.attempts,
+        recovery.recovered_runs,
+        recovery.awaiting_soyuz_runs,
+        recovery.owned_elsewhere,
+        recovery.manual_review_runs,
+        recovery.ambiguous_execution_runs,
     );
     (
         [(

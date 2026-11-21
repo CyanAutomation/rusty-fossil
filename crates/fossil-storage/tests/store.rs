@@ -1,3 +1,4 @@
+use fossil_core::contract::OperationalEventType;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::{CallbackDeliveryState, LocalLifecycleState};
 use fossil_core::queue::QueueEnvelope;
@@ -569,6 +570,54 @@ async fn callback_outbox_reuses_event_ids_and_tracks_delivery() {
     );
 }
 
+#[test]
+fn outbox_backpressure_reserves_terminal_callback_capacity_before_new_intake() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(state_path(directory.path())).unwrap();
+    store.observe_run(run_id(), worker_id()).unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::MessageValidated)
+        .unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::CanonicalRunChecked)
+        .unwrap();
+    let claim_callback_id = ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133").unwrap();
+    store
+        .begin_claim_intent(run_id(), claim_callback_id)
+        .unwrap();
+    for _ in 0..999 {
+        store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                EventId::new(),
+                run_id(),
+                CallbackPayload::Event {
+                    event_type: OperationalEventType::ProgressUpdate,
+                    worker_id: worker_id(),
+                    claim_callback_id,
+                    stage: None,
+                    step: None,
+                    timestamp_ms: 1_798_000_000_000,
+                    payload: serde_json::json!({}),
+                },
+            ))
+            .unwrap();
+    }
+
+    let status = store.callback_outbox_status().unwrap();
+    assert_eq!(status.pending, 999);
+    assert!(status.intake_backpressured);
+
+    let next_run = RunId::parse("f8a0c4c5-d628-7b93-a7cf-4b4629a28854").unwrap();
+    store.observe_run(next_run, worker_id()).unwrap();
+    let mut descriptor = execution_descriptor();
+    descriptor.run_id = next_run;
+    store.persist_execution_descriptor(descriptor).unwrap();
+    assert!(matches!(
+        store.reserve_intake_slot(next_run),
+        Err(StoreError::OutboxBackpressure)
+    ));
+}
+
 #[tokio::test]
 async fn marking_a_missing_callback_as_delivered_reports_callback_ineligibility() {
     let directory = tempdir().unwrap();
@@ -878,4 +927,25 @@ fn recovery_metadata_is_bounded_and_durable() {
     let record = reopened.get_run(run_id()).unwrap();
     assert_eq!(record.recovery_attempts, 1);
     assert_eq!(record.recovery_action, RecoveryAction::ReconcileWithSoyuz);
+}
+
+#[test]
+fn recovery_outcomes_are_durable_without_counting_an_extra_attempt() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(state_path(directory.path())).unwrap();
+    store.observe_run(run_id(), worker_id()).unwrap();
+    store
+        .record_recovery_action(run_id(), RecoveryAction::AwaitingSoyuz)
+        .unwrap();
+
+    store
+        .set_recovery_action(run_id(), RecoveryAction::Recovered)
+        .unwrap();
+
+    let record = store.get_run(run_id()).unwrap();
+    let diagnostics = store.recovery_diagnostics().unwrap();
+    assert_eq!(record.recovery_attempts, 1);
+    assert_eq!(record.recovery_action, RecoveryAction::Recovered);
+    assert_eq!(diagnostics.recovered_runs, 1);
+    assert_eq!(diagnostics.awaiting_soyuz_runs, 0);
 }
