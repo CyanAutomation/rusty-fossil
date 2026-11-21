@@ -177,7 +177,7 @@ async fn authorized_harness(limits: SupervisorLimits) -> DockerHarness {
         .expect("CI builds the test worker and supplies its immutable image ID");
     let docker_socket = std::env::var("FOSSIL_SUPERVISOR_TEST_DOCKER_SOCKET")
         .unwrap_or_else(|_| "/var/run/docker.sock".to_owned());
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let store = SqliteStore::open(directory.path().join("state.sqlite3")).unwrap();
     let run_id = RunId::parse(&Uuid::now_v7().to_string()).unwrap();
     let worker_id = WorkerId::parse(WORKER).unwrap();
@@ -294,6 +294,33 @@ async fn authorized_harness(limits: SupervisorLimits) -> DockerHarness {
         supervisor,
         cancel_requested,
         docker_socket,
+    }
+}
+
+fn private_tempdir() -> TempDir {
+    let directory = tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    directory
+}
+
+#[test]
+fn integration_state_directory_is_owner_only() {
+    let directory = private_tempdir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
 
