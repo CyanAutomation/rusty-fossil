@@ -1,4 +1,5 @@
 use fossil_core::contract::OperationalEventType;
+use fossil_core::execution::SyntheticScenario;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::{CallbackDeliveryState, LocalLifecycleState};
 use fossil_core::queue::QueueEnvelope;
@@ -7,8 +8,8 @@ use fossil_soyuz::{
     SoyuzClientConfig, StartedAuthorization, StartedRequest, WorkerClaimRequest,
 };
 use fossil_storage::{
-    CallbackOutboxRecord, CallbackPayload, ExecutionDescriptor, RecoveryAction, SqliteStore,
-    StoreError, callback_retry_deadline_ms,
+    CallbackOutboxRecord, CallbackPayload, ContainerLaunchState, ExecutionDescriptor,
+    RecoveryAction, SqliteStore, StoreError, callback_retry_deadline_ms,
 };
 use secrecy::SecretString;
 use std::fs;
@@ -287,6 +288,183 @@ async fn single_execution_slot_requires_a_fresh_matching_canonical_proof() {
             .unwrap()
     );
     assert_eq!(store.execution_descriptor(run_id()).unwrap(), None);
+}
+
+#[tokio::test]
+async fn docker_launch_intent_is_proof_gated_stable_and_durable() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+
+    assert!(matches!(
+        store.begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone()),
+        Err(StoreError::ExecutionSlotNotAuthorized)
+    ));
+    store.reserve_execution_slot(run_id()).unwrap();
+
+    let intent = store
+        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .unwrap();
+    assert_eq!(intent.state, ContainerLaunchState::LaunchIntentPersisted);
+    assert!(intent.container_name.starts_with("rusty-fossil-synth-"));
+    assert_eq!(
+        intent,
+        store
+            .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+            .unwrap()
+    );
+    assert!(matches!(
+        store.begin_container_launch(run_id(), SyntheticScenario::ControlledFailure, gate),
+        Err(StoreError::ContainerLaunchIdentityConflict)
+    ));
+
+    drop(store);
+    let reopened = SqliteStore::open(path).unwrap();
+    let recovered = reopened.container_launch(run_id()).unwrap().unwrap();
+    assert_eq!(recovered.state, ContainerLaunchState::LaunchIntentPersisted);
+    assert_eq!(recovered.container_name, intent.container_name);
+}
+
+#[tokio::test]
+async fn cancellation_before_container_creation_is_terminal_and_keeps_cleanup_fenced() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(run_id(), SyntheticScenario::Success, gate)
+        .unwrap();
+
+    store
+        .mark_container_stop_requested(run_id(), "cancelled")
+        .unwrap();
+    let terminal = store
+        .record_container_exit(
+            run_id(),
+            None,
+            "cancelled",
+            "synthetic workload cancelled before start",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let callback = CallbackOutboxRecord::new(
+        terminal.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Cancelled {
+            worker_id: worker_id(),
+            claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                .unwrap(),
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: None,
+            reason: Some("synthetic workload cancelled before start".to_owned()),
+            outcome_summary: None,
+        },
+    );
+    store
+        .transition_terminal_with_callback(run_id(), callback.clone())
+        .unwrap();
+
+    assert_eq!(store.pending_callbacks().unwrap(), vec![callback]);
+    assert_eq!(store.execution_slot_owner().unwrap(), Some(run_id()));
+    assert_eq!(
+        store.container_launch(run_id()).unwrap().unwrap().state,
+        ContainerLaunchState::CleanupPending
+    );
+}
+
+#[tokio::test]
+async fn restarted_supervisor_recovers_running_state_from_durable_start_proof() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(run_id(), SyntheticScenario::Success, gate)
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "container-id-123")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+
+    let recovered = store
+        .recover_container_running(run_id(), 1_798_000_000_000)
+        .unwrap();
+    assert_eq!(recovered.state, ContainerLaunchState::ContainerRunning);
+    assert_eq!(recovered.started_at_ms, Some(1_798_000_000_000));
+    assert_eq!(
+        store.get_run(run_id()).unwrap().lifecycle_state,
+        LocalLifecycleState::ExecutionActive
+    );
+    assert_eq!(store.execution_slot_owner().unwrap(), Some(run_id()));
+}
+
+#[tokio::test]
+async fn docker_lifecycle_persists_before_each_side_effect_and_terminal_callback() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .unwrap();
+
+    assert!(store.request_container_create(run_id()).unwrap());
+    assert!(!store.request_container_create(run_id()).unwrap());
+    store
+        .record_container_created(run_id(), "container-id-123")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate.clone(), 1_798_000_000_000)
+        .unwrap();
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "success",
+            "synthetic workload completed",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+
+    let callback_id = exited.terminal_callback_id.unwrap();
+    let callback = CallbackOutboxRecord::new(
+        callback_id,
+        run_id(),
+        CallbackPayload::Completed {
+            worker_id: worker_id(),
+            claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                .unwrap(),
+            completed_at_ms: 1_798_000_000_000,
+            exit_code: Some(0),
+            summary: Some("synthetic workload completed".to_owned()),
+            published_url: None,
+            changed_file_count: None,
+            outcome_summary: None,
+        },
+    );
+    store
+        .transition_terminal_with_callback(run_id(), callback.clone())
+        .unwrap();
+    assert_eq!(
+        store.container_launch(run_id()).unwrap().unwrap().state,
+        ContainerLaunchState::CleanupPending
+    );
+    assert_eq!(store.pending_callbacks().unwrap(), vec![callback]);
+
+    store.complete_container_cleanup(run_id()).unwrap();
+    assert_eq!(
+        store.container_launch(run_id()).unwrap().unwrap().state,
+        ContainerLaunchState::CleanupCompleted
+    );
+    assert_eq!(store.execution_slot_owner().unwrap(), None);
 }
 
 #[test]
@@ -816,7 +994,7 @@ fn schema_v2_callback_outbox_migrates_retry_state_without_losing_rows() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let columns: Vec<String> = connection
         .prepare("PRAGMA table_info(callback_outbox)")
         .unwrap()

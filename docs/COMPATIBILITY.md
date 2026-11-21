@@ -13,18 +13,18 @@ The [Kaseki operation index](https://kaseki-tunnel.scheimann.xyz/docs) links to 
 | Authenticate client submission, allocate canonical run/display IDs, persist and publish the run, own lifecycle and cancellation intent. | Soyuz | Never implemented here. Rusty-Fossil has no client submission token or submission endpoint. |
 | Queue contract-v1 message, normalized request, correlation/request IDs. | Soyuz emits; controller validates. | Full currently supported normalized request is typed and preserved in SQLite. Unknown fields or modes fail closed. |
 | At-least-once Queue pull, lease ack/retry and dead-letter policy. | Cloudflare Queue and controller adapter. | HTTP pull/ack/retry client is implemented and mock-tested. Coordinator limits pulls to one message. Failed ack/retry is counted and safely logged; permanent errors suspend polling. Production polling and live DLQ policy remain disabled. The documented rollout policy requires a finite retry limit and DLQ. |
-| Read canonical state, claim with worker identity and fence, authorize `/started`. | Soyuz is authority; Rusty-Fossil coordinates. | Implemented coordinator and proof-gated store path with mocks. Claim/start IDs persist before network calls; uncertain outcomes reconcile. No executor follows the handoff. |
+| Read canonical state, claim with worker identity and fence, authorize `/started`. | Soyuz is authority; Rusty-Fossil coordinates. | Implemented coordinator and proof-gated store path with mocks. Claim/start IDs persist before network calls; uncertain outcomes reconcile. An explicitly supplied IPC client can hand off only the canonical run ID to the isolated supervisor. |
 | Request recovery after controller restart. | Rusty-Fossil local journal; Soyuz canonical state. | `RecoveryManager` can reconcile pending records independently of Queue delivery and reuses persisted callback IDs. Full validated descriptor, claims, proofs, slot and callback outbox persist in SQLite. Corrupt state fails closed. Ambiguous active execution is not relaunched. The production service does not activate the recovery loop. |
 | Worker events, heartbeat, completion, failure and cancellation callbacks. | Rusty-Fossil reports; Soyuz records. | Typed bounded requests and durable exact-payload outbox replay are implemented; tests use mock Soyuz. The production binary does not start a callback delivery loop. |
 | One active local handoff and recovery-aware Queue intake. | Rusty-Fossil host. | Unique SQLite slot, recovery-aware intake capacity, and 999-of-1,000 outbox high-water mark with one mandatory callback reservation are implemented. Callback replay does not require the execution slot. The intake/recovery loops are not constructed by the production service. |
-| Readiness and diagnostics. | Rusty-Fossil. | Only `/health`, `/ready`, and `/metrics`. Readiness remains false because production intake is disabled and no coding runtime exists. |
-| Docker isolation, repository checkout, shell/coding agent, validation and publication. | Future Phase 2B/2C/3 worker. | Deferred. No Docker socket, repository checkout, command execution, Pi CLI, Git operation or publication capability was added. |
+| Readiness and diagnostics. | Rusty-Fossil. | Only `/health`, `/ready`, and `/metrics`. Readiness reports Queue and Senku state, an unknown Docker supervisor probe, unavailable synthetic execution, and false production coding readiness because the handoff is not wired into `main`. |
+| Docker isolation, fixed synthetic scenarios, cancellation, timeout and cleanup. | Separate Phase 2B supervisor process. | Implemented in `fossil-supervisor` and `fossil-synthetic-worker`. The supervisor alone opens Docker Engine; the controller receives only a private token-authenticated Unix socket client. No repository checkout, task-prompt command, Pi CLI, Git operation or publication capability exists. |
 | Senku decisions. | Senku; Rusty-Fossil prepares evidence and consumes advice. | `fossil-senku` supports all five Kaseki-owned profiles, bounded/redacted inputs, authenticated one-shot transport and strict response validation. `task_admission_v1` has a mockable coordinator seam; its output cannot authorize work. The production binary does not instantiate the Senku client. No JEV dependency or direct OpenRouter call. |
 | Standalone/local submission, automatic fallback, Kaseki API/dashboard, webhook testing, gateway diagnostics. | Legacy Kaseki interface. | Explicitly excluded. Soyuz outage never enables local fallback. |
 
 ## Evidence and coverage map
 
-Requirement IDs refer to current Soyuz `docs/TEST-REQUIREMENTS.md`. Tests are local and deterministic. They do not demonstrate production Queue, live Soyuz, Docker, or external service behavior.
+Requirement IDs refer to current Soyuz `docs/TEST-REQUIREMENTS.md`. Default tests use local mocks. A dedicated Docker-enabled CI job exercises the real synthetic image and Engine; local Docker execution is unavailable in this environment.
 
 | Requirement | Rust evidence | Coverage |
 | --- | --- | --- |
@@ -35,6 +35,7 @@ Requirement IDs refer to current Soyuz `docs/TEST-REQUIREMENTS.md`. Tests are lo
 | `AUTH-REST-01`, `WORKER-READ-01` | `fossil-soyuz/tests/client.rs`. | Worker bearer token, canonical reads, status/cancellation, bounded response and error classes. |
 | `WORKER-CLAIM-01`, `WORKER-CLAIM-ID-01`, `WORKER-CLAIM-FENCE-01` | Soyuz client and storage tests. | Claim wire request, durable stable callback ID, proof-only claim authorization, and mismatch rejection. No real multi-host race. |
 | `WORKER-START-01`, `WORKER-START-02`, `WORKER-CLAIM-RECOVERY-01` | Coordinator and storage mock tests. | Claim before start, stable start ID, success and canonical reconciliation, fresh exact-fence gate, cancellation rejection, durable slot and duplicate redelivery. |
+| Phase 2B launch/recovery boundary | `fossil-storage/tests/store.rs`, `fossil-supervisor` tests and `docker_engine.rs`. | Proof-gated launch intent, deterministic name, single create permission, persistence across reopen, start recovery from stored proof, pre-create cancellation, output/result/callback atomicity, fixed profile, IPC auth/bounds. The ignored Docker Engine test runs in CI with a locally built image ID. |
 | `CALLBACK-IDEMPOTENCY-01`, `WORKER-EVENT-01`, `WORKER-FAIL-01`, `WORKER-CANCEL-01` | Storage and coordinator callback replay tests; Soyuz client callback tests. | Full payload persistence, exact ID/fence replay, retry deadline, success marking, and stale-claim blocking. Live duplicate semantics are an integration dependency. |
 | `HEALTH-DB-01` | `rusty-fossil/tests/service.rs`. | Read-only health/readiness/metrics output and local state health. No production Queue probe is performed. |
 | Worker ID policy | `fossil-core/tests/contracts.rs`. | Empty, 65-character, Unicode, period and colon values rejected; 64-character valid identifier accepted. |
@@ -46,10 +47,12 @@ Requirement IDs refer to current Soyuz `docs/TEST-REQUIREMENTS.md`. Tests are lo
 - Queue data alone cannot authorize a claim/start; canonical state and private-field proofs are required.
 - A failed or uncertain Soyuz request does not enable direct local execution.
 - Unsupported normalized run settings fail closed rather than being discarded.
-- The Phase 2A coordinator prepares a durable authorized handoff, but no process or Docker worker is launched.
+- The production `main` does not construct the coordinator, poll Queue, replay callbacks, or attach the supervisor IPC client. Deployment of `fossil-supervisord` alone does not consume work.
 - Production polling, recovery supervision, callback replay and Senku inference are not started from the service binary. This keeps this implementation from consuming production messages or invoking paid inference.
-- Multi-host local SQLite coordination, claim renewal, real DLQ behavior, live Queue producer content type, Docker restart, and execution cleanup remain unverified or deferred.
+- SQLite state is a single-host journal, not a multi-host scheduler. Cross-host takeover, claim renewal, live DLQ behavior, and live Queue producer content type remain unverified or deferred.
+- This development host cannot access its Docker socket; the real Docker test is delegated to Docker-enabled CI and has not been observed locally.
+- No Raspberry Pi hardware run has been performed; ARM64 cross-build is not a substitute for testing host cgroups, rootless Docker, memory pressure, disk limits or restart recovery on a Pi.
 
 ## Follow-on evidence
 
-Phase 2B needs a proof-gated supervisor mock, isolation/resource-limit tests, cancellation and cleanup tests, and explicit crash-boundary tests before any real worker image is enabled. Before runtime rollout, separately review the Kaseki-owned Senku credential and live Queue/DLQ configuration.
+Phase 2C may introduce Pi behind the existing supervisor only after separate review of repository mounts, tool invocation, credential handling, output capture, and host-level resource isolation. Before runtime rollout, separately review the Kaseki-owned Senku credential, non-production Queue/DLQ configuration, and Docker host account/socket permissions.

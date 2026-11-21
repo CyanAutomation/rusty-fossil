@@ -1,6 +1,13 @@
 .git
-.env
-secrets
-state
+.github
+.codex
+.agents
+.idea
+.vscode
 target
-docs
+state
+secrets
+.env
+.env.*
+*.sqlite3
+*.db

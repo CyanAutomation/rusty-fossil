@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const MAX_CALLBACK_PAYLOAD_BYTES: usize = 12 * 1024;
 const MAX_PENDING_CALLBACKS: u32 = 1_000;
 const MAX_EXECUTION_DESCRIPTOR_BYTES: usize = 96 * 1024;
@@ -73,6 +73,113 @@ pub enum RecoveryAction {
     AmbiguousExecution,
     RetryCallback,
     ManualReview,
+}
+
+/// Durable Docker lifecycle for one canonical run and one persisted start
+/// authorization. The run record remains the canonical local workflow state;
+/// this value records Docker side effects that must be reconciled after a
+/// process or daemon interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerLaunchState {
+    LaunchIntentPersisted,
+    CreateRequested,
+    ContainerCreated,
+    StartRequested,
+    ContainerRunning,
+    StopRequested,
+    ContainerExited,
+    CleanupPending,
+    CleanupCompleted,
+    ManualReviewRequired,
+}
+
+impl ContainerLaunchState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LaunchIntentPersisted => "launch_intent_persisted",
+            Self::CreateRequested => "create_requested",
+            Self::ContainerCreated => "container_created",
+            Self::StartRequested => "start_requested",
+            Self::ContainerRunning => "container_running",
+            Self::StopRequested => "stop_requested",
+            Self::ContainerExited => "container_exited",
+            Self::CleanupPending => "cleanup_pending",
+            Self::CleanupCompleted => "cleanup_completed",
+            Self::ManualReviewRequired => "manual_review_required",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "launch_intent_persisted" => Ok(Self::LaunchIntentPersisted),
+            "create_requested" => Ok(Self::CreateRequested),
+            "container_created" => Ok(Self::ContainerCreated),
+            "start_requested" => Ok(Self::StartRequested),
+            "container_running" => Ok(Self::ContainerRunning),
+            "stop_requested" => Ok(Self::StopRequested),
+            "container_exited" => Ok(Self::ContainerExited),
+            "cleanup_pending" => Ok(Self::CleanupPending),
+            "cleanup_completed" => Ok(Self::CleanupCompleted),
+            "manual_review_required" => Ok(Self::ManualReviewRequired),
+            _ => Err(StoreError::InvalidStoredValue("container launch state")),
+        }
+    }
+
+    fn can_advance_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::LaunchIntentPersisted, Self::CreateRequested)
+                | (Self::LaunchIntentPersisted, Self::StopRequested)
+                | (Self::LaunchIntentPersisted, Self::ManualReviewRequired)
+                | (Self::CreateRequested, Self::ContainerCreated)
+                | (Self::CreateRequested, Self::ManualReviewRequired)
+                | (Self::ContainerCreated, Self::StartRequested)
+                | (Self::ContainerCreated, Self::StopRequested)
+                | (Self::ContainerCreated, Self::ManualReviewRequired)
+                | (Self::StartRequested, Self::ContainerRunning)
+                | (Self::StartRequested, Self::StopRequested)
+                | (Self::StartRequested, Self::ContainerExited)
+                | (Self::StartRequested, Self::ManualReviewRequired)
+                | (Self::ContainerRunning, Self::StopRequested)
+                | (Self::ContainerRunning, Self::ContainerExited)
+                | (Self::ContainerRunning, Self::ManualReviewRequired)
+                | (Self::StopRequested, Self::ContainerExited)
+                | (Self::StopRequested, Self::ManualReviewRequired)
+                | (Self::ContainerExited, Self::CleanupPending)
+                | (Self::ContainerExited, Self::ManualReviewRequired)
+                | (Self::CleanupPending, Self::CleanupCompleted)
+                | (Self::CleanupPending, Self::ManualReviewRequired)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLaunchRecord {
+    pub run_id: RunId,
+    pub worker_id: WorkerId,
+    pub claim_callback_id: ClaimCallbackId,
+    pub start_callback_id: EventId,
+    pub scenario: fossil_core::execution::SyntheticScenario,
+    pub container_name: String,
+    pub container_id: Option<String>,
+    pub state: ContainerLaunchState,
+    pub exit_code: Option<i32>,
+    pub outcome_class: Option<String>,
+    pub diagnostic_summary: Option<String>,
+    pub output_truncated: bool,
+    pub terminal_callback_id: Option<EventId>,
+    pub stop_reason: Option<String>,
+    pub stop_requested_at_ms: Option<i64>,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerExitTimes {
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: i64,
 }
 
 impl RecoveryAction {
@@ -324,6 +431,38 @@ fn valid_outcome_summary(value: Option<&serde_json::Value>) -> bool {
     value.is_none_or(valid_soyuz_outcome_summary)
 }
 
+fn callback_matches_container_result(
+    callback: &CallbackOutboxRecord,
+    launch: &ContainerLaunchRecord,
+) -> bool {
+    if callback.run_id != launch.run_id
+        || callback.payload.worker_id() != &launch.worker_id
+        || callback.payload.claim_callback_id() != launch.claim_callback_id
+    {
+        return false;
+    }
+    match (&callback.payload, launch.outcome_class.as_deref()) {
+        (CallbackPayload::Completed { exit_code, .. }, Some("success")) => {
+            *exit_code == Some(0) && launch.exit_code == Some(0)
+        }
+        (CallbackPayload::Cancelled { exit_code, .. }, Some("cancelled")) => {
+            *exit_code == launch.exit_code
+        }
+        (
+            CallbackPayload::Failed { exit_code, .. },
+            Some(
+                "nonzero_exit"
+                | "timeout"
+                | "docker_failure"
+                | "resource_limit_failure"
+                | "unexpected_termination"
+                | "execution_uncertain",
+            ),
+        ) => *exit_code == launch.exit_code,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackOutboxRecord {
     pub event_id: EventId,
@@ -438,6 +577,18 @@ pub enum StoreError {
     ExecutionGateProofRequired,
     #[error("execution slot can only be released after terminal completion")]
     ExecutionSlotReleaseDenied,
+    #[error("Docker launch intent requires the matching fresh execution-gate proof")]
+    ContainerLaunchAuthorizationMismatch,
+    #[error("Docker launch identity conflicts with an existing attempt")]
+    ContainerLaunchIdentityConflict,
+    #[error("Docker launch state does not permit this operation")]
+    ContainerLaunchTransitionDenied,
+    #[error("Docker container identity conflicts with the persisted attempt")]
+    ContainerIdentityConflict,
+    #[error("Docker execution result or terminal callback does not match the persisted result")]
+    ContainerLaunchResultMismatch,
+    #[error("Docker execution result is invalid or too large")]
+    InvalidContainerLaunchResult,
     #[error("execution descriptor can only be removed after terminal callbacks are delivered")]
     ExecutionDescriptorRetentionDenied,
     #[error("callback event ID is already bound to different callback data")]
@@ -583,6 +734,47 @@ impl SqliteStore {
                     ON callback_outbox(delivery_state, next_eligible_at_ms, created_at_ms);
                 INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, 0);
                 PRAGMA user_version = 3;",
+            )?;
+            transaction.commit()?;
+            return Self::migrate(connection);
+        }
+
+        if version == 3 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "CREATE TABLE container_launches (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES run_records(run_id) ON DELETE CASCADE,
+                    worker_id TEXT NOT NULL,
+                    claim_callback_id TEXT NOT NULL,
+                    start_callback_id TEXT NOT NULL UNIQUE,
+                    scenario TEXT NOT NULL CHECK (scenario IN (
+                        'success', 'controlled_failure', 'timeout', 'cancellation',
+                        'bounded_output', 'unexpected_termination'
+                    )),
+                    container_name TEXT NOT NULL UNIQUE,
+                    container_id TEXT UNIQUE,
+                    state TEXT NOT NULL CHECK (state IN (
+                        'launch_intent_persisted', 'create_requested', 'container_created',
+                        'start_requested', 'container_running', 'stop_requested',
+                        'container_exited', 'cleanup_pending', 'cleanup_completed',
+                        'manual_review_required'
+                    )),
+                    exit_code INTEGER,
+                    outcome_class TEXT,
+                    diagnostic_summary TEXT,
+                    output_truncated INTEGER NOT NULL DEFAULT 0 CHECK (output_truncated IN (0, 1)),
+                    terminal_callback_id TEXT UNIQUE,
+                    stop_reason TEXT CHECK (stop_reason IN ('cancelled', 'timeout', 'execution_uncertain') OR stop_reason IS NULL),
+                    stop_requested_at_ms INTEGER,
+                    started_at_ms INTEGER,
+                    completed_at_ms INTEGER,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX container_launches_state_idx ON container_launches(state);
+                INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, 0);
+                PRAGMA user_version = 4;",
             )?;
             transaction.commit()?;
             return Ok(());
@@ -1209,11 +1401,652 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// Persists the deterministic container identity before any Docker API
+    /// side effect. The supplied proof is the result of a fresh Soyuz gate
+    /// check; IPC callers must send only the canonical run ID and have the
+    /// supervisor rebuild this proof from the durable record plus Soyuz.
+    pub fn begin_container_launch(
+        &self,
+        run_id: RunId,
+        scenario: fossil_core::execution::SyntheticScenario,
+        authorization: ExecutionGateAuthorization,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        if authorization.run_id() != run_id {
+            return Err(StoreError::ContainerLaunchAuthorizationMismatch);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_run(&transaction, run_id)?;
+        if run.worker_id != *authorization.worker_id()
+            || run.claim_callback_id != Some(authorization.claim_callback_id())
+            || run.start_callback_id != Some(authorization.start_callback_id())
+            || !run.start_authorized
+        {
+            return Err(StoreError::ContainerLaunchAuthorizationMismatch);
+        }
+
+        let slot_owner: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM execution_slot WHERE slot_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if slot_owner.as_deref() != Some(run_id.to_string().as_str()) {
+            return Err(StoreError::ExecutionSlotNotAuthorized);
+        }
+
+        if let Some(existing) = load_container_launch_optional(&transaction, run_id)? {
+            if existing.worker_id != run.worker_id
+                || existing.claim_callback_id != authorization.claim_callback_id()
+                || existing.start_callback_id != authorization.start_callback_id()
+                || existing.scenario != scenario
+            {
+                return Err(StoreError::ContainerLaunchIdentityConflict);
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+
+        if run.lifecycle_state != LocalLifecycleState::StartAuthorizationPersisted {
+            return Err(StoreError::ContainerLaunchAuthorizationMismatch);
+        }
+        let descriptor_payload: Option<String> = transaction
+            .query_row(
+                "SELECT descriptor_json FROM execution_handoffs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(descriptor_payload) = descriptor_payload else {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        };
+        if descriptor_payload.len() > MAX_EXECUTION_DESCRIPTOR_BYTES {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        }
+        let descriptor: ExecutionDescriptor = serde_json::from_str(&descriptor_payload)
+            .map_err(|_| StoreError::InvalidExecutionDescriptor)?;
+        if descriptor.run_id != run_id || !descriptor.validate() {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        }
+
+        let other_launch: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM container_launches
+                 WHERE run_id != ?1 AND state != 'cleanup_completed' LIMIT 1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if other_launch.is_some() {
+            return Err(StoreError::ExecutionSlotOccupied);
+        }
+
+        let container_name = stable_container_name(run_id, authorization.start_callback_id());
+        let now = now_ms();
+        transaction.execute(
+            "INSERT INTO container_launches (
+                run_id, worker_id, claim_callback_id, start_callback_id, scenario,
+                container_name, state, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'launch_intent_persisted', ?7, ?7)",
+            params![
+                run_id.to_string(),
+                run.worker_id.as_str(),
+                authorization.claim_callback_id().to_string(),
+                authorization.start_callback_id().to_string(),
+                scenario.as_str(),
+                container_name,
+                now
+            ],
+        )?;
+        let launch = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(launch)
+    }
+
+    pub fn container_launch(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<ContainerLaunchRecord>, StoreError> {
+        let connection = self.lock()?;
+        load_container_launch_optional(&connection, run_id)
+    }
+
+    pub fn container_launches_requiring_reconciliation(
+        &self,
+    ) -> Result<Vec<ContainerLaunchRecord>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT run_id FROM container_launches WHERE state != 'cleanup_completed'
+             ORDER BY created_at_ms, run_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut launches = Vec::new();
+        for row in rows {
+            let run_id =
+                RunId::parse(&row?).map_err(|_| StoreError::InvalidStoredValue("run ID"))?;
+            launches.push(load_container_launch(&connection, run_id)?);
+        }
+        Ok(launches)
+    }
+
+    pub fn mark_container_create_requested(
+        &self,
+        run_id: RunId,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        self.advance_container_launch(run_id, ContainerLaunchState::CreateRequested)
+    }
+
+    /// Exactly one cooperating supervisor process receives permission to send
+    /// the initial create request. Once persisted, all other callers reconcile
+    /// by deterministic name and never repeat an ambiguous create side effect.
+    pub fn request_container_create(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if current.state != ContainerLaunchState::LaunchIntentPersisted {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE container_launches SET state = 'create_requested', updated_at_ms = ?2
+             WHERE run_id = ?1 AND state = 'launch_intent_persisted'",
+            params![run_id.to_string(), now_ms()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn record_container_created(
+        &self,
+        run_id: RunId,
+        container_id: &str,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        if container_id.is_empty()
+            || container_id.len() > 128
+            || !container_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(StoreError::ContainerIdentityConflict);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if let Some(existing_id) = &current.container_id {
+            if existing_id != container_id {
+                return Err(StoreError::ContainerIdentityConflict);
+            }
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if current.state != ContainerLaunchState::CreateRequested {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        transaction.execute(
+            "UPDATE container_launches SET container_id = ?2, state = 'container_created',
+                updated_at_ms = ?3 WHERE run_id = ?1 AND state = 'create_requested'",
+            params![run_id.to_string(), container_id, now_ms()],
+        )?;
+        let updated = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn mark_container_start_requested(
+        &self,
+        run_id: RunId,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        self.advance_container_launch(run_id, ContainerLaunchState::StartRequested)
+    }
+
+    /// Atomically records that Docker reports the exact persisted container
+    /// running and advances the canonical local run into active execution.
+    pub fn mark_container_running(
+        &self,
+        run_id: RunId,
+        authorization: ExecutionGateAuthorization,
+        started_at_ms: i64,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        if started_at_ms < 0 {
+            return Err(StoreError::InvalidContainerLaunchResult);
+        }
+        if authorization.run_id() != run_id {
+            return Err(StoreError::ExecutionGateProofRequired);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_run(&transaction, run_id)?;
+        let mut launch = load_container_launch(&transaction, run_id)?;
+        if run.worker_id != *authorization.worker_id()
+            || run.claim_callback_id != Some(authorization.claim_callback_id())
+            || run.start_callback_id != Some(authorization.start_callback_id())
+            || !run.start_authorized
+            || launch.worker_id != run.worker_id
+            || launch.claim_callback_id != authorization.claim_callback_id()
+            || launch.start_callback_id != authorization.start_callback_id()
+            || launch.container_id.is_none()
+        {
+            return Err(StoreError::ExecutionGateProofRequired);
+        }
+        if launch.state == ContainerLaunchState::ContainerRunning
+            && run.lifecycle_state == LocalLifecycleState::ExecutionActive
+        {
+            transaction.commit()?;
+            return Ok(launch);
+        }
+        if launch.state != ContainerLaunchState::StartRequested
+            || run.lifecycle_state != LocalLifecycleState::StartAuthorizationPersisted
+        {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        let slot_owner: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM execution_slot WHERE slot_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if slot_owner.as_deref() != Some(run_id.to_string().as_str()) {
+            return Err(StoreError::ExecutionSlotNotAuthorized);
+        }
+        let descriptor_payload: Option<String> = transaction
+            .query_row(
+                "SELECT descriptor_json FROM execution_handoffs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(descriptor_payload) = descriptor_payload else {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        };
+        if descriptor_payload.len() > MAX_EXECUTION_DESCRIPTOR_BYTES {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        }
+        let descriptor: ExecutionDescriptor = serde_json::from_str(&descriptor_payload)
+            .map_err(|_| StoreError::InvalidExecutionDescriptor)?;
+        if descriptor.run_id != run_id || !descriptor.validate() {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        }
+        run.lifecycle_state
+            .transition(LocalLifecycleState::ExecutionActive)?;
+        transaction.execute(
+            "UPDATE run_records SET lifecycle_state = 'execution_active', updated_at_ms = ?2
+             WHERE run_id = ?1 AND lifecycle_state = 'start_authorization_persisted'",
+            params![run_id.to_string(), now_ms()],
+        )?;
+        transaction.execute(
+            "UPDATE container_launches SET state = 'container_running', started_at_ms = ?2,
+                updated_at_ms = ?2
+             WHERE run_id = ?1 AND state = 'start_requested'",
+            params![run_id.to_string(), started_at_ms],
+        )?;
+        launch = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(launch)
+    }
+
+    /// Recovers an already-started container after a process restart. The
+    /// caller must first inspect Docker and verify the persisted container
+    /// name, ID, labels, and isolation profile. This accepts only the durable
+    /// start proof and fenced slot already recorded for this exact launch.
+    pub fn recover_container_running(
+        &self,
+        run_id: RunId,
+        started_at_ms: i64,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        if started_at_ms < 0 {
+            return Err(StoreError::InvalidContainerLaunchResult);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_run(&transaction, run_id)?;
+        let mut launch = load_container_launch(&transaction, run_id)?;
+        if !run.start_authorized
+            || launch.worker_id != run.worker_id
+            || launch.container_id.is_none()
+        {
+            return Err(StoreError::ExecutionGateProofRequired);
+        }
+        if launch.state == ContainerLaunchState::ContainerRunning
+            && run.lifecycle_state == LocalLifecycleState::ExecutionActive
+        {
+            transaction.commit()?;
+            return Ok(launch);
+        }
+        if launch.state != ContainerLaunchState::StartRequested
+            || run.lifecycle_state != LocalLifecycleState::StartAuthorizationPersisted
+        {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        let slot_owner: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM execution_slot WHERE slot_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if slot_owner.as_deref() != Some(run_id.to_string().as_str()) {
+            return Err(StoreError::ExecutionSlotNotAuthorized);
+        }
+        let descriptor_payload: Option<String> = transaction
+            .query_row(
+                "SELECT descriptor_json FROM execution_handoffs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(descriptor_payload) = descriptor_payload else {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        };
+        if descriptor_payload.len() > MAX_EXECUTION_DESCRIPTOR_BYTES {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        }
+        let descriptor: ExecutionDescriptor = serde_json::from_str(&descriptor_payload)
+            .map_err(|_| StoreError::InvalidExecutionDescriptor)?;
+        if descriptor.run_id != run_id || !descriptor.validate() {
+            return Err(StoreError::InvalidExecutionDescriptor);
+        }
+        run.lifecycle_state
+            .transition(LocalLifecycleState::ExecutionActive)?;
+        transaction.execute(
+            "UPDATE run_records SET lifecycle_state = 'execution_active', updated_at_ms = ?2
+             WHERE run_id = ?1 AND lifecycle_state = 'start_authorization_persisted'",
+            params![run_id.to_string(), now_ms()],
+        )?;
+        transaction.execute(
+            "UPDATE container_launches SET state = 'container_running', started_at_ms = ?2,
+                updated_at_ms = ?2
+             WHERE run_id = ?1 AND state = 'start_requested'",
+            params![run_id.to_string(), started_at_ms],
+        )?;
+        launch = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(launch)
+    }
+
+    pub fn mark_container_stop_requested(
+        &self,
+        run_id: RunId,
+        reason: &str,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        if !matches!(reason, "cancelled" | "timeout" | "execution_uncertain") {
+            return Err(StoreError::InvalidContainerLaunchResult);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if current.state == ContainerLaunchState::StopRequested {
+            if current.stop_reason.as_deref() != Some(reason) {
+                return Err(StoreError::ContainerLaunchResultMismatch);
+            }
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if !current
+            .state
+            .can_advance_to(ContainerLaunchState::StopRequested)
+        {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE container_launches SET state = 'stop_requested', stop_reason = ?2,
+                stop_requested_at_ms = ?3, updated_at_ms = ?3
+             WHERE run_id = ?1 AND state = ?4",
+            params![run_id.to_string(), reason, now, current.state.as_str()],
+        )?;
+        let updated = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn mark_container_manual_review(
+        &self,
+        run_id: RunId,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if current.state == ContainerLaunchState::CleanupCompleted
+            || current.state == ContainerLaunchState::ManualReviewRequired
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        transaction.execute(
+            "UPDATE container_launches SET state = 'manual_review_required', updated_at_ms = ?2
+             WHERE run_id = ?1",
+            params![run_id.to_string(), now_ms()],
+        )?;
+        let updated = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn record_container_exit(
+        &self,
+        run_id: RunId,
+        exit_code: Option<i32>,
+        outcome_class: &str,
+        diagnostic_summary: &str,
+        output_truncated: bool,
+        completed_at_ms: i64,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        self.record_container_exit_with_times(
+            run_id,
+            exit_code,
+            outcome_class,
+            diagnostic_summary,
+            output_truncated,
+            ContainerExitTimes {
+                started_at_ms: None,
+                completed_at_ms,
+            },
+        )
+    }
+
+    pub fn record_container_exit_with_times(
+        &self,
+        run_id: RunId,
+        exit_code: Option<i32>,
+        outcome_class: &str,
+        diagnostic_summary: &str,
+        output_truncated: bool,
+        times: ContainerExitTimes,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        let ContainerExitTimes {
+            started_at_ms,
+            completed_at_ms,
+        } = times;
+        let valid_class = matches!(
+            outcome_class,
+            "success"
+                | "nonzero_exit"
+                | "timeout"
+                | "cancelled"
+                | "docker_failure"
+                | "resource_limit_failure"
+                | "unexpected_termination"
+                | "execution_uncertain"
+        );
+        if !valid_class
+            || diagnostic_summary.len() > 512
+            || diagnostic_summary.chars().any(char::is_control)
+            || started_at_ms.is_some_and(|started| started < 0 || started > completed_at_ms)
+            || completed_at_ms < 0
+            || (outcome_class == "success" && exit_code != Some(0))
+            || (outcome_class == "nonzero_exit" && exit_code.is_none_or(|value| value == 0))
+        {
+            return Err(StoreError::InvalidContainerLaunchResult);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if current.state == ContainerLaunchState::ContainerExited {
+            if current.exit_code != exit_code
+                || current.outcome_class.as_deref() != Some(outcome_class)
+                || current.diagnostic_summary.as_deref() != Some(diagnostic_summary)
+                || current.output_truncated != output_truncated
+                || current.completed_at_ms != Some(completed_at_ms)
+                || started_at_ms.is_some_and(|started| current.started_at_ms != Some(started))
+            {
+                return Err(StoreError::ContainerLaunchResultMismatch);
+            }
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if !matches!(
+            current.state,
+            ContainerLaunchState::LaunchIntentPersisted
+                | ContainerLaunchState::ContainerCreated
+                | ContainerLaunchState::StartRequested
+                | ContainerLaunchState::ContainerRunning
+                | ContainerLaunchState::StopRequested
+        ) {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        let callback_id = current.terminal_callback_id.unwrap_or_else(EventId::new);
+        transaction.execute(
+            "UPDATE container_launches SET state = 'container_exited', exit_code = ?2,
+                outcome_class = ?3, diagnostic_summary = ?4, output_truncated = ?5,
+                terminal_callback_id = ?6, started_at_ms = COALESCE(started_at_ms, ?7),
+                completed_at_ms = ?8, updated_at_ms = ?8
+             WHERE run_id = ?1",
+            params![
+                run_id.to_string(),
+                exit_code,
+                outcome_class,
+                diagnostic_summary,
+                output_truncated,
+                callback_id.to_string(),
+                started_at_ms,
+                completed_at_ms
+            ],
+        )?;
+        let updated = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn complete_container_cleanup(
+        &self,
+        run_id: RunId,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if current.state == ContainerLaunchState::CleanupCompleted {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if current.state != ContainerLaunchState::CleanupPending
+            || load_run(&transaction, run_id)?.lifecycle_state
+                != LocalLifecycleState::ExecutionTerminal
+        {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        transaction.execute(
+            "UPDATE container_launches SET state = 'cleanup_completed', updated_at_ms = ?2
+             WHERE run_id = ?1 AND state = 'cleanup_pending'",
+            params![run_id.to_string(), now_ms()],
+        )?;
+        transaction.execute(
+            "DELETE FROM execution_slot WHERE slot_id = 1 AND run_id = ?1",
+            [run_id.to_string()],
+        )?;
+        let updated = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn execution_slot_owner(&self) -> Result<Option<RunId>, StoreError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT run_id FROM execution_slot WHERE slot_id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|run_id| {
+                RunId::parse(&run_id).map_err(|_| StoreError::InvalidStoredValue("run ID"))
+            })
+            .transpose()
+    }
+
+    fn advance_container_launch(
+        &self,
+        run_id: RunId,
+        next: ContainerLaunchState,
+    ) -> Result<ContainerLaunchRecord, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_container_launch(&transaction, run_id)?;
+        if current.state == next
+            || matches!(
+                (next, current.state),
+                (
+                    ContainerLaunchState::CreateRequested,
+                    ContainerLaunchState::ContainerCreated
+                ) | (
+                    ContainerLaunchState::CreateRequested,
+                    ContainerLaunchState::StartRequested
+                ) | (
+                    ContainerLaunchState::CreateRequested,
+                    ContainerLaunchState::ContainerRunning
+                ) | (
+                    ContainerLaunchState::StartRequested,
+                    ContainerLaunchState::ContainerRunning
+                ) | (
+                    ContainerLaunchState::StartRequested,
+                    ContainerLaunchState::StopRequested
+                ) | (
+                    ContainerLaunchState::StartRequested,
+                    ContainerLaunchState::ContainerExited
+                ) | (
+                    ContainerLaunchState::StopRequested,
+                    ContainerLaunchState::ContainerExited
+                ) | (
+                    ContainerLaunchState::StopRequested,
+                    ContainerLaunchState::CleanupPending
+                ) | (
+                    ContainerLaunchState::StopRequested,
+                    ContainerLaunchState::CleanupCompleted
+                )
+            )
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if !current.state.can_advance_to(next) {
+            return Err(StoreError::ContainerLaunchTransitionDenied);
+        }
+        transaction.execute(
+            "UPDATE container_launches SET state = ?2, updated_at_ms = ?3
+             WHERE run_id = ?1 AND state = ?4",
+            params![
+                run_id.to_string(),
+                next.as_str(),
+                now_ms(),
+                current.state.as_str()
+            ],
+        )?;
+        let updated = load_container_launch(&transaction, run_id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
     pub fn release_execution_slot(&self, run_id: RunId) -> Result<(), StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record = load_run(&transaction, run_id)?;
         if record.lifecycle_state != LocalLifecycleState::ExecutionTerminal {
+            return Err(StoreError::ExecutionSlotReleaseDenied);
+        }
+        if load_container_launch_optional(&transaction, run_id)?
+            .is_some_and(|launch| launch.state != ContainerLaunchState::CleanupCompleted)
+        {
             return Err(StoreError::ExecutionSlotReleaseDenied);
         }
         transaction.execute(
@@ -1332,16 +2165,32 @@ impl SqliteStore {
         record
             .lifecycle_state
             .transition(LocalLifecycleState::ExecutionTerminal)?;
+        let docker_launch = load_container_launch_optional(&transaction, run_id)?;
+        if let Some(launch) = &docker_launch
+            && (launch.state != ContainerLaunchState::ContainerExited
+                || launch.terminal_callback_id != Some(callback.event_id)
+                || !callback_matches_container_result(&callback, launch))
+        {
+            return Err(StoreError::ContainerLaunchResultMismatch);
+        }
         let now = now_ms();
         insert_callback(&transaction, &callback, now)?;
         transaction.execute(
             "UPDATE run_records SET lifecycle_state = 'execution_terminal', updated_at_ms = ?2 WHERE run_id = ?1",
             params![run_id.to_string(), now],
         )?;
-        transaction.execute(
-            "DELETE FROM execution_slot WHERE slot_id = 1 AND run_id = ?1",
-            [run_id.to_string()],
-        )?;
+        if docker_launch.is_some() {
+            transaction.execute(
+                "UPDATE container_launches SET state = 'cleanup_pending', updated_at_ms = ?2
+                 WHERE run_id = ?1 AND state = 'container_exited'",
+                params![run_id.to_string(), now],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM execution_slot WHERE slot_id = 1 AND run_id = ?1",
+                [run_id.to_string()],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1725,6 +2574,123 @@ fn parse_lifecycle_state(
         "execution_terminal" => Ok(LocalLifecycleState::ExecutionTerminal),
         _ => Err(StoreError::InvalidStoredValue("lifecycle state")),
     }
+}
+
+fn load_container_launch(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<ContainerLaunchRecord, StoreError> {
+    load_container_launch_optional(connection, run_id)?
+        .ok_or(StoreError::InvalidStoredValue("container launch record"))
+}
+
+fn load_container_launch_optional(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<ContainerLaunchRecord>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT worker_id, claim_callback_id, start_callback_id, scenario,
+                    container_name, container_id, state, exit_code, outcome_class,
+                    diagnostic_summary, output_truncated, terminal_callback_id,
+                    stop_reason, stop_requested_at_ms, started_at_ms, completed_at_ms,
+                    updated_at_ms
+             FROM container_launches WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i32>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, bool>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, i64>(16)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            worker_id,
+            claim_callback_id,
+            start_callback_id,
+            scenario,
+            container_name,
+            container_id,
+            state,
+            exit_code,
+            outcome_class,
+            diagnostic_summary,
+            output_truncated,
+            terminal_callback_id,
+            stop_reason,
+            stop_requested_at_ms,
+            started_at_ms,
+            completed_at_ms,
+            updated_at_ms,
+        )| {
+            Ok(ContainerLaunchRecord {
+                run_id,
+                worker_id: WorkerId::parse(&worker_id)
+                    .map_err(|_| StoreError::InvalidStoredValue("container worker ID"))?,
+                claim_callback_id: ClaimCallbackId::parse(&claim_callback_id)
+                    .map_err(|_| StoreError::InvalidStoredValue("container claim ID"))?,
+                start_callback_id: EventId::parse(&start_callback_id)
+                    .map_err(|_| StoreError::InvalidStoredValue("container start ID"))?,
+                scenario: parse_synthetic_scenario(&scenario)?,
+                container_name,
+                container_id,
+                state: ContainerLaunchState::parse(&state)?,
+                exit_code,
+                outcome_class,
+                diagnostic_summary,
+                output_truncated,
+                terminal_callback_id: terminal_callback_id
+                    .map(|id| {
+                        EventId::parse(&id)
+                            .map_err(|_| StoreError::InvalidStoredValue("terminal callback ID"))
+                    })
+                    .transpose()?,
+                stop_reason,
+                stop_requested_at_ms,
+                started_at_ms,
+                completed_at_ms,
+                updated_at_ms,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn parse_synthetic_scenario(
+    value: &str,
+) -> Result<fossil_core::execution::SyntheticScenario, StoreError> {
+    match value {
+        "success" => Ok(fossil_core::execution::SyntheticScenario::Success),
+        "controlled_failure" => Ok(fossil_core::execution::SyntheticScenario::ControlledFailure),
+        "timeout" => Ok(fossil_core::execution::SyntheticScenario::Timeout),
+        "cancellation" => Ok(fossil_core::execution::SyntheticScenario::Cancellation),
+        "bounded_output" => Ok(fossil_core::execution::SyntheticScenario::BoundedOutput),
+        "unexpected_termination" => {
+            Ok(fossil_core::execution::SyntheticScenario::UnexpectedTermination)
+        }
+        _ => Err(StoreError::InvalidStoredValue("synthetic scenario")),
+    }
+}
+
+fn stable_container_name(run_id: RunId, start_callback_id: EventId) -> String {
+    format!("rusty-fossil-synth-{run_id}-{start_callback_id}")
 }
 
 fn parse_callback_delivery(value: &str) -> Result<CallbackDeliveryState, StoreError> {

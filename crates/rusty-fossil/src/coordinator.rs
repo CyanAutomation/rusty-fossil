@@ -16,6 +16,7 @@ use fossil_storage::{
     CallbackOutboxRecord, CallbackPayload, ExecutionDescriptor, RecoveryAction, SqliteStore,
     callback_retry_deadline_ms,
 };
+use fossil_supervisor::SupervisorIpcClient;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -105,6 +106,7 @@ pub struct AuthorizationCoordinator {
     metrics: Arc<CoordinatorMetrics>,
     processing_lock: Arc<AsyncMutex<()>>,
     decision_service: Option<Arc<dyn DecisionService>>,
+    supervisor_client: Option<SupervisorIpcClient>,
 }
 
 impl AuthorizationCoordinator {
@@ -116,6 +118,7 @@ impl AuthorizationCoordinator {
             metrics: Arc::new(CoordinatorMetrics::default()),
             processing_lock: Arc::new(AsyncMutex::new(())),
             decision_service: None,
+            supervisor_client: None,
         }
     }
 
@@ -123,6 +126,14 @@ impl AuthorizationCoordinator {
     /// as service telemetry and is never an authorization input.
     pub fn with_decision_service(mut self, service: Arc<dyn DecisionService>) -> Self {
         self.decision_service = Some(service);
+        self
+    }
+
+    /// Opts an explicitly constructed coordinator into the isolated synthetic
+    /// supervisor handoff. Production startup remains disabled until a caller
+    /// deliberately supplies this authenticated local client.
+    pub fn with_supervisor_client(mut self, client: SupervisorIpcClient) -> Self {
+        self.supervisor_client = Some(client);
         self
     }
 
@@ -880,7 +891,14 @@ impl AuthorizationCoordinator {
             return self.recover_with_action(run_id, attempts, RecoveryAction::ManualReview);
         }
         match self.store.reserve_execution_slot(run_id) {
-            Ok(_) => QueueDisposition::Acknowledge,
+            Ok(_) => {
+                if let Some(supervisor) = &self.supervisor_client
+                    && supervisor.launch(run_id).await.is_err()
+                {
+                    return retry_for(attempts);
+                }
+                QueueDisposition::Acknowledge
+            }
             Err(_) => self.recover_and_retry(run_id, attempts),
         }
     }
