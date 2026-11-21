@@ -34,6 +34,8 @@ Implemented in this worktree; merge and runtime rollout remain pending. The new 
 
 ## Phase 2B — Disposable worker execution
 
+Status: not complete. The current branch adds only the supervisor contract and a deterministic proof-gated mock for lifecycle experiments. It does not implement the Docker authority boundary, durable launch-intent/container states, Docker recovery, the synthetic worker image, cancellation/timeout monitoring, callback integration, or controlled runtime wiring. Do not enable production Queue polling or run real containers from this prototype. Those items remain required before Phase 2B can be considered complete.
+
 Add a separate, narrowly scoped worker supervisor and non-root worker image. The supervisor must re-load the durable descriptor and require exact persisted start proof plus a fresh canonical gate before launch. Enforce one slot, CPU/memory/PID/disk/network/time limits, bounded outputs, cancellation, cleanup, graceful shutdown and explicit crash recovery. Do not auto-launch after ambiguous restart state. Keep Docker socket access out of the controller container where an external supervisor boundary is feasible. Start with a mock executor and prove no launch without the exact run, worker and claim fence.
 
 ## Phase 2C — Coding-agent runtime

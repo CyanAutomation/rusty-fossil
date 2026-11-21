@@ -2,7 +2,7 @@
 
 Rusty-Fossil is the host-side controller foundation for disposable repository workers. **Soyuz is the only run-control authority**: it accepts submissions, assigns canonical run IDs, owns lifecycle and cancellation state, and publishes Cloudflare Queue messages. Rusty-Fossil has no submission endpoint or local-run fallback.
 
-Phase 2A.1 adds independent durable reconciliation, cross-host ownership cleanup, protected callback-outbox headroom, and observable Queue operation failures. Phase 2A-S adds a contract-validated Senku advisory client for all five Kaseki-owned profiles and a task-admission seam. Senku remains advisory; Soyuz remains the sole run authority. The production service still does not construct a Queue poller or Senku client. Docker execution and coding-task execution are not implemented, so `/ready` remains false.
+Phase 2A.1 adds independent durable reconciliation, cross-host ownership cleanup, protected callback-outbox headroom, and observable Queue operation failures. Phase 2A-S adds a contract-validated Senku advisory client for all five Kaseki-owned profiles and a task-admission seam. Senku remains advisory; Soyuz remains the sole run authority. The production service still does not construct a Queue poller or Senku client. The Phase 2B branch adds a proof-gated mock supervisor contract only; Docker execution, durable Docker recovery, and coding-task execution are not implemented, so `/ready` remains false.
 
 ## Workspace
 
