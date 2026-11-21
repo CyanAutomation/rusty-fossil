@@ -86,7 +86,43 @@ Queue, coordinator and outbox counters are low-cardinality. They do not label ru
 
 ## Senku boundary for Phase 2A-S
 
-Senku is a later advisory decision service. A follow-on `fossil-senku` crate may support the Kaseki-owned profiles `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Advisory results cannot replace deterministic validation or Soyuz authorization. Do not add JEV or direct OpenRouter calls here; Senku availability will not be required to accept a valid Soyuz authorization.
+The `fossil-senku` crate implements the Senku REST protocol for the five Kaseki-owned profiles below. It sends one request per evaluation to `POST /v1/profiles/{profileId}/evaluate`, with `{ "schemaVersion": "1", "input": { ... } }`, and disables redirects. Requests have a 128 KiB total cap; response streams are stopped at 64 KiB. No automatic retry, provider failover, JEV client, or direct OpenRouter call is used.
+
+| Profile ID | Typed input | Contract-specific validation |
+| --- | --- | --- |
+| `task_admission_v1` | `TaskAdmissionInput` | HTTPS repository URL and ref, bounded task instructions/options, profile answer IDs and labels. |
+| `kaseki_context_routing_v1` | `ContextRoutingInput` | Supported routing mode, bounded sanitized evidence, returned routing identities constrained to submitted context. No raw source, shell command, or tool output is intentionally supplied. |
+| `validation_recovery_v1` | `ValidationRecoveryInput` | Bounded command metadata and at most 8 KiB redacted output; redaction occurs before taking the trailing excerpt. Missing advice never authorizes a retry. |
+| `kaseki_goal_check_v1` | `GoalCheckInput` | Unique submitted criterion IDs; returned answers must exactly match this request's criteria. |
+| `kaseki_run_evaluation_v1` | `RunEvaluationInput` | Bounded run-state evidence and profile-specific score/answer validation. |
+
+The client validates schema version, request ID, completed status, exact profile ID and version, provider identity, exact answer identities and labels/scales, probability keys and normalization, nullable confidence, and the canonical `result` mirror. Unknown, missing, malformed, or oversized responses fail as typed errors. A null confidence remains null. Dynamic context/goal answers are matched to the request rather than accepted by naming pattern alone.
+
+Evidence is recursively bounded to depth 8 and 64 list entries. Profile evidence caps are 32 KiB for task admission/context, 8 KiB for validation recovery, 48 KiB for goal check, and 96 KiB for run evaluation, with a 128 KiB serialized envelope cap. Sensitive-key values, bearer/JWT/provider/GitHub tokens, AWS credentials, URL passwords, and private-key blocks are redacted. Validation output is fully redacted before taking its tail. Raw prompts, evidence, provider responses, tokens, and rationale must not appear in logs or metrics.
+
+`task_admission_v1` is available behind an optional coordinator `DecisionService` seam. Its output is discarded as an authorization input; deterministic contract checks and Soyuz's canonical claim/start/fence protocol remain mandatory. Other profile calls are typed client capabilities only. Missing or failed advice is a degraded advisory result: context is retained, validation failure remains a failure, goal-check uncertainty is not success, and run-evaluation uncertainty does not fabricate a score. Senku availability is reported separately and does not make Soyuz readiness fail. The service binary does not instantiate the client or perform paid inference.
+
+Senku's current permission matrix allows these profiles to the Kaseki machine identity, not a Soyuz identity. Rusty-Fossil needs a separately provisioned authorized Senku bearer token; never reuse `SOYUZ_WORKER_API_TOKEN`. A dedicated Rusty-Fossil machine identity requires a separately reviewed Senku permission change and is not implemented here. Configure `SENKU_API_ORIGIN` and either `SENKU_API_TOKEN_FILE` or `SENKU_API_TOKEN`. Production origin must be HTTPS. HTTP is accepted only for loopback in development/tests; origins cannot contain credentials, paths, queries, or fragments. The Compose overlay in `docker-compose.senku.yml` demonstrates a mounted secret but does not enable inference in `main`.
+
+The Senku client exposes per-profile attempts, successes, invalid responses, transport failures, degraded counts, and bounded-duration totals through `SenkuClient::metrics()`. These snapshots are not connected to the diagnostic HTTP endpoint until the client is intentionally wired into a non-production runtime.
+
+### Controlled Senku contract-test procedure
+
+Default Rust tests use synthetic fixtures and never call a live Senku or provider. To compare against a Senku checkout, run its local worker with a mocked decision provider and a synthetic Kaseki-authorized test credential; point only a local Rust integration test at its loopback origin. Exercise each profile's request fixture, response fixture, error envelope, and size boundary. Do not point the test harness at the deployment origin, inject production task evidence, add the cross-repository harness to required offline CI, or enable this client in `main` as part of the comparison.
+
+## Queue acknowledgement, retry and dead-letter operations
+
+| Situation | Adapter behavior | Operator interpretation |
+| --- | --- | --- |
+| Durable authorization/handoff is committed | Ack the exact lease and require `ackCount == 1`. | An ack timeout is uncertain; redelivery is deduplicated by Soyuz run ID and SQLite, never by lease ID. |
+| Coordinator requests retry | Retry the exact lease with bounded exponential delay and jitter (capped at 375 seconds); require `retryCount == 1`. | A failed retry request is logged/counted; lease expiry can redeliver, so do not resubmit a run. |
+| Pull/ack/retry receives a recoverable network, timeout, rate-limit, or service-unavailable error | Bounded backoff; polling loop continues. | Check Queue transport metrics and Cloudflare status. |
+| Permanent authorization/configuration/protocol error | Polling suspends and increments a suspension counter; structured logs record the safe class. | Fix token scopes/configuration or contract mismatch, then restart the adapter under controlled rollout. |
+| Invalid or poison message | No Soyuz claim; bounded retry lets configured Cloudflare policy move it to DLQ. | Inspect sanitized failure category and source run; do not replay unchanged poison input. |
+
+Production Cloudflare Queue configuration is deliberately not modified here. Before enabling polling, set a finite retry limit (recommended initial maximum: 5 deliveries), configure a dedicated DLQ, and retain source and DLQ messages for at least 7 days or the incident-response window, whichever is longer. Alert on DLQ arrivals and failed ack/retry operations. Investigate poison messages against the canonical Soyuz run and contract version. Replay only after correcting the cause, using the original canonical `runId` and a controlled Queue redrive; never create a replacement run to bypass a stuck message. DLQ retention and actual redrive behavior must be verified in a non-production account first.
+
+For a blocked callback, inspect the redacted failure class, pending age and stable callback/event ID, then verify current Soyuz state and worker fence. Do not delete a blocked row to clear capacity. Reconcile or resolve it through an operator-approved store procedure that preserves the callback's canonical identity; otherwise keep intake backpressured.
 
 ## Phase 2B Docker prerequisites
 

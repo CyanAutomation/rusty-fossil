@@ -2,7 +2,7 @@
 
 Rusty-Fossil is the host-side controller foundation for disposable repository workers. **Soyuz is the only run-control authority**: it accepts submissions, assigns canonical run IDs, owns lifecycle and cancellation state, and publishes Cloudflare Queue messages. Rusty-Fossil has no submission endpoint or local-run fallback.
 
-Phase 2A adds a Cloudflare Queue HTTP pull adapter, strict contract-v1 request validation, a durable authorization coordinator, restart-safe execution descriptors, fenced claim/start proofs, a single local handoff slot, and a retryable callback outbox. The transport and coordinator are implemented for mock-driven use, but the production service does not start Queue polling. Docker execution and coding-task execution are not implemented. `/ready` therefore remains false.
+Phase 2A.1 adds independent durable reconciliation, cross-host ownership cleanup, protected callback-outbox headroom, and observable Queue operation failures. Phase 2A-S adds a contract-validated Senku advisory client for all five Kaseki-owned profiles and a task-admission seam. Senku remains advisory; Soyuz remains the sole run authority. The production service still does not construct a Queue poller or Senku client. Docker execution and coding-task execution are not implemented, so `/ready` remains false.
 
 ## Workspace
 
@@ -10,6 +10,7 @@ Phase 2A adds a Cloudflare Queue HTTP pull adapter, strict contract-v1 request v
 - `crates/fossil-queue` — Cloudflare HTTP pull, ack/retry, response bounds, backoff, shutdown handling, and transport counters.
 - `crates/fossil-soyuz` — worker API client, claim/start/canonical proofs, callback requests, and bounded error classification.
 - `crates/fossil-storage` — SQLite migrations, private local state, durable descriptors and intents, one-slot reservation, recovery, and callback outbox.
+- `crates/fossil-senku` — versioned profile inputs, bounded authenticated transport, strict response validation, evidence redaction, and advisory metrics.
 - `crates/rusty-fossil` — controller configuration, authorization coordinator, read-only diagnostics, and callback replay logic.
 - `docs/` — contracts, architecture, compatibility evidence, decisions, and follow-on plan.
 
@@ -35,10 +36,14 @@ sequenceDiagram
     C->>S: final canonical authorization check
     C->>DB: confirm durable proof against the reserved slot
     C->>Q: ack lease only after durable authorized handoff
-    Note over C,Q: No worker is launched in Phase 2A.
+    Note over C,Q: No worker is launched in Phase 2A.1 or 2A-S.
 ```
 
-The canonical run UUID is the deduplication key. Queue message and lease IDs are transport identities only. The database retains the complete normalized request needed for restart recovery; SQLite files and their directory are restricted to the service account. Terminal callback intents are stored with local terminal transitions in one transaction.
+The canonical run UUID is the deduplication key. Queue message and lease IDs are transport identities only. The database retains the complete normalized request, claim/start IDs, and recovery state needed for restart reconciliation; SQLite files and their directory are restricted to the service account. Terminal callback intents are stored with local terminal transitions in one transaction.
+
+`RecoveryManager` can reconcile durable runs at startup and periodically without a Queue lease. It reuses persisted IDs, re-reads canonical Soyuz state, and never relaunches a potentially active execution. Intake pauses while local recovery state is unresolved, while callback replay remains independent of the execution slot. A single reserved outbox entry protects a mandatory terminal callback.
+
+The Senku client supports `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Inputs are bounded and redacted, and responses are checked against the selected profile. Only task admission has a coordinator seam; no Senku answer authorizes a claim, start, retry, or execution.
 
 ## Build and local diagnostics
 
@@ -53,15 +58,15 @@ The service binds to `127.0.0.1:8080` by default and creates `./state/fossil.sql
 
 - `GET /health` reports process liveness.
 - `GET /ready` reports configuration, local state, Queue probe, recovery backlog, handoff readiness, and missing execution capabilities. It returns 503 because Queue intake is disabled and Docker execution is absent.
-- `GET /metrics` reports read-only diagnostics, callback backlog, and local slot availability.
+- `GET /metrics` reports read-only diagnostics, callback backlog, recovery outcomes, intake blocking, and local slot availability. Senku client snapshots include per-profile attempts, successes, invalid responses, transport failures, degraded evaluations, and duration totals; they are not wired into the service endpoint while the production client remains disabled.
 
-There are no `POST /runs`, `POST /execute`, retry, claim, or start routes. Queue intake must not be enabled in Compose or in a production deployment as part of Phase 2A.
+There are no `POST /runs`, `POST /execute`, retry, claim, or start routes. Queue intake and the Senku client are not enabled by the service binary in this phase.
 
 ## Configuration
 
 Use mounted secret files for `SOYUZ_WORKER_API_TOKEN` and `CLOUDFLARE_QUEUE_TOKEN`; direct values are supported for local mock tests. The Soyuz worker token and Cloudflare Queue read/write token are separate. Configure `SOYUZ_API_ORIGIN`, `SOYUZ_WORKER_ID`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_QUEUE_ID` as needed. Worker IDs remain restricted to 1–64 ASCII letters, digits, `-`, or `_`.
 
-See [Soyuz and Queue contract notes](docs/CONTRACTS.md#configuration-boundary) and `.env.example`. Configuration validity alone does not enable intake or mark coding execution ready.
+See [Soyuz, Queue, and Senku contract notes](docs/CONTRACTS.md#configuration-boundary) and `.env.example`. Senku requires a separate bearer credential; never reuse the Soyuz worker token. Configuration validity alone does not enable intake or mark coding execution ready.
 
 ## Checks
 
@@ -80,4 +85,4 @@ Protocol and coordinator tests use local HTTP mocks and no production credential
 - [Soyuz and Cloudflare contracts](docs/CONTRACTS.md)
 - [Compatibility inventory](docs/COMPATIBILITY.md)
 - [Architecture decisions](docs/DECISIONS/)
-- [Implementation plan and Phase 2A-S / 2B prerequisites](docs/IMPLEMENTATION-PLAN.md)
+- [Implementation plan and Phase 2B prerequisites](docs/IMPLEMENTATION-PLAN.md)

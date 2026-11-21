@@ -22,11 +22,15 @@ Implemented in this change:
 - Readiness and diagnostics that distinguish configuration, state, transport probe, recovery, handoff and missing execution runtime.
 - Local mock integration coverage. Production Queue polling and callback replay remain unwired in the service binary. No Docker worker or coding process is started.
 
-Before enabling the adapter operationally, verify actual Soyuz producer content type and Queue message body encoding in a controlled non-production Queue. Establish and document the Cloudflare dead-letter queue policy and operator procedures for blocked callback rows. Queue transport metrics and coordinator metrics are available from their components; the diagnostic HTTP API currently exposes local outbox and slot gauges, while transport status remains unprobed.
+The adapter remains unconstructed in `main`. Before enabling it operationally, verify actual Soyuz producer content type and Queue message body encoding in a controlled non-production Queue and configure the documented finite retry/DLQ policy. Queue transport and coordinator metrics are available from their components; transport status remains unprobed by the read-only diagnostics API.
+
+## Phase 2A.1 — Recovery and Queue ownership hardening
+
+Implemented in this worktree; merge and runtime rollout remain pending. `RecoveryManager` reconciles persisted nonterminal runs independently of Queue delivery, reuses stable callback identities, recognizes cross-host ownership, and stops on ambiguous active work. Intake checks both the single-slot/recovery state and outbox headroom. The callback outbox retains its 1,000-item cap and pauses new intake at 999 pending/blocked items to protect one mandatory terminal callback. Queue ack/retry failures and permanent polling suspension are counted and logged. No production Queue resource was changed.
 
 ## Phase 2A-S — Senku advisory decision foundation
 
-Create a separate `fossil-senku` crate and typed client for Kaseki-owned profiles: `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Add fixtures, response validation, bounded timeouts, stage-specific degradation behavior and mock tests. Results remain advisory. Deterministic security validation and the Soyuz claim/start protocol cannot be overridden. Do not add JEV or call OpenRouter directly; Senku availability is not required to receive a valid Soyuz authorization.
+Implemented in this worktree; merge and runtime rollout remain pending. The new `fossil-senku` crate supports all five Kaseki-owned profile IDs with typed inputs, versioned envelopes, authenticated bounded transport, strict consumer validation, evidence minimization/redaction, and per-profile client metrics. `task_admission_v1` has a mockable coordinator seam. Senku output never authorizes a claim/start/retry or overrides deterministic checks. The client is optional and is not instantiated by the production binary. Senku's current permission matrix grants these profiles to the Kaseki identity; provision a separate credential under that authorization or review a dedicated Rusty-Fossil identity with a separate Senku change. Never reuse the Soyuz token.
 
 ## Phase 2B — Disposable worker execution
 
@@ -49,6 +53,9 @@ Run controlled Queue and Soyuz integration tests, confirm idempotent callback be
 1. Review this Phase 2A implementation and CI.
 2. Verify producer content type and base64 payload behavior with a non-production queue.
 3. Define DLQ retention/replay and blocked-callback operator runbooks.
-4. Land 2A-S only after documenting that advisory output cannot authorize work.
-5. Land 2B only after proving the proof-gated mock supervisor and restart/cancellation boundaries.
-6. Keep production Queue polling disabled until transport, recovery, and worker controls are separately reviewed.
+4. Merge Phase 2A.1 and 2A-S only after CI passes on Linux AMD64 and ARM64 and the sandbox-limited mock transport tests run in a socket-enabled environment.
+5. Provision Senku credentials with the currently authorized profile scope; a dedicated Rusty-Fossil identity requires a separately reviewed Senku permission change.
+6. Land 2B only after proving the proof-gated mock supervisor and restart/cancellation boundaries.
+7. Keep production Queue polling, recovery supervision, callback replay, and Senku inference disabled until transport, recovery, DLQ, credential, and worker controls are separately reviewed.
+
+The acceptance status in this worktree is implementation-present and awaiting review/merge. Do not call either phase merged or production-ready before that review.

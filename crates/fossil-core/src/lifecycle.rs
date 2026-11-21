@@ -9,6 +9,7 @@ pub enum LocalLifecycleState {
     CanonicalRunChecked,
     ClaimIntentPersisted,
     ClaimAuthorized,
+    StartIntentPersisted,
     StartAuthorizationPersisted,
     ExecutionActive,
     CancellationRequested,
@@ -26,12 +27,18 @@ impl LocalLifecycleState {
                 | (Self::CanonicalRunChecked, Self::ClaimIntentPersisted)
                 | (Self::CanonicalRunChecked, Self::ExecutionTerminal)
                 | (Self::ClaimAuthorized, Self::StartAuthorizationPersisted)
+                | (Self::ClaimAuthorized, Self::StartIntentPersisted)
+                | (
+                    Self::StartIntentPersisted,
+                    Self::StartAuthorizationPersisted
+                )
                 | (Self::StartAuthorizationPersisted, Self::ExecutionActive)
                 | (Self::ExecutionActive, Self::CancellationRequested)
                 | (Self::ExecutionActive, Self::ExecutionTerminal)
                 | (Self::CancellationRequested, Self::ExecutionTerminal)
                 | (Self::ClaimIntentPersisted, Self::ExecutionTerminal)
                 | (Self::ClaimAuthorized, Self::ExecutionTerminal)
+                | (Self::StartIntentPersisted, Self::ExecutionTerminal)
                 | (Self::StartAuthorizationPersisted, Self::ExecutionTerminal)
         );
         if valid {

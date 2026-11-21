@@ -3,6 +3,7 @@ members = [
     "crates/fossil-core",
     "crates/fossil-storage",
     "crates/fossil-soyuz",
+    "crates/fossil-senku",
     "crates/fossil-queue",
     "crates/rusty-fossil",
 ]
@@ -20,6 +21,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 fossil-core = { path = "crates/fossil-core" }
 fossil-soyuz = { path = "crates/fossil-soyuz" }
+fossil-senku = { path = "crates/fossil-senku" }
 fossil-queue = { path = "crates/fossil-queue" }
 fossil-storage = { path = "crates/fossil-storage" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
