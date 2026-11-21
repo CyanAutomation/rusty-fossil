@@ -419,9 +419,6 @@ impl AuthorizationCoordinator {
                 .record_recovery_action(run_id, RecoveryAction::ManualReview);
             return QueueDisposition::Acknowledge;
         }
-        if newly_observed {
-            self.evaluate_task_admission(&envelope).await;
-        }
         if record.lifecycle_state == LocalLifecycleState::ExecutionTerminal {
             return QueueDisposition::Acknowledge;
         }
@@ -457,6 +454,21 @@ impl AuthorizationCoordinator {
         }
         if is_terminal(canonical.status) {
             return self.handle_terminal(record);
+        }
+
+        let admission_eligible = match canonical.status {
+            SoyuzRunStatus::Queued => {
+                canonical.worker_id.is_none()
+                    || canonical.worker_id.as_ref() == Some(&self.worker_id)
+            }
+            SoyuzRunStatus::Claimed | SoyuzRunStatus::Running => {
+                canonical.worker_id.as_ref() == Some(&self.worker_id)
+                    && canonical.claim_callback_id == record.claim_callback_id
+            }
+            _ => false,
+        };
+        if newly_observed && admission_eligible {
+            self.evaluate_task_admission(&envelope).await;
         }
 
         match canonical.status {
@@ -1557,8 +1569,8 @@ mod tests {
         );
         assert!(record.claim_callback_id.is_none());
         assert!(!record.start_authorized);
-        assert_eq!(senku.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(coordinator.metrics().senku_task_admission_degraded, 1);
+        assert_eq!(senku.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(coordinator.metrics().senku_task_admission_degraded, 0);
     }
 
     #[tokio::test]
@@ -1651,8 +1663,8 @@ mod tests {
         assert_eq!(record.recovery_action, RecoveryAction::OwnedElsewhere);
         assert!(store.pending_callbacks().unwrap().is_empty());
         assert!(store.intake_capacity_available().unwrap());
-        assert_eq!(senku.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(coordinator.metrics().senku_task_admission_successes, 1);
+        assert_eq!(senku.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(coordinator.metrics().senku_task_admission_successes, 0);
     }
 
     #[tokio::test]
