@@ -1012,18 +1012,37 @@ fn redact_text(value: &str) -> String {
         index += 1;
     }
     let mut result = redacted_words.join(" ");
-    if let Some(start) = result.find("-----BEGIN")
-        && result[start..].contains("PRIVATE KEY-----")
-    {
-        let end = result[start..]
+    let mut cursor = 0;
+    while let Some(offset) = result[cursor..].find("-----BEGIN") {
+        let start = cursor + offset;
+        let header_end_offset = result[start + 5..].find("-----");
+        if header_end_offset.is_none() && result[start..].contains("PRIVATE KEY") {
+            result.replace_range(start.., "[REDACTED PRIVATE KEY]");
+            break;
+        }
+        let header_end = header_end_offset
+            .map(|end| start + 5 + end + 5)
+            .unwrap_or(result.len());
+        if !result[start..header_end].contains("PRIVATE KEY-----") {
+            cursor = header_end.max(start + 1);
+            if cursor >= result.len() {
+                break;
+            }
+            continue;
+        }
+        let end = result[header_end..]
             .find("-----END")
             .and_then(|offset| {
-                result[start + offset..]
+                result[header_end + offset + 8..]
                     .find("-----")
-                    .map(|tail| start + offset + tail + 5)
+                    .map(|tail| header_end + offset + 8 + tail + 5)
             })
             .unwrap_or(result.len());
         result.replace_range(start..end, "[REDACTED PRIVATE KEY]");
+        cursor = start + "[REDACTED PRIVATE KEY]".len();
+        if cursor >= result.len() {
+            break;
+        }
     }
     result
 }
@@ -1492,4 +1511,34 @@ fn probability(value: Option<&Value>) -> Result<f64, DecisionError> {
 
 fn has_exact_keys(object: &Map<String, Value>, expected: &[&str]) -> bool {
     object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+#[cfg(test)]
+mod redaction_regression_tests {
+    use super::redact_text;
+
+    #[test]
+    fn redacts_all_private_key_blocks_and_adjacent_credentials() {
+        let first = "-----BEGIN RSA PRIVATE KEY-----\nalpha-secret\n-----END RSA PRIVATE KEY-----";
+        let second =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nbeta-secret\n-----END OPENSSH PRIVATE KEY-----";
+        let input = format!("{first} ghp_sensitive-token {second} password=also-sensitive");
+        let sanitized = redact_text(&input);
+        assert!(!sanitized.contains("alpha-secret"));
+        assert!(!sanitized.contains("beta-secret"));
+        assert!(!sanitized.contains("ghp_sensitive-token"));
+        assert!(!sanitized.contains("also-sensitive"));
+        assert!(sanitized.contains("[REDACTED PRIVATE KEY]"));
+        assert_eq!(sanitized.matches("[REDACTED PRIVATE KEY]").count(), 2);
+    }
+
+    #[test]
+    fn unterminated_private_key_redacts_the_remainder() {
+        let sanitized = redact_text("safe prefix\n-----BEGIN PRIVATE KEY-----\nsecret-tail");
+        assert!(sanitized.starts_with("safe prefix"));
+        assert!(!sanitized.contains("secret-tail"));
+
+        let malformed = redact_text("safe -----BEGIN PRIVATE KEY\nsecret-tail");
+        assert!(!malformed.contains("secret-tail"));
+    }
 }
