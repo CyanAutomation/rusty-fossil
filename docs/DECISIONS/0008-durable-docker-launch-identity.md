@@ -9,7 +9,7 @@ Docker create and start requests can succeed even when the client loses the resp
 
 ## Decision
 
-SQLite schema v4 stores one `container_launches` row per canonical run. The row contains the run, worker, claim fence, start callback, fixed scenario, deterministic name, optional Docker ID, state, timestamps, terminal callback ID and bounded diagnostic result. The name uses a fixed prefix plus canonical run and start identity; prompts and repository metadata are never included in names or labels.
+SQLite schema v5 stores one `container_launches` row per canonical run. The row contains the run, worker, claim fence, start callback, versioned workload kind, fixed scenario, immutable image identity, profile version, effective resource/runtime policy, deterministic name, optional Docker ID, state, timestamps, absolute runtime deadline, terminal callback ID and bounded diagnostic result. The name uses a fixed prefix plus canonical run and start identity; prompts and repository metadata are never included in names or labels. The migration preserves v4 rows and leaves their unknown image identity, effective policy and runtime deadline unset rather than guessing.
 
 The supervisor commits `launch_intent_persisted` before Docker access and uses a transactional transition to `create_requested` so only one cooperating process sends the initial create. A lost create response is reconciled by inspecting that exact name and checking all immutable labels, configured image, Docker ID when present, and effective security profile. The create call is never repeated after `create_requested` is durable.
 

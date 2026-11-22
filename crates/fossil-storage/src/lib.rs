@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_CALLBACK_PAYLOAD_BYTES: usize = 12 * 1024;
 const MAX_PENDING_CALLBACKS: u32 = 1_000;
 const MAX_EXECUTION_DESCRIPTOR_BYTES: usize = 96 * 1024;
@@ -160,7 +160,14 @@ pub struct ContainerLaunchRecord {
     pub worker_id: WorkerId,
     pub claim_callback_id: ClaimCallbackId,
     pub start_callback_id: EventId,
+    pub workload_kind: WorkloadKind,
+    pub workload_version: u32,
     pub scenario: fossil_core::execution::SyntheticScenario,
+    pub image_identity: Option<String>,
+    pub profile_version: String,
+    pub effective_policy_json: String,
+    pub runtime_limit_ms: Option<i64>,
+    pub effective_deadline_at_ms: Option<i64>,
     pub container_name: String,
     pub container_id: Option<String>,
     pub state: ContainerLaunchState,
@@ -174,6 +181,32 @@ pub struct ContainerLaunchRecord {
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
     pub updated_at_ms: i64,
+}
+
+/// Workload types that the supervisor currently knows how to launch. New
+/// workload kinds must be added explicitly; unknown persisted kinds fail
+/// closed during recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadKind {
+    Synthetic,
+}
+
+impl WorkloadKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLaunchProfile {
+    pub workload_kind: WorkloadKind,
+    pub workload_version: u32,
+    pub image_identity: String,
+    pub profile_version: String,
+    pub effective_policy_json: String,
+    pub runtime_limit_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -795,6 +828,30 @@ impl SqliteStore {
                 CREATE INDEX container_launches_state_idx ON container_launches(state);
                 INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, 0);
                 PRAGMA user_version = 4;",
+            )?;
+            transaction.commit()?;
+            return Self::migrate(connection);
+        }
+
+        if version == 4 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE container_launches
+                    ADD COLUMN workload_kind TEXT NOT NULL DEFAULT 'synthetic';
+                ALTER TABLE container_launches
+                    ADD COLUMN workload_version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE container_launches ADD COLUMN image_identity TEXT;
+                ALTER TABLE container_launches
+                    ADD COLUMN profile_version TEXT NOT NULL DEFAULT 'synthetic-v1';
+                ALTER TABLE container_launches
+                    ADD COLUMN effective_policy_json TEXT NOT NULL DEFAULT '{}'
+                        CHECK (length(effective_policy_json) <= 4096);
+                ALTER TABLE container_launches ADD COLUMN runtime_limit_ms INTEGER;
+                ALTER TABLE container_launches ADD COLUMN effective_deadline_at_ms INTEGER;
+
+                INSERT INTO schema_migrations(version, applied_at_ms) VALUES (5, 0);
+                PRAGMA user_version = 5;",
             )?;
             transaction.commit()?;
             return Ok(());
@@ -1429,8 +1486,27 @@ impl SqliteStore {
         &self,
         run_id: RunId,
         scenario: fossil_core::execution::SyntheticScenario,
+        profile: ContainerLaunchProfile,
         authorization: ExecutionGateAuthorization,
     ) -> Result<ContainerLaunchRecord, StoreError> {
+        if profile.workload_kind != WorkloadKind::Synthetic
+            || profile.workload_version != 1
+            || profile.profile_version != "synthetic-v1"
+            || profile.image_identity.is_empty()
+            || profile.image_identity.len() > 512
+            || profile
+                .image_identity
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || profile.effective_policy_json.len() > 4096
+            || !matches!(
+                serde_json::from_str::<serde_json::Value>(&profile.effective_policy_json),
+                Ok(value) if value.is_object()
+            )
+            || !(1..=10_800_000).contains(&profile.runtime_limit_ms)
+        {
+            return Err(StoreError::InvalidContainerLaunchResult);
+        }
         if authorization.run_id() != run_id {
             return Err(StoreError::ContainerLaunchAuthorizationMismatch);
         }
@@ -1461,6 +1537,12 @@ impl SqliteStore {
                 || existing.claim_callback_id != authorization.claim_callback_id()
                 || existing.start_callback_id != authorization.start_callback_id()
                 || existing.scenario != scenario
+                || existing.workload_kind != profile.workload_kind
+                || existing.workload_version != profile.workload_version
+                || existing.image_identity.as_deref() != Some(&profile.image_identity)
+                || existing.profile_version != profile.profile_version
+                || existing.effective_policy_json != profile.effective_policy_json
+                || existing.runtime_limit_ms != Some(profile.runtime_limit_ms)
             {
                 return Err(StoreError::ContainerLaunchIdentityConflict);
             }
@@ -1507,8 +1589,11 @@ impl SqliteStore {
         transaction.execute(
             "INSERT INTO container_launches (
                 run_id, worker_id, claim_callback_id, start_callback_id, scenario,
-                container_name, state, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'launch_intent_persisted', ?7, ?7)",
+                container_name, state, created_at_ms, updated_at_ms, workload_kind,
+                workload_version, image_identity, profile_version, effective_policy_json,
+                runtime_limit_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'launch_intent_persisted', ?7, ?7,
+                       ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 run_id.to_string(),
                 run.worker_id.as_str(),
@@ -1516,7 +1601,13 @@ impl SqliteStore {
                 authorization.start_callback_id().to_string(),
                 scenario.as_str(),
                 container_name,
-                now
+                now,
+                profile.workload_kind.as_str(),
+                i64::from(profile.workload_version),
+                profile.image_identity,
+                profile.profile_version,
+                profile.effective_policy_json,
+                profile.runtime_limit_ms,
             ],
         )?;
         let launch = load_container_launch(&transaction, run_id)?;
@@ -1690,6 +1781,7 @@ impl SqliteStore {
         }
         run.lifecycle_state
             .transition(LocalLifecycleState::ExecutionActive)?;
+        let effective_deadline_at_ms = calculate_effective_deadline(&launch, started_at_ms)?;
         transaction.execute(
             "UPDATE run_records SET lifecycle_state = 'execution_active', updated_at_ms = ?2
              WHERE run_id = ?1 AND lifecycle_state = 'start_authorization_persisted'",
@@ -1697,9 +1789,9 @@ impl SqliteStore {
         )?;
         transaction.execute(
             "UPDATE container_launches SET state = 'container_running', started_at_ms = ?2,
-                updated_at_ms = ?2
+                effective_deadline_at_ms = ?3, updated_at_ms = ?2
              WHERE run_id = ?1 AND state = 'start_requested'",
-            params![run_id.to_string(), started_at_ms],
+            params![run_id.to_string(), started_at_ms, effective_deadline_at_ms],
         )?;
         launch = load_container_launch(&transaction, run_id)?;
         transaction.commit()?;
@@ -1769,6 +1861,7 @@ impl SqliteStore {
         }
         run.lifecycle_state
             .transition(LocalLifecycleState::ExecutionActive)?;
+        let effective_deadline_at_ms = calculate_effective_deadline(&launch, started_at_ms)?;
         transaction.execute(
             "UPDATE run_records SET lifecycle_state = 'execution_active', updated_at_ms = ?2
              WHERE run_id = ?1 AND lifecycle_state = 'start_authorization_persisted'",
@@ -1776,9 +1869,9 @@ impl SqliteStore {
         )?;
         transaction.execute(
             "UPDATE container_launches SET state = 'container_running', started_at_ms = ?2,
-                updated_at_ms = ?2
+                effective_deadline_at_ms = ?3, updated_at_ms = ?2
              WHERE run_id = ?1 AND state = 'start_requested'",
-            params![run_id.to_string(), started_at_ms],
+            params![run_id.to_string(), started_at_ms, effective_deadline_at_ms],
         )?;
         launch = load_container_launch(&transaction, run_id)?;
         transaction.commit()?;
@@ -2599,6 +2692,19 @@ fn parse_lifecycle_state(
     }
 }
 
+fn calculate_effective_deadline(
+    launch: &ContainerLaunchRecord,
+    started_at_ms: i64,
+) -> Result<i64, StoreError> {
+    let runtime_limit_ms = launch
+        .runtime_limit_ms
+        .filter(|limit| *limit > 0)
+        .ok_or(StoreError::InvalidContainerLaunchResult)?;
+    started_at_ms
+        .checked_add(runtime_limit_ms)
+        .ok_or(StoreError::InvalidContainerLaunchResult)
+}
+
 fn load_container_launch(
     connection: &Connection,
     run_id: RunId,
@@ -2617,7 +2723,9 @@ fn load_container_launch_optional(
                     container_name, container_id, state, exit_code, outcome_class,
                     diagnostic_summary, output_truncated, terminal_callback_id,
                     stop_reason, stop_requested_at_ms, started_at_ms, completed_at_ms,
-                    updated_at_ms
+                    updated_at_ms, workload_kind, workload_version, image_identity,
+                    profile_version, runtime_limit_ms, effective_deadline_at_ms,
+                    effective_policy_json
              FROM container_launches WHERE run_id = ?1",
             [run_id.to_string()],
             |row| {
@@ -2639,6 +2747,13 @@ fn load_container_launch_optional(
                     row.get::<_, Option<i64>>(14)?,
                     row.get::<_, Option<i64>>(15)?,
                     row.get::<_, i64>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, String>(20)?,
+                    row.get::<_, Option<i64>>(21)?,
+                    row.get::<_, Option<i64>>(22)?,
+                    row.get::<_, String>(23)?,
                 ))
             },
         )
@@ -2662,7 +2777,16 @@ fn load_container_launch_optional(
             started_at_ms,
             completed_at_ms,
             updated_at_ms,
+            workload_kind,
+            workload_version,
+            image_identity,
+            profile_version,
+            runtime_limit_ms,
+            effective_deadline_at_ms,
+            effective_policy_json,
         )| {
+            let workload_version = u32::try_from(workload_version)
+                .map_err(|_| StoreError::InvalidStoredValue("workload version"))?;
             Ok(ContainerLaunchRecord {
                 run_id,
                 worker_id: WorkerId::parse(&worker_id)
@@ -2671,7 +2795,14 @@ fn load_container_launch_optional(
                     .map_err(|_| StoreError::InvalidStoredValue("container claim ID"))?,
                 start_callback_id: EventId::parse(&start_callback_id)
                     .map_err(|_| StoreError::InvalidStoredValue("container start ID"))?,
+                workload_kind: parse_workload_kind(&workload_kind)?,
+                workload_version,
                 scenario: parse_synthetic_scenario(&scenario)?,
+                image_identity,
+                profile_version,
+                effective_policy_json,
+                runtime_limit_ms,
+                effective_deadline_at_ms,
                 container_name,
                 container_id,
                 state: ContainerLaunchState::parse(&state)?,
@@ -2694,6 +2825,13 @@ fn load_container_launch_optional(
         },
     )
     .transpose()
+}
+
+fn parse_workload_kind(value: &str) -> Result<WorkloadKind, StoreError> {
+    match value {
+        "synthetic" => Ok(WorkloadKind::Synthetic),
+        _ => Err(StoreError::InvalidStoredValue("container workload kind")),
+    }
 }
 
 fn parse_synthetic_scenario(

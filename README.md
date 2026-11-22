@@ -4,6 +4,8 @@ Rusty-Fossil is the host-side controller foundation for disposable repository wo
 
 Phase 2A.1 and 2A-S provide independent durable reconciliation, callback-outbox headroom, observable Queue failures, and an optional contract-validated Senku advisory client. Phase 2B adds an authenticated supervisor process, durable single-container Docker lifecycle, bounded security profile, and a fixed synthetic worker. Phase 2B.1 hardens outbox capacity, adds coordinator-to-supervisor process integration and restart coverage, and builds both controller and supervisor for Linux AMD64 and ARM64. Senku remains advisory and Soyuz remains the sole run authority. Production `main` still does not construct a Queue poller, callback replay loop, Senku client, or supervisor IPC client; `/ready` remains false until a controlled runtime is wired.
 
+Phase 2C-A adds a pinned Pi 1.6.0 worker image and bounded prompt wrapper. The Rust Pi event parser now processes JSONL incrementally with strict stream, record and event-count bounds, and classifies completion together with the actual process exit. SQLite schema v5 also persists the current synthetic workload version, image digest, profile policy and absolute runtime deadline. This remains groundwork only: the supervisor is still synthetic-only, and no repository, gateway or coding-task execution path is enabled.
+
 ## Workspace
 
 - `crates/fossil-core` — canonical IDs, normalized Soyuz request schema, Queue parsing, and local lifecycle rules.
@@ -99,6 +101,9 @@ Default tests use local HTTP mocks and no production credentials, public network
 - [Soyuz and Cloudflare contracts](docs/CONTRACTS.md)
 - [Compatibility inventory](docs/COMPATIBILITY.md)
 - [Phase 2B supervisor operations](docs/PHASE-2B-OPERATIONS.md)
+- [Phase 2C-A operations](docs/PHASE-2C-A-OPERATIONS.md)
+- [Agentlab compatibility and validation](docs/AGENTLAB-COMPATIBILITY.md)
+- [Agentlab validation record](docs/AGENTLAB-VALIDATION.md)
 - [Architecture decisions](docs/DECISIONS/)
 - [Implementation plan and Phase 2B status](docs/IMPLEMENTATION-PLAN.md)
 - [Phase 2C-A long-running execution policy proposal](docs/DECISIONS/0012-phase-2c-long-running-execution-policy.md)

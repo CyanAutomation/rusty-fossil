@@ -16,8 +16,8 @@ use fossil_core::contract::SoyuzRunStatus;
 use fossil_core::ids::{EventId, RunId, WorkerId};
 use fossil_soyuz::{ExecutionGateAuthorization, SoyuzApi};
 use fossil_storage::{
-    CallbackOutboxRecord, CallbackPayload, ContainerExitTimes, ContainerLaunchRecord,
-    ContainerLaunchState, SqliteStore,
+    CallbackOutboxRecord, CallbackPayload, ContainerExitTimes, ContainerLaunchProfile,
+    ContainerLaunchRecord, ContainerLaunchState, SqliteStore, WorkloadKind,
 };
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -315,11 +315,28 @@ impl DockerSupervisor {
         }
     }
 
+    fn validate_launch_profile(
+        &self,
+        launch: &ContainerLaunchRecord,
+    ) -> Result<(), SupervisorError> {
+        if launch.workload_kind != WorkloadKind::Synthetic
+            || launch.workload_version != 1
+            || launch.profile_version != WORKLOAD_VERSION
+            || launch.image_identity.as_deref() != Some(self.config.image())
+            || launch.effective_policy_json != self.config.effective_policy_json()
+            || launch.runtime_limit_ms != Some(self.config.limits().max_runtime.as_millis() as i64)
+        {
+            return Err(SupervisorError::AmbiguousContainerState);
+        }
+        Ok(())
+    }
+
     fn validate_container_identity(
         &self,
         launch: &ContainerLaunchRecord,
         inspect: &ContainerInspectResponse,
     ) -> Result<String, SupervisorError> {
+        self.validate_launch_profile(launch)?;
         let labels = inspect
             .config
             .as_ref()
@@ -434,6 +451,10 @@ impl DockerSupervisor {
         mut launch: ContainerLaunchRecord,
     ) -> Result<ContainerLaunchRecord, SupervisorError> {
         if launch.state == ContainerLaunchState::LaunchIntentPersisted {
+            if self.validate_launch_profile(&launch).is_err() {
+                self.mark_manual_review(launch.run_id);
+                return Err(SupervisorError::AmbiguousContainerState);
+            }
             self.refresh_gate(launch.run_id).await?;
             let owns_create = self
                 .store
@@ -589,10 +610,9 @@ impl DockerSupervisor {
                 )
                 .ok_or(SupervisorError::AmbiguousContainerState)?;
                 match launch.state {
-                    ContainerLaunchState::StartRequested => self
-                        .store
-                        .recover_container_running(launch.run_id, started_at_ms)
-                        .map_err(|_| SupervisorError::StateUnavailable),
+                    ContainerLaunchState::StartRequested => {
+                        self.recover_container_running(launch.run_id, started_at_ms)
+                    }
                     ContainerLaunchState::ContainerRunning => Ok(launch),
                     _ => Err(SupervisorError::AmbiguousContainerState),
                 }
@@ -713,9 +733,18 @@ impl DockerSupervisor {
                         .and_then(docker_timestamp_ms)
                 })
                 .ok_or(SupervisorError::AmbiguousContainerState)?;
-            if now_ms().saturating_sub(started_at_ms)
-                >= self.config.limits().max_runtime.as_millis() as i64
-            {
+            let Some(deadline_at_ms) = launch.effective_deadline_at_ms else {
+                self.mark_manual_review(launch.run_id);
+                return Err(SupervisorError::AmbiguousContainerState);
+            };
+            let expected_deadline = launch
+                .runtime_limit_ms
+                .and_then(|runtime_ms| started_at_ms.checked_add(runtime_ms));
+            if expected_deadline != Some(deadline_at_ms) {
+                self.mark_manual_review(launch.run_id);
+                return Err(SupervisorError::AmbiguousContainerState);
+            }
+            if now_ms() >= deadline_at_ms {
                 return self.stop_and_finalize(launch, "timeout").await;
             }
 
@@ -1166,6 +1195,20 @@ impl DockerSupervisor {
             .map_err(|_| SupervisorError::StateUnavailable)
     }
 
+    fn recover_container_running(
+        &self,
+        run_id: RunId,
+        started_at_ms: i64,
+    ) -> Result<ContainerLaunchRecord, SupervisorError> {
+        match self.store.recover_container_running(run_id, started_at_ms) {
+            Ok(launch) => Ok(launch),
+            Err(_) => {
+                self.mark_manual_review(run_id);
+                Err(SupervisorError::StateUnavailable)
+            }
+        }
+    }
+
     fn record_ambiguous_state(&self, run_id: RunId) {
         if self
             .store
@@ -1204,11 +1247,20 @@ impl ExecutionSupervisor for DockerSupervisor {
         if !same_gate(&authorization, &fresh) {
             return Err(SupervisorError::AuthorizationRejected);
         }
+        let limits = self.config.limits();
+        let profile = ContainerLaunchProfile {
+            workload_kind: WorkloadKind::Synthetic,
+            workload_version: 1,
+            image_identity: self.config.image().to_owned(),
+            profile_version: WORKLOAD_VERSION.to_owned(),
+            effective_policy_json: self.config.effective_policy_json(),
+            runtime_limit_ms: limits.max_runtime.as_millis() as i64,
+        };
         #[cfg(feature = "test-support")]
         process_test_barrier("before_launch_intent_commit").await;
         let launch = self
             .store
-            .begin_container_launch(authorization.run_id(), scenario, fresh)
+            .begin_container_launch(authorization.run_id(), scenario, profile, fresh)
             .map_err(|_| SupervisorError::AuthorizationRejected)?;
         #[cfg(feature = "test-support")]
         process_test_barrier("after_launch_intent_commit").await;
@@ -1375,9 +1427,7 @@ impl ExecutionSupervisor for DockerSupervisor {
                     .and_then(docker_timestamp_ms)
                     .ok_or(SupervisorError::AmbiguousContainerState)?;
                 if launch.state == ContainerLaunchState::StartRequested {
-                    self.store
-                        .recover_container_running(run_id, started_at_ms)
-                        .map_err(|_| SupervisorError::StateUnavailable)?;
+                    self.recover_container_running(run_id, started_at_ms)?;
                 } else if launch.state != ContainerLaunchState::ContainerRunning {
                     return Ok(ReconciliationOutcome::Ambiguous);
                 }
