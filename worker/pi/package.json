@@ -1,0 +1,12 @@
+{
+  "name": "@earendil-works/pi-coding-agent-install",
+  "version": "1.6.0",
+  "private": true,
+  "description": "Pinned Pi CLI runtime for the disposable Rusty-Fossil coding worker",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.6.0"
+  }
+}

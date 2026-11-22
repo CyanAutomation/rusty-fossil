@@ -262,9 +262,11 @@ Phase 2B.1 additionally exercises the coordinator, Queue envelope, mock Soyuz, p
 
 The Linux target matrix builds both `rusty-fossil` and `fossil-supervisord` for AMD64 and ARM64; the synthetic worker OCI image is built for both platforms. These checks do not establish compatibility with a specific Raspberry Pi model or prove thermal, memory, storage or cgroup behaviour under sustained coding workloads.
 
-### Phase 2C-A: Pi coding worker foundation (design only)
+### Phase 2C-A: Pi coding worker foundation (partial)
 
-Keep timeout policy split by workload: synthetic timeout remains 15 minutes (current supported maximum 30 minutes); introduce a separately bounded coding-job timeout only with the coding runtime. Keep cancellation grace, Soyuz outage grace, supervisor shutdown grace and container recovery deadline as separate controls. Do not increase the synthetic runtime or global supervisor defaults to accommodate coding jobs. The proposal and shutdown review are recorded in [ADR 0012](DECISIONS/0012-phase-2c-long-running-execution-policy.md). Phase 2C-A still requires a fixed Pi worker image, disposable repository preparation, scoped credentials, outbound network policy, native Pi testing, and operator-reviewed drain/maintenance semantics. No Pi runtime is implemented here.
+This branch adds a separate Pi 1.6.0 worker package, a bounded stdin-to-JSON-mode launcher, a transcript-free Rust JSONL event classifier, and an AMD64/ARM64 CI image build with SBOM/provenance generation. These artifacts are not connected to the supervisor: the persisted launch model remains synthetic-only, no Pi image is on the supervisor allowlist, and no task descriptor, repository workspace or result summary is passed to a coding container.
+
+Keep timeout policy split by workload: synthetic timeout remains 15 minutes (current supported maximum 30 minutes); introduce a separately bounded coding-job timeout only with the coding runtime. Keep cancellation grace, Soyuz outage grace, supervisor shutdown grace and container recovery deadline as separate controls. Do not increase the synthetic runtime or global supervisor defaults to accommodate coding jobs. The proposal and shutdown review are recorded in [ADR 0012](DECISIONS/0012-phase-2c-long-running-execution-policy.md). End-to-end Phase 2C-A still requires a versioned durable workload type, a trusted Pi image profile, validated disposable repository preparation, an enforced egress broker, non-production gateway credentials, result persistence/recovery, native Pi testing, and operator-reviewed drain/maintenance semantics. Production Queue polling and coding execution remain disabled.
 
 ## Rust and targets
 
