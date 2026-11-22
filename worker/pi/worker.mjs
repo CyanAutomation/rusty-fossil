@@ -75,6 +75,7 @@ function runPi(prompt, model) {
       FOSSIL_PI_MODEL: model,
     },
     shell: false,
+    // Pi's JSONL stays on container stdout, which the supervisor reads via bounded Docker logs.
     stdio: ["pipe", "inherit", "inherit"],
   });
 

@@ -241,6 +241,10 @@ mod tests {
             PiStreamError::StreamTooLarge
         );
 
+        let max_events = "{\"type\":\"x\"}\n".repeat(super::MAX_PI_EVENT_COUNT);
+        let summary = summarize_pi_jsonl(max_events.as_bytes(), false).unwrap();
+        assert_eq!(summary.event_count, super::MAX_PI_EVENT_COUNT);
+
         let too_many_events = "{\"type\":\"x\"}\n".repeat(super::MAX_PI_EVENT_COUNT + 1);
         assert_eq!(
             summarize_pi_jsonl(too_many_events.as_bytes(), false).unwrap_err(),
