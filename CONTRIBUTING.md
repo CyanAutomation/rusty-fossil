@@ -28,3 +28,7 @@ Write the contract or lifecycle test first, then implement the smallest behavior
 ## Documentation
 
 Update the architecture, protocol notes, compatibility inventory, and implementation roadmap when behavior or external contracts change. Soyuz's current published contract takes precedence for Soyuz-facing behavior. Record differences from Kaseki as intentional compatibility decisions.
+
+## Agent skills
+
+Task-specific agent workflows are available in [`.github/skills`](.github/skills/README.md). Use them as checklists for recurring changes, and follow the linked architecture, contract, and operations documents as the source of truth.
