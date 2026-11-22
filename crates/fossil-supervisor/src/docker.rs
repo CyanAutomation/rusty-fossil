@@ -188,6 +188,24 @@ impl DockerRuntimeConfig {
         self.limits
     }
 
+    pub(crate) fn effective_policy_json(&self) -> String {
+        serde_json::json!({
+            "capabilities": "drop_all",
+            "cancellation_grace_ms": self.limits.cancellation_grace.as_millis(),
+            "cpu_millicores": self.limits.cpu_millicores,
+            "max_output_bytes": self.limits.max_output_bytes,
+            "memory_mib": self.limits.memory_mib,
+            "network_mode": "none",
+            "no_new_privileges": true,
+            "pid_limit": self.limits.pid_limit,
+            "read_only_rootfs": true,
+            "runtime_limit_ms": self.limits.max_runtime.as_millis(),
+            "temporary_storage_mib": self.limits.temporary_storage_mib,
+            "user": "65532:65532"
+        })
+        .to_string()
+    }
+
     pub fn container_config(&self, launch: &ContainerLaunchRecord) -> ContainerCreateBody {
         let labels = HashMap::from([
             ("io.rusty-fossil.managed".to_owned(), "true".to_owned()),
@@ -364,6 +382,25 @@ mod tests {
             DockerRuntimeConfig::new("alpine:latest", "/var/run/docker.sock").unwrap_err(),
             DockerConfigError::ImageNotPinned
         );
+    }
+
+    #[test]
+    fn effective_policy_identity_covers_resource_and_runtime_limits() {
+        let digest = "a".repeat(64);
+        let config = DockerRuntimeConfig::new(
+            format!("{TRUSTED_WORKER_IMAGE}@sha256:{digest}"),
+            "/var/run/docker.sock",
+        )
+        .unwrap();
+        let policy: serde_json::Value =
+            serde_json::from_str(&config.effective_policy_json()).unwrap();
+
+        assert_eq!(policy["cpu_millicores"], 500);
+        assert_eq!(policy["memory_mib"], 256);
+        assert_eq!(policy["pid_limit"], 32);
+        assert_eq!(policy["runtime_limit_ms"], 900_000);
+        assert_eq!(policy["network_mode"], "none");
+        assert!(policy["read_only_rootfs"].as_bool().unwrap());
     }
 
     #[cfg(feature = "test-support")]

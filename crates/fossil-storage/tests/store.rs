@@ -8,9 +8,11 @@ use fossil_soyuz::{
     SoyuzClientConfig, StartedAuthorization, StartedRequest, WorkerClaimRequest,
 };
 use fossil_storage::{
-    CallbackEnqueueResult, CallbackOutboxRecord, CallbackPayload, ContainerLaunchState,
-    ExecutionDescriptor, RecoveryAction, SqliteStore, StoreError, callback_retry_deadline_ms,
+    CallbackEnqueueResult, CallbackOutboxRecord, CallbackPayload, ContainerLaunchProfile,
+    ContainerLaunchState, ExecutionDescriptor, RecoveryAction, SqliteStore, StoreError,
+    callback_retry_deadline_ms,
 };
+use rusqlite::Connection;
 use secrecy::SecretString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,18 @@ use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUN_ID: &str = "f8a0c4c5-d628-7b93-a7cf-4b4629a28853";
+const SYNTHETIC_IMAGE: &str = "ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn synthetic_launch_profile(runtime_limit_ms: i64) -> ContainerLaunchProfile {
+    ContainerLaunchProfile {
+        workload_kind: fossil_storage::WorkloadKind::Synthetic,
+        workload_version: 1,
+        image_identity: SYNTHETIC_IMAGE.to_owned(),
+        profile_version: "synthetic-v1".to_owned(),
+        effective_policy_json: r#"{"cpu_millicores":500,"memory_mib":256}"#.to_owned(),
+        runtime_limit_ms,
+    }
+}
 
 fn state_path(root: &Path) -> PathBuf {
     root.join("private-state").join("state.sqlite3")
@@ -298,32 +312,178 @@ async fn docker_launch_intent_is_proof_gated_stable_and_durable() {
     let gate = execution_gate_authorization_for(&started_authorization).await;
 
     assert!(matches!(
-        store.begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone()),
+        store.begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate.clone(),
+        ),
         Err(StoreError::ExecutionSlotNotAuthorized)
     ));
     store.reserve_execution_slot(run_id()).unwrap();
 
     let intent = store
-        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate.clone(),
+        )
         .unwrap();
     assert_eq!(intent.state, ContainerLaunchState::LaunchIntentPersisted);
     assert!(intent.container_name.starts_with("rusty-fossil-synth-"));
     assert_eq!(
         intent,
         store
-            .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+            .begin_container_launch(
+                run_id(),
+                SyntheticScenario::Success,
+                synthetic_launch_profile(900_000),
+                gate.clone(),
+            )
             .unwrap()
     );
     assert!(matches!(
-        store.begin_container_launch(run_id(), SyntheticScenario::ControlledFailure, gate),
+        store.begin_container_launch(
+            run_id(),
+            SyntheticScenario::ControlledFailure,
+            synthetic_launch_profile(900_000),
+            gate.clone(),
+        ),
         Err(StoreError::ContainerLaunchIdentityConflict)
     ));
+    assert!(matches!(
+        store.begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(600_000),
+            gate.clone()
+        ),
+        Err(StoreError::ContainerLaunchIdentityConflict)
+    ));
+    let mut changed_image = synthetic_launch_profile(900_000);
+    changed_image.image_identity = format!(
+        "ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:{}",
+        "b".repeat(64)
+    );
+    assert!(matches!(
+        store.begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            changed_image,
+            gate.clone()
+        ),
+        Err(StoreError::ContainerLaunchIdentityConflict)
+    ));
+    let mut changed_policy = synthetic_launch_profile(900_000);
+    changed_policy.effective_policy_json = r#"{"cpu_millicores":250}"#.to_owned();
+    assert!(matches!(
+        store.begin_container_launch(run_id(), SyntheticScenario::Success, changed_policy, gate),
+        Err(StoreError::ContainerLaunchIdentityConflict)
+    ));
+    assert_eq!(intent.image_identity.as_deref(), Some(SYNTHETIC_IMAGE));
+    assert_eq!(intent.profile_version, "synthetic-v1");
+    assert_eq!(
+        intent.effective_policy_json,
+        r#"{"cpu_millicores":500,"memory_mib":256}"#
+    );
+    assert_eq!(intent.runtime_limit_ms, Some(900_000));
 
     drop(store);
     let reopened = SqliteStore::open(path).unwrap();
     let recovered = reopened.container_launch(run_id()).unwrap().unwrap();
     assert_eq!(recovered.state, ContainerLaunchState::LaunchIntentPersisted);
     assert_eq!(recovered.container_name, intent.container_name);
+}
+
+#[tokio::test]
+async fn runtime_deadline_is_persisted_from_original_start_and_survives_restart() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(600_000),
+            gate.clone(),
+        )
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "container-id-deadline")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+
+    let started_at_ms = 1_798_000_000_000;
+    let running = store
+        .mark_container_running(run_id(), gate, started_at_ms)
+        .unwrap();
+    assert_eq!(
+        running.effective_deadline_at_ms,
+        Some(started_at_ms + 600_000)
+    );
+
+    drop(store);
+    let reopened = SqliteStore::open(path).unwrap();
+    let recovered = reopened.container_launch(run_id()).unwrap().unwrap();
+    assert_eq!(recovered.started_at_ms, Some(started_at_ms));
+    assert_eq!(recovered.runtime_limit_ms, Some(600_000));
+    assert_eq!(
+        recovered.effective_deadline_at_ms,
+        Some(started_at_ms + 600_000)
+    );
+}
+
+#[tokio::test]
+async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    let launch = store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(600_000),
+            gate,
+        )
+        .unwrap();
+    drop(store);
+
+    let legacy_db = Connection::open(&path).unwrap();
+    legacy_db
+        .execute_batch(
+            "ALTER TABLE container_launches DROP COLUMN workload_kind;
+             ALTER TABLE container_launches DROP COLUMN workload_version;
+             ALTER TABLE container_launches DROP COLUMN image_identity;
+             ALTER TABLE container_launches DROP COLUMN profile_version;
+             ALTER TABLE container_launches DROP COLUMN effective_policy_json;
+             ALTER TABLE container_launches DROP COLUMN runtime_limit_ms;
+             ALTER TABLE container_launches DROP COLUMN effective_deadline_at_ms;
+             DELETE FROM schema_migrations WHERE version = 5;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    drop(legacy_db);
+
+    let reopened = SqliteStore::open(path).unwrap();
+    let migrated = reopened.container_launch(run_id()).unwrap().unwrap();
+    assert_eq!(migrated.run_id, launch.run_id);
+    assert_eq!(migrated.scenario, SyntheticScenario::Success);
+    assert_eq!(
+        migrated.workload_kind,
+        fossil_storage::WorkloadKind::Synthetic
+    );
+    assert_eq!(migrated.workload_version, 1);
+    assert_eq!(migrated.image_identity, None);
+    assert_eq!(migrated.profile_version, "synthetic-v1");
+    assert_eq!(migrated.effective_policy_json, "{}");
+    assert_eq!(migrated.runtime_limit_ms, None);
+    assert_eq!(migrated.effective_deadline_at_ms, None);
 }
 
 #[tokio::test]
@@ -334,7 +494,12 @@ async fn cancellation_before_container_creation_is_terminal_and_keeps_cleanup_fe
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
     store
-        .begin_container_launch(run_id(), SyntheticScenario::Success, gate)
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate,
+        )
         .unwrap();
 
     store
@@ -383,7 +548,12 @@ async fn restarted_supervisor_recovers_running_state_from_durable_start_proof() 
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
     store
-        .begin_container_launch(run_id(), SyntheticScenario::Success, gate)
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate,
+        )
         .unwrap();
     store.request_container_create(run_id()).unwrap();
     store
@@ -396,6 +566,7 @@ async fn restarted_supervisor_recovers_running_state_from_durable_start_proof() 
         .unwrap();
     assert_eq!(recovered.state, ContainerLaunchState::ContainerRunning);
     assert_eq!(recovered.started_at_ms, Some(1_798_000_000_000));
+    assert_eq!(recovered.effective_deadline_at_ms, Some(1_798_000_900_000));
     assert_eq!(
         store.get_run(run_id()).unwrap().lifecycle_state,
         LocalLifecycleState::ExecutionActive
@@ -411,7 +582,12 @@ async fn docker_lifecycle_persists_before_each_side_effect_and_terminal_callback
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
     store
-        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate.clone(),
+        )
         .unwrap();
 
     assert!(store.request_container_create(run_id()).unwrap());
@@ -848,7 +1024,12 @@ async fn optional_callbacks_stop_at_999_and_terminal_callback_uses_reserved_slot
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
     store
-        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate.clone(),
+        )
         .unwrap();
     store.request_container_create(run_id()).unwrap();
     store
@@ -991,7 +1172,12 @@ async fn concurrent_optional_and_terminal_insertions_preserve_terminal_callback(
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
     store
-        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            synthetic_launch_profile(900_000),
+            gate.clone(),
+        )
         .unwrap();
     store.request_container_create(run_id()).unwrap();
     store
@@ -1259,7 +1445,7 @@ fn schema_v2_callback_outbox_migrates_retry_state_without_losing_rows() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let columns: Vec<String> = connection
         .prepare("PRAGMA table_info(callback_outbox)")
         .unwrap()
@@ -1269,6 +1455,15 @@ fn schema_v2_callback_outbox_migrates_retry_state_without_losing_rows() {
         .unwrap();
     assert!(columns.contains(&"next_eligible_at_ms".to_owned()));
     assert!(columns.contains(&"failure_class".to_owned()));
+    let launch_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(container_launches)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(launch_columns.contains(&"image_identity".to_owned()));
+    assert!(launch_columns.contains(&"effective_deadline_at_ms".to_owned()));
     let (attempts, state): (u32, String) = connection
         .query_row(
             "SELECT attempts, delivery_state FROM callback_outbox WHERE event_id = ?1",

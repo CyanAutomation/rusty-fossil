@@ -1,6 +1,6 @@
 use fossil_core::execution::SyntheticScenario;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
-use fossil_storage::{ContainerLaunchRecord, ContainerLaunchState};
+use fossil_storage::{ContainerLaunchRecord, ContainerLaunchState, WorkloadKind};
 use fossil_supervisor::DockerRuntimeConfig;
 use std::collections::HashMap;
 
@@ -15,7 +15,14 @@ fn launch(scenario: SyntheticScenario) -> ContainerLaunchRecord {
         )
         .unwrap(),
         start_callback_id: EventId::parse("15870068-6723-4b70-9e9f-53b8271e032d").unwrap(),
+        workload_kind: WorkloadKind::Synthetic,
+        workload_version: 1,
         scenario,
+        image_identity: Some(IMAGE.to_owned()),
+        profile_version: "synthetic-v1".to_owned(),
+        effective_policy_json: "{}".to_owned(),
+        runtime_limit_ms: Some(900_000),
+        effective_deadline_at_ms: None,
         container_name: "rusty-fossil-synth-f8a0c4c5-d628-7b93-a7cf-4b4629a28853-15870068-6723-4b70-9e9f-53b8271e032d".to_owned(),
         container_id: None,
         state: ContainerLaunchState::LaunchIntentPersisted,
