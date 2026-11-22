@@ -523,8 +523,28 @@ impl AuthorizationCoordinator {
                     return self.require_manual_review(run_id, attempts);
                 }
                 if record.lifecycle_state == LocalLifecycleState::ExecutionActive {
-                    // A restart must not launch a replacement for work that may
-                    // already be running. The durable local state owns recovery.
+                    if let Some(supervisor) = &self.supervisor_client {
+                        match self.store.container_launch(run_id) {
+                            Ok(Some(launch))
+                                if launch.state
+                                    == fossil_storage::ContainerLaunchState::ManualReviewRequired =>
+                            {
+                                return self.require_manual_review(run_id, attempts);
+                            }
+                            Ok(_) => {}
+                            Err(_) => return retry_for(attempts),
+                        }
+                        // This is an idempotent resume request, not permission to
+                        // create a replacement. The supervisor reloads its durable
+                        // launch identity and fences any uncertain Docker side effect.
+                        if supervisor.launch(run_id).await.is_err() {
+                            return retry_for(attempts);
+                        }
+                        return QueueDisposition::Acknowledge;
+                    }
+                    // Without the explicitly configured supervisor client, the
+                    // active execution cannot be safely resumed from a Queue
+                    // duplicate. Keep the fail-closed behavior.
                     let _ = self
                         .store
                         .record_recovery_action(run_id, RecoveryAction::AmbiguousExecution);

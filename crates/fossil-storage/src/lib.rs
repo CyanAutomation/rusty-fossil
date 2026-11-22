@@ -297,6 +297,17 @@ impl CallbackPayload {
         }
     }
 
+    fn is_optional(&self) -> bool {
+        matches!(self, Self::Event { .. } | Self::Heartbeat { .. })
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled { .. }
+        )
+    }
+
     fn worker_id(&self) -> &WorkerId {
         match self {
             Self::Event { worker_id, .. }
@@ -472,6 +483,15 @@ pub struct CallbackOutboxRecord {
     pub attempts: u32,
     pub next_eligible_at_ms: i64,
     pub failure_class: Option<String>,
+}
+
+/// Result of an outbox enqueue. Optional operational events can be suppressed
+/// at the storage boundary while terminal outcomes retain the reserved slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackEnqueueResult {
+    Enqueued,
+    AlreadyPresent,
+    SuppressedCapacity,
 }
 
 impl CallbackOutboxRecord {
@@ -2133,13 +2153,16 @@ impl SqliteStore {
             .collect()
     }
 
-    pub fn enqueue_callback(&self, callback: CallbackOutboxRecord) -> Result<(), StoreError> {
+    pub fn enqueue_callback(
+        &self,
+        callback: CallbackOutboxRecord,
+    ) -> Result<CallbackEnqueueResult, StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
-        insert_callback(&transaction, &callback, now)?;
+        let result = insert_callback(&transaction, &callback, now)?;
         transaction.commit()?;
-        Ok(())
+        Ok(result)
     }
 
     /// Commits a terminal local transition and its Soyuz callback intent in
@@ -2736,7 +2759,7 @@ fn insert_callback(
     transaction: &rusqlite::Transaction<'_>,
     callback: &CallbackOutboxRecord,
     now: i64,
-) -> Result<(), StoreError> {
+) -> Result<CallbackEnqueueResult, StoreError> {
     callback.payload.validate()?;
     let payload_json = serde_json::to_string(&callback.payload)?;
     if payload_json.len() > MAX_CALLBACK_PAYLOAD_BYTES {
@@ -2773,7 +2796,7 @@ fn insert_callback(
         {
             return Err(StoreError::CallbackIdConflict);
         }
-        return Ok(());
+        return Ok(CallbackEnqueueResult::AlreadyPresent);
     }
 
     let pending_count: u32 = transaction.query_row(
@@ -2781,6 +2804,23 @@ fn insert_callback(
         [],
         |row| row.get(0),
     )?;
+    if callback.payload.is_optional() && pending_count >= MAX_PENDING_CALLBACKS.saturating_sub(1) {
+        return Ok(CallbackEnqueueResult::SuppressedCapacity);
+    }
+
+    if callback.payload.is_terminal() && pending_count >= MAX_PENDING_CALLBACKS.saturating_sub(1) {
+        let active_run: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM execution_slot WHERE slot_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if active_run.as_deref() != Some(callback.run_id.to_string().as_str()) {
+            return Err(StoreError::OutboxBackpressure);
+        }
+    }
+
     if pending_count >= MAX_PENDING_CALLBACKS {
         return Err(StoreError::CallbackOutboxCapacityExceeded);
     }
@@ -2802,7 +2842,7 @@ fn insert_callback(
         "UPDATE run_records SET callback_delivery = 'pending', updated_at_ms = ?2 WHERE run_id = ?1",
         params![callback.run_id.to_string(), now],
     )?;
-    Ok(())
+    Ok(CallbackEnqueueResult::Enqueued)
 }
 
 /// Capped exponential retry with stable per-event jitter so hosts do not

@@ -22,6 +22,7 @@ use fossil_storage::{
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -42,6 +43,37 @@ pub struct DockerSupervisor {
     store: SqliteStore,
     soyuz: Arc<dyn SoyuzApi>,
     worker_id: WorkerId,
+    metrics: Arc<SupervisorMetrics>,
+}
+
+#[derive(Default)]
+struct SupervisorMetrics {
+    optional_callbacks_enqueued: AtomicU64,
+    heartbeats_suppressed_capacity: AtomicU64,
+    heartbeat_insertion_errors: AtomicU64,
+    terminal_callback_insertion_failures: AtomicU64,
+    terminal_callback_persistence_retries: AtomicU64,
+    restart_reconciliation_attempts: AtomicU64,
+    existing_containers_reattached: AtomicU64,
+    ambiguous_container_states: AtomicU64,
+    duplicate_launch_preventions: AtomicU64,
+    cleanup_retries: AtomicU64,
+    recovery_backlog: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DockerSupervisorMetricsSnapshot {
+    pub optional_callbacks_enqueued: u64,
+    pub heartbeats_suppressed_capacity: u64,
+    pub heartbeat_insertion_errors: u64,
+    pub terminal_callback_insertion_failures: u64,
+    pub terminal_callback_persistence_retries: u64,
+    pub restart_reconciliation_attempts: u64,
+    pub existing_containers_reattached: u64,
+    pub ambiguous_container_states: u64,
+    pub duplicate_launch_preventions: u64,
+    pub cleanup_retries: u64,
+    pub recovery_backlog: u64,
 }
 
 impl DockerSupervisor {
@@ -81,7 +113,65 @@ impl DockerSupervisor {
             store,
             soyuz,
             worker_id,
+            metrics: Arc::default(),
         })
+    }
+
+    /// Returns fixed-cardinality counters. No run IDs or task content are
+    /// included; callers decide how to export this snapshot.
+    pub fn metrics(&self) -> DockerSupervisorMetricsSnapshot {
+        DockerSupervisorMetricsSnapshot {
+            optional_callbacks_enqueued: self
+                .metrics
+                .optional_callbacks_enqueued
+                .load(Ordering::Relaxed),
+            heartbeats_suppressed_capacity: self
+                .metrics
+                .heartbeats_suppressed_capacity
+                .load(Ordering::Relaxed),
+            heartbeat_insertion_errors: self
+                .metrics
+                .heartbeat_insertion_errors
+                .load(Ordering::Relaxed),
+            terminal_callback_insertion_failures: self
+                .metrics
+                .terminal_callback_insertion_failures
+                .load(Ordering::Relaxed),
+            terminal_callback_persistence_retries: self
+                .metrics
+                .terminal_callback_persistence_retries
+                .load(Ordering::Relaxed),
+            restart_reconciliation_attempts: self
+                .metrics
+                .restart_reconciliation_attempts
+                .load(Ordering::Relaxed),
+            existing_containers_reattached: self
+                .metrics
+                .existing_containers_reattached
+                .load(Ordering::Relaxed),
+            ambiguous_container_states: self
+                .metrics
+                .ambiguous_container_states
+                .load(Ordering::Relaxed),
+            duplicate_launch_preventions: self
+                .metrics
+                .duplicate_launch_preventions
+                .load(Ordering::Relaxed),
+            cleanup_retries: self.metrics.cleanup_retries.load(Ordering::Relaxed),
+            recovery_backlog: self.metrics.recovery_backlog.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_duplicate_launch_prevented(&self) {
+        self.metrics
+            .duplicate_launch_preventions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_recovery_backlog(&self, count: usize) {
+        self.metrics
+            .recovery_backlog
+            .store(count as u64, Ordering::Relaxed);
     }
 
     /// The IPC boundary accepts only a canonical run ID. All descriptor,
@@ -113,11 +203,26 @@ impl DockerSupervisor {
         &self,
         run_id: RunId,
     ) -> Result<ExecutionOutcome, SupervisorError> {
+        self.metrics
+            .restart_reconciliation_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let launch = self
             .store
             .container_launch(run_id)
             .map_err(|_| SupervisorError::StateUnavailable)?
             .ok_or(SupervisorError::AuthorizationRejected)?;
+        if launch.container_id.is_some()
+            && !matches!(
+                launch.state,
+                ContainerLaunchState::CleanupPending
+                    | ContainerLaunchState::CleanupCompleted
+                    | ContainerLaunchState::ManualReviewRequired
+            )
+        {
+            self.metrics
+                .existing_containers_reattached
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.execute(prepared_from_launch(&launch)).await
     }
 
@@ -340,6 +445,8 @@ impl DockerSupervisor {
                 .map_err(|_| SupervisorError::StateUnavailable)?
                 .ok_or(SupervisorError::StateUnavailable)?;
             if owns_create {
+                #[cfg(feature = "test-support")]
+                process_test_barrier("after_create_requested_commit").await;
                 let options = CreateContainerOptionsBuilder::default()
                     .name(&launch.container_name)
                     .build();
@@ -349,10 +456,14 @@ impl DockerSupervisor {
                     .await
                 {
                     Ok(response) => {
+                        #[cfg(feature = "test-support")]
+                        process_test_barrier("after_docker_create_before_identity_commit").await;
                         launch = self
                             .store
                             .record_container_created(launch.run_id, &response.id)
                             .map_err(|_| SupervisorError::StateUnavailable)?;
+                        #[cfg(feature = "test-support")]
+                        process_test_barrier("after_container_identity_commit").await;
                     }
                     Err(_) => {
                         // An errored response can mean Docker created the
@@ -369,7 +480,7 @@ impl DockerSupervisor {
                         {
                             return Err(SupervisorError::AmbiguousContainerState);
                         } else {
-                            let _ = self.store.mark_container_manual_review(launch.run_id);
+                            self.mark_manual_review(launch.run_id);
                             return Err(SupervisorError::AmbiguousContainerState);
                         }
                     }
@@ -385,7 +496,7 @@ impl DockerSupervisor {
             let id = match self.validate_container_identity(&launch, &inspect) {
                 Ok(id) => id,
                 Err(error) => {
-                    let _ = self.store.mark_container_manual_review(launch.run_id);
+                    self.mark_manual_review(launch.run_id);
                     return Err(error);
                 }
             };
@@ -398,7 +509,7 @@ impl DockerSupervisor {
             self.verify_effective_profile(&launch, &inspect)?;
             Ok(launch)
         } else {
-            let _ = self.store.mark_container_manual_review(launch.run_id);
+            self.mark_manual_review(launch.run_id);
             Err(SupervisorError::AmbiguousContainerState)
         }
     }
@@ -408,17 +519,19 @@ impl DockerSupervisor {
         launch: ContainerLaunchRecord,
     ) -> Result<ContainerLaunchRecord, SupervisorError> {
         let Some(inspect) = self.inspect_named(&launch).await? else {
+            #[cfg(feature = "test-support")]
+            process_test_barrier("after_create_requested_missing_container").await;
             if launch.updated_at_ms
                 <= now_ms().saturating_sub(CREATE_RESPONSE_GRACE.as_millis() as i64)
             {
-                let _ = self.store.mark_container_manual_review(launch.run_id);
+                self.mark_manual_review(launch.run_id);
             }
             return Err(SupervisorError::AmbiguousContainerState);
         };
         let id = match self.validate_container_identity(&launch, &inspect) {
             Ok(id) => id,
             Err(error) => {
-                let _ = self.store.mark_container_manual_review(launch.run_id);
+                self.mark_manual_review(launch.run_id);
                 return Err(error);
             }
         };
@@ -438,7 +551,7 @@ impl DockerSupervisor {
         self.validate_container_identity(launch, inspect)
             .map(|_| ())
             .inspect_err(|_error| {
-                let _ = self.store.mark_container_manual_review(launch.run_id);
+                self.mark_manual_review(launch.run_id);
             })
     }
 
@@ -451,6 +564,8 @@ impl DockerSupervisor {
                 .store
                 .mark_container_start_requested(launch.run_id)
                 .map_err(|_| SupervisorError::StateUnavailable)?;
+            #[cfg(feature = "test-support")]
+            process_test_barrier("after_start_requested_commit").await;
         }
         if !matches!(
             launch.state,
@@ -495,12 +610,15 @@ impl DockerSupervisor {
                 if launch.state != ContainerLaunchState::StartRequested {
                     return Err(SupervisorError::AmbiguousContainerState);
                 }
-                if self
+                let start_result = self
                     .docker
                     .start_container(&launch.container_name, None::<StartContainerOptions>)
-                    .await
-                    .is_err()
-                {
+                    .await;
+                #[cfg(feature = "test-support")]
+                if start_result.is_ok() {
+                    process_test_barrier("after_docker_start_before_running_commit").await;
+                }
+                if start_result.is_err() {
                     let inspect = self
                         .inspect_named(&launch)
                         .await?
@@ -566,7 +684,7 @@ impl DockerSupervisor {
                 return self.stop_and_finalize(launch, &reason).await;
             }
             let inspect = self.inspect_named(&launch).await?.ok_or_else(|| {
-                let _ = self.store.mark_container_manual_review(launch.run_id);
+                self.mark_manual_review(launch.run_id);
                 SupervisorError::AmbiguousContainerState
             })?;
             self.verify_effective_profile(&launch, &inspect)?;
@@ -580,9 +698,11 @@ impl DockerSupervisor {
                 return self.load_outcome(launch.run_id);
             }
             if status != Some(ContainerStateStatusEnum::RUNNING) {
-                let _ = self.store.mark_container_manual_review(launch.run_id);
+                self.mark_manual_review(launch.run_id);
                 return Err(SupervisorError::AmbiguousContainerState);
             }
+            #[cfg(feature = "test-support")]
+            process_test_barrier("while_container_running").await;
             let started_at_ms = launch
                 .started_at_ms
                 .or_else(|| {
@@ -618,7 +738,7 @@ impl DockerSupervisor {
                 Ok(_) => {
                     self.stop_and_finalize(launch.clone(), "execution_uncertain")
                         .await?;
-                    let _ = self.store.mark_container_manual_review(launch.run_id);
+                    self.mark_manual_review(launch.run_id);
                     return Err(SupervisorError::AuthorizationRejected);
                 }
                 Err(_) => {
@@ -682,7 +802,7 @@ impl DockerSupervisor {
                 }
                 return self.finalize_unstarted(launch, &reason).await;
             }
-            let _ = self.store.mark_container_manual_review(launch.run_id);
+            self.mark_manual_review(launch.run_id);
             return Err(SupervisorError::AmbiguousContainerState);
         };
         self.verify_effective_profile(&launch, &inspect)?;
@@ -708,7 +828,7 @@ impl DockerSupervisor {
                     | ContainerLaunchState::StartRequested
                     | ContainerLaunchState::StopRequested
             ) {
-                let _ = self.store.mark_container_manual_review(launch.run_id);
+                self.mark_manual_review(launch.run_id);
                 return Err(SupervisorError::AmbiguousContainerState);
             }
             if launch.state != ContainerLaunchState::StopRequested {
@@ -761,7 +881,7 @@ impl DockerSupervisor {
                 )
             })
         {
-            let _ = self.store.mark_container_manual_review(launch.run_id);
+            self.mark_manual_review(launch.run_id);
             return Err(SupervisorError::AmbiguousContainerState);
         }
         self.finalize_exited_container(launch, &inspect, Some(&reason))
@@ -830,6 +950,8 @@ impl DockerSupervisor {
             (code, class, summary)
         };
         if launch.state != ContainerLaunchState::ContainerExited {
+            #[cfg(feature = "test-support")]
+            process_test_barrier("after_docker_exit_before_terminal_persist").await;
             launch = self
                 .store
                 .record_container_exit_with_times(
@@ -855,31 +977,57 @@ impl DockerSupervisor {
         let mut persisted = launch;
         if persisted.state == ContainerLaunchState::ContainerExited {
             let callback = terminal_callback(&persisted)?;
-            self.store
-                .transition_terminal_with_callback(persisted.run_id, callback)
-                .or_else(|error| {
-                    // A committed callback and cleanup state survive a lost
-                    // IPC response. Repeated finalization observes them here.
-                    self.store
-                        .container_launch(persisted.run_id)
-                        .ok()
-                        .flatten()
-                        .filter(|record| {
-                            matches!(
-                                record.state,
-                                ContainerLaunchState::CleanupPending
-                                    | ContainerLaunchState::CleanupCompleted
-                            )
-                        })
-                        .map(|_| ())
-                        .ok_or(error)
-                })
-                .map_err(|_| SupervisorError::StateUnavailable)?;
+            let mut terminal_persisted = false;
+            for attempt in 0..3 {
+                match self
+                    .store
+                    .transition_terminal_with_callback(persisted.run_id, callback.clone())
+                {
+                    Ok(()) => {
+                        terminal_persisted = true;
+                        break;
+                    }
+                    Err(_) => {
+                        // A committed callback and cleanup state survive a lost
+                        // IPC response. Repeated finalization observes them here.
+                        if self
+                            .store
+                            .container_launch(persisted.run_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|record| {
+                                matches!(
+                                    record.state,
+                                    ContainerLaunchState::CleanupPending
+                                        | ContainerLaunchState::CleanupCompleted
+                                )
+                            })
+                        {
+                            terminal_persisted = true;
+                            break;
+                        }
+                        if attempt < 2 {
+                            self.metrics
+                                .terminal_callback_persistence_retries
+                                .fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(10 << attempt)).await;
+                        }
+                    }
+                }
+            }
+            if !terminal_persisted {
+                self.metrics
+                    .terminal_callback_insertion_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(SupervisorError::StateUnavailable);
+            }
             persisted = self
                 .store
                 .container_launch(persisted.run_id)
                 .map_err(|_| SupervisorError::StateUnavailable)?
                 .ok_or(SupervisorError::StateUnavailable)?;
+            #[cfg(feature = "test-support")]
+            process_test_barrier("after_terminal_persist_before_cleanup").await;
         }
         let outcome = outcome_from_launch(&persisted)?;
         self.cleanup(&persisted).await?;
@@ -887,6 +1035,14 @@ impl DockerSupervisor {
     }
 
     async fn cleanup(&self, launch: &ContainerLaunchRecord) -> Result<(), SupervisorError> {
+        let result = self.cleanup_inner(launch).await;
+        if result.is_err() {
+            self.metrics.cleanup_retries.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn cleanup_inner(&self, launch: &ContainerLaunchRecord) -> Result<(), SupervisorError> {
         if launch.state == ContainerLaunchState::CleanupCompleted {
             return Ok(());
         }
@@ -921,6 +1077,8 @@ impl DockerSupervisor {
                 }) => {}
                 Err(_) => return Err(SupervisorError::CleanupPending),
             }
+            #[cfg(feature = "test-support")]
+            process_test_barrier("after_docker_remove_before_cleanup_commit").await;
         }
         self.store
             .complete_container_cleanup(launch.run_id)
@@ -967,7 +1125,59 @@ impl DockerSupervisor {
                 timestamp_ms,
             },
         );
-        let _ = self.store.enqueue_callback(callback);
+        match self.store.enqueue_callback(callback) {
+            Ok(fossil_storage::CallbackEnqueueResult::Enqueued)
+            | Ok(fossil_storage::CallbackEnqueueResult::AlreadyPresent) => {
+                self.metrics
+                    .optional_callbacks_enqueued
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(fossil_storage::CallbackEnqueueResult::SuppressedCapacity) => {
+                self.metrics
+                    .heartbeats_suppressed_capacity
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    outcome = "suppressed_capacity",
+                    "optional supervisor heartbeat was not persisted"
+                );
+            }
+            Err(_) => {
+                self.metrics
+                    .heartbeat_insertion_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    outcome = "storage_error",
+                    "optional supervisor heartbeat could not be persisted"
+                );
+            }
+        }
+    }
+
+    fn mark_manual_review(&self, run_id: RunId) {
+        self.record_ambiguous_state(run_id);
+        let _ = self.store.mark_container_manual_review(run_id);
+    }
+
+    fn mark_manual_review_checked(&self, run_id: RunId) -> Result<(), SupervisorError> {
+        self.record_ambiguous_state(run_id);
+        self.store
+            .mark_container_manual_review(run_id)
+            .map(|_| ())
+            .map_err(|_| SupervisorError::StateUnavailable)
+    }
+
+    fn record_ambiguous_state(&self, run_id: RunId) {
+        if self
+            .store
+            .container_launch(run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|launch| launch.state != ContainerLaunchState::ManualReviewRequired)
+        {
+            self.metrics
+                .ambiguous_container_states
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn load_outcome(&self, run_id: RunId) -> Result<ExecutionOutcome, SupervisorError> {
@@ -994,10 +1204,14 @@ impl ExecutionSupervisor for DockerSupervisor {
         if !same_gate(&authorization, &fresh) {
             return Err(SupervisorError::AuthorizationRejected);
         }
+        #[cfg(feature = "test-support")]
+        process_test_barrier("before_launch_intent_commit").await;
         let launch = self
             .store
             .begin_container_launch(authorization.run_id(), scenario, fresh)
             .map_err(|_| SupervisorError::AuthorizationRejected)?;
+        #[cfg(feature = "test-support")]
+        process_test_barrier("after_launch_intent_commit").await;
         Ok(prepared_from_launch(&launch))
     }
 
@@ -1131,9 +1345,7 @@ impl ExecutionSupervisor for DockerSupervisor {
                 if launch.updated_at_ms
                     <= now_ms().saturating_sub(CREATE_RESPONSE_GRACE.as_millis() as i64)
                 {
-                    self.store
-                        .mark_container_manual_review(run_id)
-                        .map_err(|_| SupervisorError::StateUnavailable)?;
+                    self.mark_manual_review_checked(run_id)?;
                     return Ok(ReconciliationOutcome::Ambiguous);
                 }
                 return Ok(ReconciliationOutcome::Prepared);
@@ -1143,9 +1355,7 @@ impl ExecutionSupervisor for DockerSupervisor {
         let id = match self.validate_container_identity(&launch, &inspect) {
             Ok(id) => id,
             Err(_) => {
-                self.store
-                    .mark_container_manual_review(run_id)
-                    .map_err(|_| SupervisorError::StateUnavailable)?;
+                self.mark_manual_review_checked(run_id)?;
                 return Ok(ReconciliationOutcome::Ambiguous);
             }
         };
@@ -1310,6 +1520,21 @@ fn format_timestamp_ms(value: i64) -> Option<String> {
 fn now_ms() -> i64 {
     unix_nanos_to_millis(OffsetDateTime::now_utc().unix_timestamp_nanos())
         .expect("current Unix millisecond timestamp fits in i64")
+}
+
+/// Test-only deterministic process barrier for crash-boundary integration
+/// tests. Production builds contain no environment-controlled pause points.
+#[cfg(feature = "test-support")]
+async fn process_test_barrier(checkpoint: &str) {
+    if std::env::var("FOSSIL_SUPERVISOR_TEST_BARRIER").as_deref() != Ok(checkpoint) {
+        return;
+    }
+    let Some(marker) = std::env::var_os("FOSSIL_SUPERVISOR_TEST_BARRIER_MARKER") else {
+        return;
+    };
+    if std::fs::write(marker, checkpoint).is_ok() {
+        std::future::pending::<()>().await;
+    }
 }
 
 fn supports_required_resource_controls(info: &SystemInfo) -> bool {

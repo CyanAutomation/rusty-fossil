@@ -12,6 +12,8 @@ Phase 2B is a synthetic-only execution capability. It does not consume Queue mes
 
 The Docker Engine socket grants substantial host authority. Give access only to the dedicated supervisor account. Membership in the rootful `docker` group is effectively root-equivalent; protect the host and that account accordingly. A rootless Docker socket reduces daemon privilege but still grants the supervisor control of that user's containers and files; use a dedicated account and verify its cgroup limits. Do not mount the Docker socket into the controller container.
 
+The callback outbox is capped at 1,000 pending or blocked rows. Intake already stops at 999. SQLite also enforces the reserved slot during callback insertion: heartbeat and other optional event callbacks at 999 return a capacity-suppressed result, which increments a supervisor counter and does not stop the workload. An admitted active run can persist its mandatory terminal callback as row 1,000. Callback rows are never deleted to recover capacity. Restore callback delivery or resolve blocked entries through the approved operator process.
+
 The image runs as UID/GID 65532 with a read-only root filesystem, no network, no capabilities, no-new-privileges, default seccomp, no host namespaces, ports, devices, bind mounts or volumes, one bounded `/tmp` tmpfs, capped JSON logs, and no automatic restart. Default limits are 500 millicores, 256 MiB memory with no swap, 32 PIDs, 16 MiB tmpfs, 15 minutes, 5 seconds graceful stop, 30 seconds Soyuz-outage grace and 64 KiB captured output. `SupervisorLimits` validates any overrides within the supported hard bounds; a Docker host without required cgroup controls is rejected before the socket is served.
 
 Docker references: [Engine API](https://docs.docker.com/reference/api/engine/), [SDK guidance](https://docs.docker.com/reference/api/engine/sdk/), [Engine security](https://docs.docker.com/engine/security/), [container run controls](https://docs.docker.com/engine/containers/run/) and [rootless mode](https://docs.docker.com/engine/security/rootless/).
@@ -28,18 +30,24 @@ The included env file is a configuration example, not a complete service-manager
 
 ## Run the Docker integration suite
 
-The ordinary workspace tests use mocks and do not need Docker. To run the real Engine test on a trusted Linux host with Docker access:
+The ordinary workspace tests use mocks and do not need Docker. To run the real Engine suite on a trusted Linux host with Docker access, build an image for the host architecture and build the test-support supervisor executable:
 
 ```sh
-docker build --platform linux/amd64 -f Dockerfile.synthetic-worker \
+docker build --platform linux/arm64 -f Dockerfile.synthetic-worker \
   -t rusty-fossil-synthetic-worker:test .
+cargo build -p fossil-supervisor --features test-support --bin fossil-supervisord --locked
 FOSSIL_SUPERVISOR_TEST_IMAGE="$(docker image inspect --format '{{.Id}}' rusty-fossil-synthetic-worker:test)" \
-  cargo test -p fossil-supervisor --test docker_engine --locked -- --ignored
+  cargo test -p fossil-supervisor --features test-support --test docker_engine --locked -- --ignored
+FOSSIL_SUPERVISOR_TEST_IMAGE="$(docker image inspect --format '{{.Id}}' rusty-fossil-synthetic-worker:test)" \
+FOSSIL_SUPERVISORD_BIN="$PWD/target/debug/fossil-supervisord" \
+  cargo test -p rusty-fossil --test synthetic_execution_engine --locked -- --ignored
 ```
 
-For ARM64, build the synthetic image for `linux/arm64` on native hardware or with a configured Buildx/QEMU builder, then run the same test against a native ARM64 Engine. The CI workflow builds an OCI image for both architectures and runs the Engine lifecycle test on its Linux Docker runner. CI status is pending until this branch's workflow has run.
+For AMD64, use `--platform linux/amd64`; for ARM64, use `--platform linux/arm64`. Prefer a native matching Engine for lifecycle execution. The CI workflow builds an OCI image for both architectures and runs integration tests on its Linux Docker runner. The Linux target matrix cross-builds both `rusty-fossil` and `fossil-supervisord` for AMD64 and ARM64. Those checks are not a substitute for Raspberry Pi hardware validation.
 
-The ignored real-Engine suite uses ephemeral SQLite databases, a mock Soyuz server, an immutable local Docker image ID, fresh UUIDv7 run IDs and labels scoped to each run. It covers success, nonzero exit, timeout, cancellation while running, bounded output truncation and abrupt termination. Cleanup inspects and removes only the exact deterministic container name after verifying Rusty-Fossil's managed and run-ID labels; it never prunes containers or touches unrelated workloads. These tests are wired to CI, but they have not been run on this development host because its Docker socket is inaccessible.
+The ignored real-Engine suite uses ephemeral SQLite databases, mock Soyuz, an immutable local Docker image ID, fresh UUIDv7 run IDs and labels scoped to each run. It covers success, nonzero exit, timeout, cancellation while running, bounded output truncation and abrupt worker termination. The actual coordinator/`fossil-supervisord` process tests exercise the Queue fixture, claim/start gate, durable handoff, duplicate delivery, crash before launch intent, create/start boundaries, running-container restart, post-exit terminal persistence, post-removal cleanup, stable callback replay, cancellation and slot release. A separate case verifies SIGTERM persists `execution_uncertain` and cleans up. All five process tests and six Docker lifecycle tests have passed locally against a native ARM64 Docker Engine. Tests use isolated SQLite and mock Soyuz only. Cleanup checks the exact run, managed, worker, claim, start and workload labels and full container ID before removing that exact ID; it never prunes or touches unrelated workloads.
+
+The `test-support` supervisor build has marker barriers for deterministic process termination before/after launch intent, create request, Docker create, identity persistence, start request, Docker start, running monitor, Docker exit, terminal persistence and Docker removal. The actual-process suite verifies fail-closed handling when `create_requested` is durable but Docker has no matching container, and reattachment/finalization at later boundaries. It does not simulate every lost API response while the process remains alive or all malformed Docker identity/error responses; do not interpret it as a complete Docker daemon fault matrix.
 
 ## Recovery and operator response
 
@@ -61,10 +69,10 @@ docker ps -a --filter label=io.rusty-fossil.managed=true \
 
 Before manual cleanup, match the run ID, full stored container ID, all launch labels and a terminal or manually resolved SQLite state. Prefer the supervisor's idempotent cleanup path. Do not run `docker system prune`, remove by broad name prefix, or force-remove a running container to clear a blocked slot.
 
-Docker retains capped logs only while the disposable container exists; the supervisor reads at most the configured output bound and sends no raw stdout/stderr to Soyuz. SQLite retains the immutable request descriptor and callback metadata under the existing store retention policy. Restrict and encrypt the state volume when task prompts require confidentiality. No artifacts or repository contents are produced in this phase.
+Docker retains capped logs only while the disposable container exists; the supervisor reads at most the configured output bound and sends no raw stdout/stderr to Soyuz. SQLite retains the immutable request descriptor and callback metadata under the existing store retention policy. Restrict and encrypt the state volume when task prompts require confidentiality. No artifacts or repository contents are produced in this phase. Supervisor metrics are emitted as a fixed-cardinality structured log snapshot every 60 seconds; they are not exposed by controller `/metrics` while production execution wiring remains disabled. No run IDs or task data are metric labels.
 
 ## Limitations before Phase 2C
 
 The synthetic scenarios prove lifecycle plumbing only. Production Queue polling, callback replay, and supervisor-client construction remain disabled in `main`; the readiness endpoint does not claim production coding readiness. There is no Pi CLI, repository checkout, Git operation, live Senku call, GitHub publication, multi-host SQLite coordination, automatic cross-host takeover, or arbitrary Docker API.
 
-AMD64/ARM64 image builds are not Raspberry Pi hardware validation. Before any Pi rollout, verify the exact Pi model and OS, Docker Engine and cgroup configuration, seccomp, memory headroom under controller load, storage wear/capacity, image architecture and shutdown recovery on that hardware. Phase 2C should add the Pi coding-agent runtime only behind this same proof-gated supervisor, first using a disposable repository and non-production credentials.
+AMD64/ARM64 image builds are not Raspberry Pi hardware validation. Before any Pi rollout, verify the exact Pi model and OS, Docker Engine and cgroup configuration, seccomp, memory headroom under controller load, storage wear/capacity, image architecture and shutdown recovery on that hardware. Phase 2C-A should add the Pi coding-agent runtime only behind this same proof-gated supervisor, first using a disposable repository and non-production credentials. Keep the synthetic runtime at 15 minutes (current maximum 30 minutes); give coding jobs a separately bounded timeout, with separate cancellation grace, Soyuz outage grace, supervisor shutdown grace and container recovery deadline. Do not change Phase 2B shutdown semantics implicitly. Before enabling multi-hour jobs, decide whether maintenance uses drain mode, refuses new launches, allows controlled worker continuation, or invokes operator cancellation/hard stop. See [ADR 0012](DECISIONS/0012-phase-2c-long-running-execution-policy.md).

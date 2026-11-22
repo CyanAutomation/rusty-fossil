@@ -74,8 +74,12 @@ jobs:
         run: docker build --platform linux/amd64 -f Dockerfile.synthetic-worker -t rusty-fossil-synthetic-worker:test .
       - name: Capture the immutable local image ID
         run: echo "FOSSIL_SUPERVISOR_TEST_IMAGE=$(docker image inspect --format '{{.Id}}' rusty-fossil-synthetic-worker:test)" >> "$GITHUB_ENV"
+      - name: Build the test-support supervisor executable
+        run: cargo build -p fossil-supervisor --features test-support --bin fossil-supervisord --locked
       - name: Run the authorized Docker lifecycle integration
         run: cargo test -p fossil-supervisor --features test-support --test docker_engine --locked -- --ignored
+      - name: Run coordinator-to-supervisor process integration
+        run: FOSSIL_SUPERVISORD_BIN="$GITHUB_WORKSPACE/target/debug/fossil-supervisord" cargo test -p rusty-fossil --test synthetic_execution_engine --locked -- --ignored
 
   linux-targets:
     name: Cross build (${{ matrix.target }})
@@ -93,4 +97,6 @@ jobs:
       - name: Install cross
         run: cargo install cross --locked
       - name: Build controller target
-        run: cross build --target ${{ matrix.target }} --release --locked -p rusty-fossil
+        run: cross build --target ${{ matrix.target }} --release --locked -p rusty-fossil --bin rusty-fossil
+      - name: Build Docker supervisor target
+        run: cross build --target ${{ matrix.target }} --release --locked -p fossil-supervisor --bin fossil-supervisord
