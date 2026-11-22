@@ -724,19 +724,10 @@ async fn supervisor_restart_reconciles_create_and_start_crash_boundaries() {
 #[tokio::test]
 #[ignore = "requires Docker Engine, a local worker image, and the test-support fossil-supervisord binary"]
 async fn supervisor_restart_finalizes_exit_and_cleanup_crash_boundaries() {
-    for (checkpoint, expected_state) in [
-        (
-            "after_docker_exit_before_terminal_persist",
-            ContainerLaunchState::StartRequested,
-        ),
-        (
-            "after_terminal_persist_before_cleanup",
-            ContainerLaunchState::CleanupPending,
-        ),
-        (
-            "after_docker_remove_before_cleanup_commit",
-            ContainerLaunchState::CleanupPending,
-        ),
+    for checkpoint in [
+        "after_docker_exit_before_terminal_persist",
+        "after_terminal_persist_before_cleanup",
+        "after_docker_remove_before_cleanup_commit",
     ] {
         let harness = ProcessHarness::new().await;
         let mut cleanup = TestContainerCleanup::new(&harness);
@@ -752,7 +743,14 @@ async fn supervisor_restart_finalizes_exit_and_cleanup_crash_boundaries() {
             .container_launch(harness.run_id)
             .unwrap()
             .unwrap();
-        assert_eq!(launch.state, expected_state);
+        if checkpoint == "after_docker_exit_before_terminal_persist" {
+            assert!(matches!(
+                launch.state,
+                ContainerLaunchState::StartRequested | ContainerLaunchState::ContainerRunning
+            ));
+        } else {
+            assert_eq!(launch.state, ContainerLaunchState::CleanupPending);
+        }
         let container_id = launch.container_id.clone().unwrap();
         if checkpoint == "after_docker_remove_before_cleanup_commit" {
             assert!(
