@@ -2197,10 +2197,7 @@ impl SqliteStore {
             return Err(StoreError::ContainerLaunchResultMismatch);
         }
         let now = now_ms();
-        let enqueue_result = insert_callback(&transaction, &callback, now)?;
-        if enqueue_result == CallbackEnqueueResult::SuppressedCapacity {
-            return Err(StoreError::OutboxBackpressure);
-        }
+        insert_callback(&transaction, &callback, now)?;
         transaction.execute(
             "UPDATE run_records SET lifecycle_state = 'execution_terminal', updated_at_ms = ?2 WHERE run_id = ?1",
             params![run_id.to_string(), now],
