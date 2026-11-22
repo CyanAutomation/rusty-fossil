@@ -13,8 +13,8 @@ Use `RecoveryManager` to enumerate durable unresolved runs and reconcile them th
 
 Never infer that a process stopped from a restart or expired claim. If work may be active, preserve local ownership records and require review; never launch a replacement automatically. When Soyuz confirms another worker owns a run and local execution is not active, terminalize only the local intake record, release its slot, emit no false terminal callback, and acknowledge the duplicate.
 
-Keep the callback outbox at 1,000 entries and stop new intake at 999 pending/blocked entries. Existing run reservations remain idempotently recoverable. Callback delivery continues independently of slot availability; blocked callbacks are retained for review.
+Keep the callback outbox at 1,000 entries and stop new intake at 999 pending/blocked entries. SQLite also enforces a transaction-level reservation for mandatory terminal callbacks because optional heartbeats/events may continue after intake. Existing run reservations remain idempotently recoverable. Callback delivery continues independently of slot availability; blocked callbacks are retained for review. See [ADR 0011](0011-terminal-callback-capacity-reservation.md) for the storage invariant and optional-event suppression behavior.
 
 ## Consequences
 
-Recovery decisions and attempts are durable and observable. The operational supervisor remains opt-in; the service binary does not start it or Queue polling in this phase. The 999-entry intake watermark protects one terminal callback but does not clear blocked records or change Soyuz ownership.
+Recovery decisions and attempts are durable and observable. The operational supervisor remains opt-in; the service binary does not start it or Queue polling in this phase. The 999-entry intake watermark is an early backpressure signal; the SQLite reservation is the final capacity guarantee. Neither mechanism clears blocked records or changes Soyuz ownership.

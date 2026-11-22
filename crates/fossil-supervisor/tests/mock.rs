@@ -1,11 +1,13 @@
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_soyuz::{SoyuzClient, SoyuzClientConfig};
 use fossil_supervisor::{
-    CancellationOutcome, ExecutionSupervisor, MockSupervisor, SyntheticScenario, TerminalReason,
+    CancellationOutcome, ExecutionSupervisor, MockSupervisor, SupervisorIpcClient,
+    SyntheticScenario, TerminalReason,
 };
 use secrecy::SecretString;
 use serde_json::json;
 use std::time::Duration;
+use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -131,4 +133,17 @@ async fn supervisor_rejects_a_valid_gate_for_another_worker() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn supervisor_ipc_client_reports_bounded_failure_counters() {
+    let directory = tempdir().unwrap();
+    let client =
+        SupervisorIpcClient::new(directory.path().join("supervisor.sock"), "i".repeat(32)).unwrap();
+    let run_id = RunId::parse(RUN_ID).unwrap();
+
+    assert!(client.reconcile(run_id).await.is_err());
+    assert!(client.reconcile(run_id).await.is_err());
+    assert_eq!(client.metrics().requests, 2);
+    assert_eq!(client.metrics().failures, 2);
 }

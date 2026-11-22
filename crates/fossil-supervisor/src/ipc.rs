@@ -12,19 +12,32 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const MAX_REQUEST_BYTES: usize = 4 * 1024;
 const MAX_TOKEN_BYTES: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 16;
 const RECOVERY_CADENCE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ClientMetrics {
+    requests: AtomicU64,
+    failures: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SupervisorIpcMetricsSnapshot {
+    pub requests: u64,
+    pub failures: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum SupervisorIpcError {
@@ -74,6 +87,7 @@ struct Response {
 pub struct SupervisorIpcClient {
     socket_path: PathBuf,
     token: Arc<str>,
+    metrics: Arc<ClientMetrics>,
 }
 
 impl SupervisorIpcClient {
@@ -89,6 +103,7 @@ impl SupervisorIpcClient {
         Ok(Self {
             socket_path,
             token: Arc::from(token),
+            metrics: Arc::default(),
         })
     }
 
@@ -111,7 +126,23 @@ impl SupervisorIpcClient {
         self.request(Command::Reconcile { run_id }).await
     }
 
+    pub fn metrics(&self) -> SupervisorIpcMetricsSnapshot {
+        SupervisorIpcMetricsSnapshot {
+            requests: self.metrics.requests.load(Ordering::Relaxed),
+            failures: self.metrics.failures.load(Ordering::Relaxed),
+        }
+    }
+
     async fn request(&self, command: Command) -> Result<String, SupervisorIpcError> {
+        self.metrics.requests.fetch_add(1, Ordering::Relaxed);
+        let result = self.request_inner(command).await;
+        if result.is_err() {
+            self.metrics.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn request_inner(&self, command: Command) -> Result<String, SupervisorIpcError> {
         timeout(REQUEST_TIMEOUT, async {
             let mut stream = UnixStream::connect(&self.socket_path)
                 .await
@@ -243,6 +274,28 @@ impl SupervisorIpcServer {
                 tokio::time::sleep(RECOVERY_CADENCE).await;
             }
         });
+        let metrics_supervisor = self.supervisor.clone();
+        let metrics = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let snapshot = metrics_supervisor.metrics();
+                info!(
+                    target: "fossil_supervisor_metrics",
+                    optional_callbacks_enqueued = snapshot.optional_callbacks_enqueued,
+                    heartbeats_suppressed_capacity = snapshot.heartbeats_suppressed_capacity,
+                    heartbeat_insertion_errors = snapshot.heartbeat_insertion_errors,
+                    terminal_callback_insertion_failures = snapshot.terminal_callback_insertion_failures,
+                    terminal_callback_persistence_retries = snapshot.terminal_callback_persistence_retries,
+                    restart_reconciliation_attempts = snapshot.restart_reconciliation_attempts,
+                    existing_containers_reattached = snapshot.existing_containers_reattached,
+                    ambiguous_container_states = snapshot.ambiguous_container_states,
+                    duplicate_launch_preventions = snapshot.duplicate_launch_preventions,
+                    cleanup_retries = snapshot.cleanup_retries,
+                    recovery_backlog = snapshot.recovery_backlog,
+                    "supervisor metric snapshot"
+                );
+            }
+        });
         let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut handlers = JoinSet::new();
         tokio::pin!(shutdown);
@@ -270,6 +323,8 @@ impl SupervisorIpcServer {
         }
         recovery.abort();
         let _ = recovery.await;
+        metrics.abort();
+        let _ = metrics.await;
         while handlers.join_next().await.is_some() {}
         if !stop_supervisor_work(&self.store, &self.supervisor, active).await {
             return Err(SupervisorIpcError::Service);
@@ -290,6 +345,7 @@ async fn stop_supervisor_work(
             return false;
         }
     };
+    supervisor.set_recovery_backlog(launches.len());
     for launch in launches {
         if matches!(
             launch.state,
@@ -358,6 +414,7 @@ async fn handle_connection(
                 Command::Launch { run_id } => {
                     let existing = store.container_launch(run_id).ok().flatten();
                     if let Some(launch) = existing {
+                        supervisor.record_duplicate_launch_prevented();
                         if launch.state == ContainerLaunchState::ManualReviewRequired {
                             Response {
                                 ok: true,

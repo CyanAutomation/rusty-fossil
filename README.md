@@ -2,7 +2,7 @@
 
 Rusty-Fossil is the host-side controller foundation for disposable repository workers. **Soyuz is the only run-control authority**: it accepts submissions, assigns canonical run IDs, owns lifecycle and cancellation state, and publishes Cloudflare Queue messages. Rusty-Fossil has no submission endpoint or local-run fallback.
 
-Phase 2A.1 adds independent durable reconciliation, cross-host ownership cleanup, protected callback-outbox headroom, and observable Queue operation failures. Phase 2A-S adds a contract-validated Senku advisory client for all five Kaseki-owned profiles and a task-admission seam. Phase 2B adds an authenticated supervisor process, durable single-container Docker lifecycle, bounded security profile, and a fixed synthetic worker. Senku remains advisory and Soyuz remains the sole run authority. Production `main` still does not construct a Queue poller, callback replay loop, Senku client, or supervisor IPC client; `/ready` remains false until a controlled runtime is wired.
+Phase 2A.1 and 2A-S provide independent durable reconciliation, callback-outbox headroom, observable Queue failures, and an optional contract-validated Senku advisory client. Phase 2B adds an authenticated supervisor process, durable single-container Docker lifecycle, bounded security profile, and a fixed synthetic worker. Phase 2B.1 hardens outbox capacity, adds coordinator-to-supervisor process integration and restart coverage, and builds both controller and supervisor for Linux AMD64 and ARM64. Senku remains advisory and Soyuz remains the sole run authority. Production `main` still does not construct a Queue poller, callback replay loop, Senku client, or supervisor IPC client; `/ready` remains false until a controlled runtime is wired.
 
 ## Workspace
 
@@ -55,7 +55,7 @@ sequenceDiagram
 
 The canonical run UUID is the deduplication key. Queue message and lease IDs are transport identities only. The database retains the complete normalized request, claim/start IDs, and recovery state needed for restart reconciliation; SQLite files and their directory are restricted to the service account. Terminal callback intents are stored with local terminal transitions in one transaction.
 
-`RecoveryManager` can reconcile durable runs at startup and periodically without a Queue lease. The Docker supervisor separately scans durable container launch rows and reattaches only to a matching container. It reuses persisted IDs, re-reads canonical Soyuz state, and never creates a replacement after ambiguous Docker history. Intake pauses while local recovery state is unresolved, while callback replay remains independent of the execution slot. A single reserved outbox entry protects a mandatory terminal callback.
+`RecoveryManager` can reconcile durable runs at startup and periodically without a Queue lease. The Docker supervisor separately scans durable container launch rows and reattaches only to a matching container. It reuses persisted IDs, re-reads canonical Soyuz state, and never creates a replacement after ambiguous Docker history. Intake pauses while local recovery state is unresolved, while callback replay remains independent of the execution slot. SQLite reserves one outbox entry transactionally for a mandatory terminal callback: optional events, including heartbeats, are suppressed at 999 outstanding rows, and an authorized active launch may use the reserved slot for its stable terminal callback.
 
 The Senku client supports `task_admission_v1`, `kaseki_context_routing_v1`, `validation_recovery_v1`, `kaseki_goal_check_v1`, and `kaseki_run_evaluation_v1`. Inputs are bounded and redacted, and responses are checked against the selected profile. Only task admission has a coordinator seam; no Senku answer authorizes a claim, start, retry, or execution.
 
@@ -91,7 +91,7 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
-Default tests use local HTTP mocks and no production credentials, public network, paid inference, Docker daemon, or GitHub publication credentials. A separate Docker-enabled CI job builds and runs the synthetic image; this development host has no accessible Docker socket. CI also checks Linux AMD64 and ARM64 builds and audits dependencies.
+Default tests use local HTTP mocks and no production credentials, public network, paid inference, Docker daemon, or GitHub publication credentials. A separate Docker-enabled CI job runs the Docker lifecycle tests and an actual `fossil-supervisord` process through coordinator authorization, duplicate Queue delivery, process restart, callback replay, cancellation and cleanup. CI checks Linux AMD64 and ARM64 builds of both binaries, builds the worker image for both architectures, and audits dependencies. These builds are not Raspberry Pi hardware validation.
 
 ## Design documents
 
@@ -101,3 +101,4 @@ Default tests use local HTTP mocks and no production credentials, public network
 - [Phase 2B supervisor operations](docs/PHASE-2B-OPERATIONS.md)
 - [Architecture decisions](docs/DECISIONS/)
 - [Implementation plan and Phase 2B status](docs/IMPLEMENTATION-PLAN.md)
+- [Phase 2C-A long-running execution policy proposal](docs/DECISIONS/0012-phase-2c-long-running-execution-policy.md)

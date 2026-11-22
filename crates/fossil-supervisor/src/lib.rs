@@ -18,9 +18,12 @@ pub mod ipc;
 pub use docker::{
     DockerConfigError, DockerRuntimeConfig, SupervisorLimitSettings, SupervisorLimits,
 };
-pub use docker_service::DockerSupervisor;
+pub use docker_service::{DockerSupervisor, DockerSupervisorMetricsSnapshot};
 pub use fossil_core::execution::SyntheticScenario;
-pub use ipc::{SupervisorIpcClient, SupervisorIpcError, SupervisorIpcServer, read_ipc_token_file};
+pub use ipc::{
+    SupervisorIpcClient, SupervisorIpcError, SupervisorIpcMetricsSnapshot, SupervisorIpcServer,
+    read_ipc_token_file,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedExecution {

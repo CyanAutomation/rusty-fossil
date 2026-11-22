@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteStore::open(state_database)?;
     let soyuz_config = SoyuzClientConfig::new(origin, soyuz_token, Duration::from_secs(10))?;
     let soyuz = Arc::new(SoyuzClient::new(soyuz_config)?);
-    let docker_config = DockerRuntimeConfig::with_limits(image, docker_socket, limits)?;
+    let docker_config = runtime_config(image, docker_socket, limits)?;
     let supervisor =
         DockerSupervisor::connect(docker_config, store.clone(), soyuz, worker_id).await?;
     let server =
@@ -77,6 +77,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(socket = %socket_path.display(), "restricted supervisor IPC listening");
     server.serve_until(shutdown_signal()).await?;
     Ok(())
+}
+
+fn runtime_config(
+    image: String,
+    docker_socket: PathBuf,
+    limits: SupervisorLimits,
+) -> Result<DockerRuntimeConfig, Box<dyn std::error::Error>> {
+    #[cfg(feature = "test-support")]
+    if let Ok(test_image_id) = std::env::var("FOSSIL_SUPERVISOR_TEST_IMAGE_ID") {
+        return Ok(DockerRuntimeConfig::with_test_image_id(
+            test_image_id,
+            docker_socket,
+            limits,
+        )?);
+    }
+
+    Ok(DockerRuntimeConfig::with_limits(
+        image,
+        docker_socket,
+        limits,
+    )?)
 }
 
 fn required(name: &'static str) -> Result<String, Box<dyn std::error::Error>> {

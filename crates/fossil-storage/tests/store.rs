@@ -8,8 +8,8 @@ use fossil_soyuz::{
     SoyuzClientConfig, StartedAuthorization, StartedRequest, WorkerClaimRequest,
 };
 use fossil_storage::{
-    CallbackOutboxRecord, CallbackPayload, ContainerLaunchState, ExecutionDescriptor,
-    RecoveryAction, SqliteStore, StoreError, callback_retry_deadline_ms,
+    CallbackEnqueueResult, CallbackOutboxRecord, CallbackPayload, ContainerLaunchState,
+    ExecutionDescriptor, RecoveryAction, SqliteStore, StoreError, callback_retry_deadline_ms,
 };
 use secrecy::SecretString;
 use std::fs;
@@ -794,6 +794,271 @@ fn outbox_backpressure_reserves_terminal_callback_capacity_before_new_intake() {
         store.reserve_intake_slot(next_run),
         Err(StoreError::OutboxBackpressure)
     ));
+}
+
+#[tokio::test]
+async fn optional_callbacks_stop_at_999_and_terminal_callback_uses_reserved_slot() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let claim_callback_id = started_authorization.claim_callback_id();
+
+    for _ in 0..998 {
+        store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                EventId::new(),
+                run_id(),
+                CallbackPayload::Event {
+                    event_type: OperationalEventType::ProgressUpdate,
+                    worker_id: worker_id(),
+                    claim_callback_id,
+                    stage: None,
+                    step: None,
+                    timestamp_ms: 1_798_000_000_000,
+                    payload: serde_json::json!({}),
+                },
+            ))
+            .unwrap();
+    }
+    assert_eq!(store.callback_outbox_status().unwrap().pending, 998);
+
+    let mut heartbeat_ids = Vec::new();
+    for _ in 0..4 {
+        let event_id = EventId::new();
+        heartbeat_ids.push(event_id);
+        let result = store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                event_id,
+                run_id(),
+                CallbackPayload::Heartbeat {
+                    worker_id: worker_id(),
+                    claim_callback_id,
+                    timestamp_ms: 1_798_000_000_000,
+                },
+            ))
+            .unwrap();
+        if heartbeat_ids.len() == 1 {
+            assert_eq!(result, CallbackEnqueueResult::Enqueued);
+        } else {
+            assert_eq!(result, CallbackEnqueueResult::SuppressedCapacity);
+        }
+    }
+
+    assert_eq!(store.callback_outbox_status().unwrap().pending, 999);
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "container-terminal-capacity")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate, 1_798_000_000_000)
+        .unwrap();
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "success",
+            "synthetic workload completed",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let terminal = CallbackOutboxRecord::new(
+        exited.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Completed {
+            worker_id: worker_id(),
+            claim_callback_id,
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: Some(0),
+            summary: Some("synthetic workload completed".to_owned()),
+            published_url: None,
+            changed_file_count: None,
+            outcome_summary: None,
+        },
+    );
+
+    store
+        .transition_terminal_with_callback(run_id(), terminal.clone())
+        .unwrap();
+    assert_eq!(store.callback_outbox_status().unwrap().pending, 1_000);
+    assert!(store.pending_callbacks().unwrap().contains(&terminal));
+    assert_eq!(
+        store.enqueue_callback(terminal.clone()).unwrap(),
+        CallbackEnqueueResult::AlreadyPresent
+    );
+    assert_eq!(store.callback_outbox_status().unwrap().pending, 1_000);
+    assert_eq!(
+        store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                heartbeat_ids[0],
+                run_id(),
+                CallbackPayload::Heartbeat {
+                    worker_id: worker_id(),
+                    claim_callback_id,
+                    timestamp_ms: 1_798_000_000_000,
+                },
+            ))
+            .unwrap(),
+        CallbackEnqueueResult::AlreadyPresent
+    );
+}
+
+#[tokio::test]
+async fn optional_callback_capacity_survives_sqlite_restart_and_counts_blocked_rows() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let claim_callback_id = started_authorization.claim_callback_id();
+    let mut first_event_id = None;
+
+    for _ in 0..999 {
+        let event_id = EventId::new();
+        first_event_id.get_or_insert(event_id);
+        store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                event_id,
+                run_id(),
+                CallbackPayload::Event {
+                    event_type: OperationalEventType::ProgressUpdate,
+                    worker_id: worker_id(),
+                    claim_callback_id,
+                    stage: None,
+                    step: None,
+                    timestamp_ms: 1_798_000_000_000,
+                    payload: serde_json::json!({}),
+                },
+            ))
+            .unwrap();
+    }
+    let first_event_id = first_event_id.unwrap();
+    store
+        .block_callback(first_event_id, "soyuz_unavailable")
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            reopened
+                .enqueue_callback(CallbackOutboxRecord::new(
+                    EventId::new(),
+                    run_id(),
+                    CallbackPayload::Heartbeat {
+                        worker_id: worker_id(),
+                        claim_callback_id,
+                        timestamp_ms: 1_798_000_000_000,
+                    },
+                ))
+                .unwrap(),
+            CallbackEnqueueResult::SuppressedCapacity
+        );
+    }
+    let status = reopened.callback_outbox_status().unwrap();
+    assert_eq!(status.pending + status.blocked, 999);
+    assert_eq!(status.blocked, 1);
+}
+
+#[tokio::test]
+async fn concurrent_optional_and_terminal_insertions_preserve_terminal_callback() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let claim_callback_id = started_authorization.claim_callback_id();
+    for _ in 0..998 {
+        store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                EventId::new(),
+                run_id(),
+                CallbackPayload::Event {
+                    event_type: OperationalEventType::ProgressUpdate,
+                    worker_id: worker_id(),
+                    claim_callback_id,
+                    stage: None,
+                    step: None,
+                    timestamp_ms: 1_798_000_000_000,
+                    payload: serde_json::json!({}),
+                },
+            ))
+            .unwrap();
+    }
+
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(run_id(), SyntheticScenario::Success, gate.clone())
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "container-concurrent-terminal")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate, 1_798_000_000_000)
+        .unwrap();
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "success",
+            "synthetic workload completed",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let terminal = CallbackOutboxRecord::new(
+        exited.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Completed {
+            worker_id: worker_id(),
+            claim_callback_id,
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: Some(0),
+            summary: Some("synthetic workload completed".to_owned()),
+            published_url: None,
+            changed_file_count: None,
+            outcome_summary: None,
+        },
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let optional_store = SqliteStore::open(&path).unwrap();
+    let terminal_store = SqliteStore::open(&path).unwrap();
+    let optional_barrier = barrier.clone();
+    let optional = std::thread::spawn(move || {
+        optional_barrier.wait();
+        optional_store.enqueue_callback(CallbackOutboxRecord::new(
+            EventId::new(),
+            run_id(),
+            CallbackPayload::Heartbeat {
+                worker_id: worker_id(),
+                claim_callback_id,
+                timestamp_ms: 1_798_000_001_000,
+            },
+        ))
+    });
+    let terminal_barrier = barrier.clone();
+    let terminal_callback = terminal.clone();
+    let terminal_insert = std::thread::spawn(move || {
+        terminal_barrier.wait();
+        terminal_store.transition_terminal_with_callback(run_id(), terminal_callback)
+    });
+
+    let optional_result = optional.join().unwrap().unwrap();
+    assert!(matches!(
+        optional_result,
+        CallbackEnqueueResult::Enqueued | CallbackEnqueueResult::SuppressedCapacity
+    ));
+    terminal_insert.join().unwrap().unwrap();
+
+    let reopened = SqliteStore::open(&path).unwrap();
+    assert!(reopened.pending_callbacks().unwrap().contains(&terminal));
+    assert!(reopened.callback_outbox_status().unwrap().pending <= 1_000);
+    assert_eq!(reopened.execution_slot_owner().unwrap(), Some(run_id()));
 }
 
 #[tokio::test]
