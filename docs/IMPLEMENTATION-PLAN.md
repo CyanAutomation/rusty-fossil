@@ -50,9 +50,13 @@ This implementation strengthens the synthetic-only path without activating produ
 
 The operational and hardware validation prerequisites are in [Phase 2B operations](PHASE-2B-OPERATIONS.md). AMD64/ARM64 build success is not a Raspberry Pi hardware test.
 
-## Phase 2C-A — Pi coding worker foundation (design only)
+## Phase 2C-A — Pi coding worker foundation (in progress)
 
-The next milestone should add a fixed Pi coding-worker image, disposable repository preparation, scoped credentials, outbound network restrictions, and a first non-production Pi execution. It must retain Soyuz proof-gating, the supervisor boundary and single-host execution slot. Use separate coding-job timeout, cancellation grace, Soyuz outage grace, supervisor shutdown grace and container recovery deadline settings; do not raise the synthetic worker timeout globally. Resolve drain-mode and maintenance behavior before multi-hour jobs are enabled. The policy proposal is [ADR 0012](DECISIONS/0012-phase-2c-long-running-execution-policy.md). No Pi or real coding runtime is implemented in Phase 2B.1.
+The current branch adds a Pi 1.6.0 package and integrity-locked dependency graph, a bounded stdin JSON-mode launcher, a transcript-free JSONL event classifier, wrapper tests, and a CI build for AMD64 and ARM64 that requests SBOM/provenance attestations. The supervisor and SQLite launch model are still synthetic-only; the image is not yet admitted by supervisor policy, and the worker does not receive a Soyuz descriptor, repository workspace, gateway config or result callback.
+
+Complete this phase by adding the versioned durable workload kind and a separate trusted Pi resource/image profile, preparing the exact permitted repository commit in an isolated workspace, enforcing gateway-only egress, keeping provider credentials in a broker, persisting and recovering structured results, and proving cancellation/timeout/restart behavior on Agentlab. Preserve Soyuz proof-gating, the existing supervisor boundary, and the single-host execution slot. Keep separate coding-job timeout, cancellation grace, Soyuz outage grace, supervisor shutdown grace and container recovery deadline settings; do not raise the synthetic timeout globally. Resolve drain-mode and maintenance behavior before multi-hour jobs are enabled. The policy proposal is [ADR 0012](DECISIONS/0012-phase-2c-long-running-execution-policy.md). No production Queue, real coding workload, or publication capability is enabled.
+
+The preflight and current host blocker are recorded in [Agentlab compatibility](AGENTLAB-COMPATIBILITY.md) and [Agentlab validation](AGENTLAB-VALIDATION.md). Follow the operational gates in [Phase 2C-A operations](PHASE-2C-A-OPERATIONS.md) before attempting a real run.
 
 ## Phase 3 — Verification and publication
 

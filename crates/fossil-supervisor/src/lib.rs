@@ -14,6 +14,7 @@ use thiserror::Error;
 mod docker;
 mod docker_service;
 pub mod ipc;
+pub mod pi_events;
 
 pub use docker::{
     DockerConfigError, DockerRuntimeConfig, SupervisorLimitSettings, SupervisorLimits,

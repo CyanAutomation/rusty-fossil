@@ -63,6 +63,38 @@ jobs:
           push: false
           outputs: type=oci,dest=/tmp/synthetic-worker.oci
 
+  pi-worker-tests:
+    name: Test the Pi worker wrapper and dependency lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+      - name: Install the locked Pi runtime dependencies
+        working-directory: worker/pi
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test the worker wrapper
+        run: node --test worker/pi/worker.test.mjs
+
+  pi-worker-multiplatform:
+    name: Build Pi worker (AMD64 and ARM64) with SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build both supported worker architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/pi/Dockerfile.pi-worker
+          platforms: linux/amd64,linux/arm64
+          push: false
+          sbom: true
+          provenance: mode=max
+          outputs: type=oci,dest=/tmp/pi-worker.oci
+
   docker-integration:
     name: Run the Soyuz-gated worker on Docker Engine
     runs-on: ubuntu-latest
