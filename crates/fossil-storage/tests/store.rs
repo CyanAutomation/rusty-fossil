@@ -39,6 +39,131 @@ fn state_path(root: &Path) -> PathBuf {
     root.join("private-state").join("state.sqlite3")
 }
 
+#[test]
+fn local_retention_uses_canonical_creation_time_and_expires_exactly_at_deadline() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(state_path(directory.path())).unwrap();
+    let envelope = QueueEnvelope::parse(include_bytes!(
+        "../../fossil-core/tests/fixtures/queue-v1-valid.json"
+    ))
+    .unwrap();
+    let created_at_ms = envelope.created_at_unix_ms().unwrap();
+    let expires_at_ms = envelope.expires_at_unix_ms().unwrap();
+    store
+        .observe_run_at(run_id(), worker_id(), created_at_ms)
+        .unwrap();
+    store
+        .persist_execution_descriptor(ExecutionDescriptor::from(&envelope))
+        .unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::ExecutionTerminal)
+        .unwrap();
+
+    let live = store.purge_expired_records(expires_at_ms - 1).unwrap();
+    assert_eq!(live.expired_runs_removed, 0);
+    assert!(store.execution_descriptor(run_id()).unwrap().is_some());
+    assert_eq!(
+        store.get_run(run_id()).unwrap().expires_at_ms,
+        expires_at_ms
+    );
+
+    let expired = store.purge_expired_records(expires_at_ms).unwrap();
+    assert_eq!(expired.expired_runs_removed, 1);
+    assert!(store.execution_descriptor(run_id()).unwrap().is_none());
+    assert!(matches!(
+        store.get_run(run_id()),
+        Err(StoreError::RunNotFound)
+    ));
+}
+
+#[test]
+fn expired_live_local_state_drops_prompt_content_but_keeps_execution_fencing() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(state_path(directory.path())).unwrap();
+    let envelope = QueueEnvelope::parse(include_bytes!(
+        "../../fossil-core/tests/fixtures/queue-v1-valid.json"
+    ))
+    .unwrap();
+    let created_at_ms = envelope.created_at_unix_ms().unwrap();
+    let expires_at_ms = envelope.expires_at_unix_ms().unwrap();
+    store
+        .observe_run_at(run_id(), worker_id(), created_at_ms)
+        .unwrap();
+    store
+        .persist_execution_descriptor(ExecutionDescriptor::from(&envelope))
+        .unwrap();
+
+    let before_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let result = store.purge_expired_records(expires_at_ms).unwrap();
+    assert_eq!(result.expired_runs_fenced_for_cleanup, 1);
+    assert!(store.execution_descriptor(run_id()).unwrap().is_none());
+    let record = store.get_run(run_id()).unwrap();
+    assert_eq!(record.recovery_action, RecoveryAction::ManualReview);
+    assert_eq!(record.expires_at_ms, expires_at_ms);
+    let after_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!((before_sweep_ms..=after_sweep_ms).contains(&record.updated_at_ms));
+    assert_ne!(record.updated_at_ms, expires_at_ms);
+}
+
+#[test]
+fn expired_callback_cleanup_records_the_wall_clock_update_time() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(state_path(directory.path())).unwrap();
+    let envelope = QueueEnvelope::parse(include_bytes!(
+        "../../fossil-core/tests/fixtures/queue-v1-valid.json"
+    ))
+    .unwrap();
+    let created_at_ms = envelope.created_at_unix_ms().unwrap();
+    let expires_at_ms = envelope.expires_at_unix_ms().unwrap();
+    store
+        .observe_run_at(run_id(), worker_id(), created_at_ms)
+        .unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::MessageValidated)
+        .unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::CanonicalRunChecked)
+        .unwrap();
+    let claim_callback_id = ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133").unwrap();
+    store
+        .begin_claim_intent(run_id(), claim_callback_id)
+        .unwrap();
+    let callback = CallbackOutboxRecord::new(
+        EventId::parse("fa870068-6723-4b70-9e9f-53b8271e032d").unwrap(),
+        run_id(),
+        CallbackPayload::Heartbeat {
+            worker_id: worker_id(),
+            claim_callback_id,
+            timestamp_ms: created_at_ms,
+        },
+    );
+    store.enqueue_callback(callback).unwrap();
+
+    let before_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let result = store.purge_expired_records(expires_at_ms).unwrap();
+    let record = store.get_run(run_id()).unwrap();
+    let after_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    assert_eq!(result.expired_runs_fenced_for_cleanup, 1);
+    assert_eq!(record.callback_delivery, CallbackDeliveryState::Blocked);
+    assert!((before_sweep_ms..=after_sweep_ms).contains(&record.updated_at_ms));
+    assert_ne!(record.updated_at_ms, expires_at_ms);
+    assert!(store.pending_callbacks().unwrap().is_empty());
+}
+
 fn prepare_state_path(path: &Path) {
     let parent = path.parent().unwrap();
     fs::create_dir_all(parent).unwrap();
@@ -452,6 +577,12 @@ async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline()
             gate,
         )
         .unwrap();
+    let expires_at_ms = QueueEnvelope::parse(include_bytes!(
+        "../../fossil-core/tests/fixtures/queue-v1-valid.json"
+    ))
+    .unwrap()
+    .expires_at_unix_ms()
+    .unwrap();
     drop(store);
 
     let legacy_db = Connection::open(&path).unwrap();
@@ -464,7 +595,9 @@ async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline()
              ALTER TABLE container_launches DROP COLUMN effective_policy_json;
              ALTER TABLE container_launches DROP COLUMN runtime_limit_ms;
              ALTER TABLE container_launches DROP COLUMN effective_deadline_at_ms;
-             DELETE FROM schema_migrations WHERE version = 5;
+             DROP INDEX run_records_expiration_idx;
+             ALTER TABLE run_records DROP COLUMN expires_at_ms;
+             DELETE FROM schema_migrations WHERE version IN (5, 6);
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -482,6 +615,10 @@ async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline()
     assert_eq!(migrated.image_identity, None);
     assert_eq!(migrated.profile_version, "synthetic-v1");
     assert_eq!(migrated.effective_policy_json, "{}");
+    assert_eq!(
+        reopened.get_run(run_id()).unwrap().expires_at_ms,
+        expires_at_ms
+    );
     assert_eq!(migrated.runtime_limit_ms, None);
     assert_eq!(migrated.effective_deadline_at_ms, None);
 }
@@ -1445,7 +1582,7 @@ fn schema_v2_callback_outbox_migrates_retry_state_without_losing_rows() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let columns: Vec<String> = connection
         .prepare("PRAGMA table_info(callback_outbox)")
         .unwrap()

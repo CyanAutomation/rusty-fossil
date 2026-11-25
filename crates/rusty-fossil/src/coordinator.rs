@@ -401,6 +401,11 @@ impl AuthorizationCoordinator {
         source: EnvelopeSource,
     ) -> QueueDisposition {
         let run_id = envelope.run_id;
+        let current_time = now_ms();
+        if envelope.is_expired_at(current_time) {
+            let _ = self.store.purge_expired_records(current_time);
+            return QueueDisposition::Acknowledge;
+        }
         let (mut record, newly_observed) = match self.store.get_run(run_id) {
             Ok(record) => {
                 if source == EnvelopeSource::QueueDelivery {
@@ -411,7 +416,15 @@ impl AuthorizationCoordinator {
                 (record, false)
             }
             Err(fossil_storage::StoreError::RunNotFound) => {
-                match self.store.observe_run(run_id, self.worker_id.clone()) {
+                let canonical_created_at_ms = match envelope.created_at_unix_ms() {
+                    Ok(created_at_ms) => created_at_ms,
+                    Err(_) => return QueueDisposition::Acknowledge,
+                };
+                match self.store.observe_run_at(
+                    run_id,
+                    self.worker_id.clone(),
+                    canonical_created_at_ms,
+                ) {
                     Ok(record) => (record, true),
                     Err(_) => return retry_for(attempts),
                 }
@@ -1062,6 +1075,7 @@ impl RecoveryManager {
     }
 
     pub async fn reconcile_pending(&self) -> RecoverySummary {
+        let _ = self.coordinator.store.purge_expired_records(now_ms());
         let candidates = match self.coordinator.store.recovery_candidates() {
             Ok(candidates) => candidates,
             Err(_) => return RecoverySummary::default(),
@@ -1089,6 +1103,10 @@ impl RecoveryManager {
             Ok(record) => record,
             Err(_) => return RecoveryOutcome::ManualReviewRequired,
         };
+        if record.expires_at_ms <= now_ms() {
+            let _ = self.coordinator.store.purge_expired_records(now_ms());
+            return RecoveryOutcome::ManualReviewRequired;
+        }
         if record.lifecycle_state == LocalLifecycleState::ExecutionTerminal {
             return if record.recovery_action == RecoveryAction::OwnedElsewhere {
                 RecoveryOutcome::OwnedElsewhere

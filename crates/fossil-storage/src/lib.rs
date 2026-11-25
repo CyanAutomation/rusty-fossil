@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
+const MAXIMUM_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CALLBACK_PAYLOAD_BYTES: usize = 12 * 1024;
 const MAX_PENDING_CALLBACKS: u32 = 1_000;
 const MAX_EXECUTION_DESCRIPTOR_BYTES: usize = 96 * 1024;
@@ -554,6 +555,7 @@ pub struct RunRecord {
     pub recovery_attempts: u32,
     pub recovery_action: RecoveryAction,
     pub created_at_ms: i64,
+    pub expires_at_ms: i64,
     pub updated_at_ms: i64,
 }
 
@@ -574,6 +576,13 @@ pub struct RecoveryDiagnostics {
     pub owned_elsewhere: u64,
     pub manual_review_runs: u64,
     pub ambiguous_execution_runs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionSweepSummary {
+    pub expired_runs_removed: u64,
+    pub expired_run_content_removed: u64,
+    pub expired_runs_fenced_for_cleanup: u64,
 }
 
 struct RecoveryDiagnosticRow {
@@ -680,6 +689,7 @@ struct StoredRunRow {
     recovery_attempts: u32,
     recovery_action: String,
     created_at_ms: i64,
+    expires_at_ms: i64,
     updated_at_ms: i64,
 }
 
@@ -716,6 +726,7 @@ impl SqliteStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "secure_delete", "ON")?;
         Self::migrate(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -854,6 +865,26 @@ impl SqliteStore {
                 PRAGMA user_version = 5;",
             )?;
             transaction.commit()?;
+            return Self::migrate(connection);
+        }
+
+        if version == 5 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE run_records ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0;
+                UPDATE run_records SET expires_at_ms = COALESCE(
+                    (SELECT CAST(strftime('%s', json_extract(h.descriptor_json, '$.createdAt')) AS INTEGER) * 1000
+                        + CAST(substr(json_extract(h.descriptor_json, '$.createdAt'), 21, 3) AS INTEGER)
+                        + 7776000000
+                     FROM execution_handoffs h WHERE h.run_id = run_records.run_id),
+                    created_at_ms + 7776000000
+                );
+                CREATE INDEX run_records_expiration_idx ON run_records(expires_at_ms, run_id);
+                INSERT INTO schema_migrations(version, applied_at_ms) VALUES (6, 0);
+                PRAGMA user_version = 6;",
+            )?;
+            transaction.commit()?;
             return Ok(());
         }
 
@@ -914,6 +945,15 @@ impl SqliteStore {
     }
 
     pub fn observe_run(&self, run_id: RunId, worker_id: WorkerId) -> Result<RunRecord, StoreError> {
+        self.observe_run_at(run_id, worker_id, now_ms())
+    }
+
+    pub fn observe_run_at(
+        &self,
+        run_id: RunId,
+        worker_id: WorkerId,
+        canonical_created_at_ms: i64,
+    ) -> Result<RunRecord, StoreError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing_worker: Option<String> = transaction
@@ -933,11 +973,20 @@ impl SqliteStore {
         }
 
         let now = now_ms();
+        let expires_at_ms = canonical_created_at_ms
+            .checked_add(MAXIMUM_RETENTION_MS)
+            .ok_or(StoreError::InvalidStoredValue("retention deadline"))?;
         transaction.execute(
             "INSERT INTO run_records (
-                run_id, worker_id, lifecycle_state, created_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, 'queue_observed', ?3, ?3)",
-            params![run_id.to_string(), worker_id.as_str(), now],
+                run_id, worker_id, lifecycle_state, created_at_ms, expires_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, 'queue_observed', ?3, ?4, ?5)",
+            params![
+                run_id.to_string(),
+                worker_id.as_str(),
+                canonical_created_at_ms,
+                expires_at_ms,
+                now
+            ],
         )?;
         let record = load_run(&transaction, run_id)?;
         transaction.commit()?;
@@ -2227,6 +2276,68 @@ impl SqliteStore {
         Ok(deleted == 1)
     }
 
+    /// Expire local prompt-bearing descriptors and callback payloads at the
+    /// canonical deadline. Keep only the run/container fence while Docker
+    /// cleanup is unresolved; remove the complete row set once terminal and safe.
+    pub fn purge_expired_records(&self, at_ms: i64) -> Result<RetentionSweepSummary, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(
+            "SELECT run_id, lifecycle_state FROM run_records WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms, run_id",
+        )?;
+        let candidates = statement
+            .query_map([at_ms], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut summary = RetentionSweepSummary::default();
+        for (run_id, lifecycle_state) in candidates {
+            let updated_at_ms = now_ms();
+            let content_removed = transaction.execute(
+                "DELETE FROM execution_handoffs WHERE run_id = ?1",
+                [&run_id],
+            )?;
+            let callbacks_removed =
+                transaction.execute("DELETE FROM callback_outbox WHERE run_id = ?1", [&run_id])?;
+            if content_removed + callbacks_removed > 0 {
+                summary.expired_run_content_removed += 1;
+            }
+            if callbacks_removed > 0 {
+                transaction.execute(
+                    "UPDATE run_records SET callback_delivery = 'blocked', updated_at_ms = ?2 WHERE run_id = ?1",
+                    params![run_id, updated_at_ms],
+                )?;
+            }
+            let container_state: Option<String> = transaction
+                .query_row(
+                    "SELECT state FROM container_launches WHERE run_id = ?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let container_is_safe = container_state
+                .as_deref()
+                .is_none_or(|state| state == "cleanup_completed");
+            if lifecycle_state == "execution_terminal" && container_is_safe {
+                summary.expired_runs_removed += transaction.execute(
+                    "DELETE FROM run_records WHERE run_id = ?1 AND expires_at_ms <= ?2",
+                    params![run_id, at_ms],
+                )? as u64;
+            } else {
+                transaction.execute(
+                    "UPDATE run_records SET recovery_action = 'manual_review', updated_at_ms = ?2 WHERE run_id = ?1",
+                    params![run_id, updated_at_ms],
+                )?;
+                summary.expired_runs_fenced_for_cleanup += 1;
+            }
+        }
+        transaction.commit()?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(summary)
+    }
+
     pub fn recovery_candidates(&self) -> Result<Vec<RunRecord>, StoreError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -2599,7 +2710,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunRecord, StoreEr
         .query_row(
             "SELECT run_id, worker_id, claim_callback_id, start_callback_id,
                     start_authorization_source, start_authorized, callback_delivery,
-                    recovery_attempts, recovery_action, created_at_ms, updated_at_ms
+                    recovery_attempts, recovery_action, created_at_ms, expires_at_ms, updated_at_ms
              FROM run_records WHERE run_id = ?1",
             [run_id.to_string()],
             |row| {
@@ -2614,7 +2725,8 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunRecord, StoreEr
                     recovery_attempts: row.get(7)?,
                     recovery_action: row.get(8)?,
                     created_at_ms: row.get(9)?,
-                    updated_at_ms: row.get(10)?,
+                    expires_at_ms: row.get(10)?,
+                    updated_at_ms: row.get(11)?,
                 })
             },
         )
@@ -2630,6 +2742,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunRecord, StoreEr
         recovery_attempts,
         recovery_action,
         created_at_ms,
+        expires_at_ms,
         updated_at_ms,
     } = row.ok_or(StoreError::RunNotFound)?;
 
@@ -2664,6 +2777,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunRecord, StoreEr
         recovery_attempts,
         recovery_action: RecoveryAction::parse(&recovery_action)?,
         created_at_ms,
+        expires_at_ms,
         updated_at_ms,
     })
 }
