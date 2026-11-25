@@ -8,6 +8,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
 const MAX_QUEUE_BODY_BYTES: usize = 96 * 1024;
+pub const MAXIMUM_RETENTION_DAYS: i64 = 90;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -48,6 +50,26 @@ impl QueueEnvelope {
             return Err(QueueEnvelopeError::InvalidTraceId);
         }
         self.request.validate()
+    }
+
+    /// Canonical run expiry is anchored to Soyuz's queue `createdAt`, never to
+    /// queue delivery, host recovery, or callback retry time.
+    pub fn expires_at_unix_ms(&self) -> Result<i64, QueueEnvelopeError> {
+        self.created_at_unix_ms()?
+            .checked_add(MAXIMUM_RETENTION_DAYS * MILLIS_PER_DAY)
+            .ok_or(QueueEnvelopeError::InvalidTimestamp)
+    }
+
+    pub fn created_at_unix_ms(&self) -> Result<i64, QueueEnvelopeError> {
+        let created_at = OffsetDateTime::parse(&self.created_at, &Rfc3339)
+            .map_err(|_| QueueEnvelopeError::InvalidTimestamp)?;
+        i64::try_from(created_at.unix_timestamp_nanos() / 1_000_000)
+            .map_err(|_| QueueEnvelopeError::InvalidTimestamp)
+    }
+
+    pub fn is_expired_at(&self, now_unix_ms: i64) -> bool {
+        self.expires_at_unix_ms()
+            .is_ok_and(|expires_at| now_unix_ms >= expires_at)
     }
 }
 

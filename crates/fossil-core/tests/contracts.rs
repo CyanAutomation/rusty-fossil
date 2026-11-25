@@ -28,6 +28,18 @@ fn valid_contract_v1_queue_envelope_deserializes_without_confusing_identifiers()
 }
 
 #[test]
+fn queue_replay_expiry_is_anchored_to_created_at_with_an_exact_boundary() {
+    let envelope = QueueEnvelope::parse(include_bytes!("fixtures/queue-v1-valid.json")).unwrap();
+    let expiry = envelope.expires_at_unix_ms().unwrap();
+    assert!(!envelope.is_expired_at(expiry - 1));
+    assert!(envelope.is_expired_at(expiry));
+    assert_eq!(
+        expiry - envelope.created_at_unix_ms().unwrap(),
+        90 * 24 * 60 * 60 * 1_000
+    );
+}
+
+#[test]
 fn worker_id_policy_is_1_to_64_ascii_alphanumeric_hyphen_or_underscore() {
     let maximum = "w".repeat(64);
     assert_eq!(WorkerId::parse(maximum.clone()).unwrap().as_str(), maximum);
