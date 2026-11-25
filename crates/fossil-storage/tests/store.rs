@@ -132,7 +132,9 @@ fn expired_callback_cleanup_records_the_wall_clock_update_time() {
         .transition(run_id(), LocalLifecycleState::CanonicalRunChecked)
         .unwrap();
     let claim_callback_id = ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133").unwrap();
-    store.begin_claim_intent(run_id(), claim_callback_id).unwrap();
+    store
+        .begin_claim_intent(run_id(), claim_callback_id)
+        .unwrap();
     let callback = CallbackOutboxRecord::new(
         EventId::parse("fa870068-6723-4b70-9e9f-53b8271e032d").unwrap(),
         run_id(),
