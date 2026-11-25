@@ -93,12 +93,73 @@ fn expired_live_local_state_drops_prompt_content_but_keeps_execution_fencing() {
         .persist_execution_descriptor(ExecutionDescriptor::from(&envelope))
         .unwrap();
 
+    let before_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
     let result = store.purge_expired_records(expires_at_ms).unwrap();
     assert_eq!(result.expired_runs_fenced_for_cleanup, 1);
     assert!(store.execution_descriptor(run_id()).unwrap().is_none());
     let record = store.get_run(run_id()).unwrap();
     assert_eq!(record.recovery_action, RecoveryAction::ManualReview);
     assert_eq!(record.expires_at_ms, expires_at_ms);
+    let after_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!((before_sweep_ms..=after_sweep_ms).contains(&record.updated_at_ms));
+    assert_ne!(record.updated_at_ms, expires_at_ms);
+}
+
+#[test]
+fn expired_callback_cleanup_records_the_wall_clock_update_time() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(state_path(directory.path())).unwrap();
+    let envelope = QueueEnvelope::parse(include_bytes!(
+        "../../fossil-core/tests/fixtures/queue-v1-valid.json"
+    ))
+    .unwrap();
+    let created_at_ms = envelope.created_at_unix_ms().unwrap();
+    let expires_at_ms = envelope.expires_at_unix_ms().unwrap();
+    store
+        .observe_run_at(run_id(), worker_id(), created_at_ms)
+        .unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::MessageValidated)
+        .unwrap();
+    store
+        .transition(run_id(), LocalLifecycleState::CanonicalRunChecked)
+        .unwrap();
+    let claim_callback_id = ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133").unwrap();
+    store.begin_claim_intent(run_id(), claim_callback_id).unwrap();
+    let callback = CallbackOutboxRecord::new(
+        EventId::parse("fa870068-6723-4b70-9e9f-53b8271e032d").unwrap(),
+        run_id(),
+        CallbackPayload::Heartbeat {
+            worker_id: worker_id(),
+            claim_callback_id,
+            timestamp_ms: created_at_ms,
+        },
+    );
+    store.enqueue_callback(callback).unwrap();
+
+    let before_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let result = store.purge_expired_records(expires_at_ms).unwrap();
+    let record = store.get_run(run_id()).unwrap();
+    let after_sweep_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    assert_eq!(result.expired_runs_fenced_for_cleanup, 1);
+    assert_eq!(record.callback_delivery, CallbackDeliveryState::Blocked);
+    assert!((before_sweep_ms..=after_sweep_ms).contains(&record.updated_at_ms));
+    assert_ne!(record.updated_at_ms, expires_at_ms);
+    assert!(store.pending_callbacks().unwrap().is_empty());
 }
 
 fn prepare_state_path(path: &Path) {

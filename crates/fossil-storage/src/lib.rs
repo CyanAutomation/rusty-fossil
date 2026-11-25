@@ -2294,6 +2294,7 @@ impl SqliteStore {
 
         let mut summary = RetentionSweepSummary::default();
         for (run_id, lifecycle_state) in candidates {
+            let updated_at_ms = now_ms();
             let content_removed = transaction.execute(
                 "DELETE FROM execution_handoffs WHERE run_id = ?1",
                 [&run_id],
@@ -2305,8 +2306,8 @@ impl SqliteStore {
             }
             if callbacks_removed > 0 {
                 transaction.execute(
-                    "UPDATE run_records SET callback_delivery = 'blocked' WHERE run_id = ?1",
-                    [&run_id],
+                    "UPDATE run_records SET callback_delivery = 'blocked', updated_at_ms = ?2 WHERE run_id = ?1",
+                    params![run_id, updated_at_ms],
                 )?;
             }
             let container_state: Option<String> = transaction
@@ -2327,7 +2328,7 @@ impl SqliteStore {
             } else {
                 transaction.execute(
                     "UPDATE run_records SET recovery_action = 'manual_review', updated_at_ms = ?2 WHERE run_id = ?1",
-                    params![run_id, at_ms],
+                    params![run_id, updated_at_ms],
                 )?;
                 summary.expired_runs_fenced_for_cleanup += 1;
             }
