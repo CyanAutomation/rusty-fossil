@@ -63,6 +63,8 @@ Worker requests use `Authorization: Bearer <SOYUZ_WORKER_API_TOKEN>`, separate f
 
 The client does not create a new callback ID on retry. Only retryable network, timeout, rate-limit and service-unavailable outcomes are retried automatically by outbox replay. A stale claim, conflict, authentication rejection, missing run, invalid request or protocol mismatch becomes blocked for operator review. A callback is marked delivered only after Soyuz returns success.
 
+The stateful Rust-side worker API simulator and its scope are documented in the [Soyuz simulator guide](SOYUZ-SIMULATOR.md). It exercises the production Rust client and coordinator against contract-based transitions without connecting to Soyuz or Cloudflare.
+
 ## Persistence, retry and cancellation
 
 - Claim intent and ID commit before `/claim`; the accepted/reconciled proof is required before `/started`.

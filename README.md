@@ -93,12 +93,13 @@ cargo test --workspace --locked
 cargo build --workspace --release --locked
 ```
 
-Default tests use local HTTP mocks and no production credentials, public network, paid inference, Docker daemon, or GitHub publication credentials. A separate Docker-enabled CI job runs the Docker lifecycle tests and an actual `fossil-supervisord` process through coordinator authorization, duplicate Queue delivery, process restart, callback replay, cancellation and cleanup. CI checks Linux AMD64 and ARM64 builds of both binaries, builds the worker image for both architectures, and audits dependencies. These builds are not Raspberry Pi hardware validation.
+Default tests use local HTTP mocks and a stateful Soyuz worker API simulator; they need no production credentials, public network, paid inference, Docker daemon, or GitHub publication credentials. The simulator-backed integration tests run the real Rust client, coordinator, and SQLite store through claim races, callback replay, uncertain responses, and cancellation gates. A separate Docker-enabled CI job runs the Docker lifecycle tests and an actual `fossil-supervisord` process through coordinator authorization, duplicate Queue delivery, process restart, callback replay, cancellation and cleanup. CI checks Linux AMD64 and ARM64 builds of both binaries, builds the worker image for both architectures, and audits dependencies. These builds are not Raspberry Pi hardware validation.
 
 ## Design documents
 
 - [Architecture and recovery boundaries](docs/ARCHITECTURE.md)
 - [Soyuz and Cloudflare contracts](docs/CONTRACTS.md)
+- [Soyuz worker API simulator](docs/SOYUZ-SIMULATOR.md)
 - [Compatibility inventory](docs/COMPATIBILITY.md)
 - [Phase 2B supervisor operations](docs/PHASE-2B-OPERATIONS.md)
 - [Phase 2C-A operations](docs/PHASE-2C-A-OPERATIONS.md)
