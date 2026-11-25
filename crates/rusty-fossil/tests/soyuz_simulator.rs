@@ -35,7 +35,7 @@ impl Harness {
         let message = queue_message();
         let run_id = message.decode_envelope().unwrap().run_id;
         let directory = tempfile::tempdir().unwrap();
-        let store = SqliteStore::open(directory.path().join("fossil.sqlite3")).unwrap();
+        let store = SqliteStore::open(directory.path().join("state/fossil.sqlite3")).unwrap();
         let simulator = SoyuzSimulator::start(TOKEN).await.unwrap();
         simulator.seed_queued_run(run_id, "soyuz-sim-1").await;
         let worker_id = WorkerId::parse(WORKER_ID).unwrap();

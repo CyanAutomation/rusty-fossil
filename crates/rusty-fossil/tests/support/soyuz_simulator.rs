@@ -887,7 +887,7 @@ fn claim_expired(run: &SimRun, now_ms: i64) -> bool {
     run.claim_expires_at
         .as_deref()
         .and_then(parse_time)
-        .is_none_or(|expires_at| expires_at <= now_ms)
+        .is_some_and(|expires_at| expires_at <= now_ms)
 }
 
 fn strict_body(body: &Value, allowed: &[&str], required: &[&str]) -> Result<(), ApiFailure> {
@@ -1046,4 +1046,20 @@ fn parse_time(timestamp: &str) -> Option<i64> {
     OffsetDateTime::parse(timestamp, &Rfc3339)
         .ok()
         .and_then(|value| i64::try_from(value.unix_timestamp_nanos() / 1_000_000).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SimRun, claim_expired, format_time};
+
+    #[test]
+    fn claim_without_expiry_is_not_expired() {
+        let mut run = SimRun::queued("run-1".to_owned(), "display-1".to_owned(), 0);
+
+        assert!(!claim_expired(&run, 0));
+
+        run.claim_expires_at = Some(format_time(1_000));
+        assert!(claim_expired(&run, 1_000));
+        assert!(!claim_expired(&run, 999));
+    }
 }
