@@ -6,6 +6,7 @@ members = [
     "crates/fossil-senku",
     "crates/fossil-queue",
     "crates/fossil-supervisor",
+    "crates/fossil-workspace",
     "crates/fossil-synthetic-worker",
     "crates/rusty-fossil",
 ]

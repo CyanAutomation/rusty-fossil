@@ -2,9 +2,9 @@
 
 ## Status
 
-The branch contains a Pi 1.6.0 worker wrapper, a locked runtime dependency graph, a fixed multi-architecture Node base digest, and a Rust JSONL event classifier. The supervisor terminal finalizer has a bounded Docker stdout parser path, and SQLite/outbox can persist Pi-specific result classes with a stable callback identity. CI tests the wrapper and builds the AMD64/ARM64 worker image with SBOM and provenance attestations. SQLite schema v7 persists the `PiCodingV1` workload/version, immutable image/profile identity, effective policy/deadline and opaque workspace identity. Storage validates and persists a per-run repository URL/ref/commit; there is no global repository allowlist, and `CyanAutomation/somatic` is a disposable test repository. No checkout is performed or verified. The record is prepared only for a patch task with `publishMode: none`; Pi image creation remains rejected by the supervisor, so the parser/result path is not reachable from a live Pi container.
+The branch contains a Pi 1.6.0 worker wrapper, a locked runtime dependency graph, a fixed multi-architecture Node base digest, and a Rust JSONL event classifier. The supervisor terminal finalizer has a bounded Docker stdout parser path, and SQLite/outbox can persist Pi-specific result classes with a stable callback identity. CI tests the wrapper and builds the AMD64/ARM64 worker image with SBOM and provenance attestations. SQLite schema v7 persists the `PiCodingV1` workload/version, immutable image/profile identity, effective policy/deadline and opaque workspace identity. `fossil-workspace` now provides an exact pilot repository allowlist, bounded branch/ref and tree validation, hostname-restricted HTTPS Git transport, commit verification and private per-run checkout/cleanup. It has not been used for a remote fetch and is not wired into the supervisor. The record is prepared only for a patch task with `publishMode: none`; Pi image creation remains rejected by the supervisor, so the parser/result path is not reachable from a live Pi container.
 
-This is still not an operational coding runtime. The supervisor accepts only its synthetic workload. It does not mount a repository, provide Pi configuration, contact a gateway, persist Pi event counters, or select this image. The durable Pi record is not permission to launch; do not launch the image as an execution fallback.
+This is still not an operational coding runtime. The supervisor accepts only its synthetic workload. It does not call the repository library, mount a repository, provide Pi configuration, contact a gateway, persist Pi event counters, or select this image. The durable Pi record is not permission to launch; do not launch the image as an execution fallback.
 
 ## Local checks
 
@@ -13,7 +13,10 @@ Run the focused checks from the repository root:
 ```sh
 node --test worker/pi/worker.test.mjs
 cargo test -p fossil-supervisor --lib pi_events --locked
+cargo test -p fossil-workspace --locked
 ```
+
+The default workspace-preparation tests are Docker-free and do not use network sockets. The optional live CONNECT-proxy test is ignored by default because some test environments prohibit loopback binding; run it explicitly only in a network-enabled environment with loopback access.
 
 The multi-platform image build is:
 
@@ -38,10 +41,10 @@ Before connecting the image to the supervisor, implement and review all of these
 5. Brokered, least-privilege, non-production gateway authentication. Do not pass reusable provider, GitHub, Soyuz, Cloudflare or Senku credentials into a shell-capable worker.
 6. Bounded JSONL capture integrated into durable outcomes and the existing callback outbox. Missing, truncated, malformed, aborted, provider-error, timed-out or ambiguous output must not become success.
 7. Cancellation, timeout, restart reconciliation, slot retention, cleanup, and callback replay tests for the Pi workload type.
-8. A secured Agentlab access path and a reviewed host resource budget. Record memory under the actual Pi run before setting production-like limits.
+8. A secured ARM64 host access path and a reviewed resource budget. Record memory under the actual Pi run before setting production-like limits.
 
 Production Queue polling, Senku inference and publication remain out of scope. There is no push token or publication path in this worker.
 
-## Current Agentlab disposition
+## Current ARM64 host disposition
 
-The last observed host inventory is in [Agentlab compatibility](AGENTLAB-COMPATIBILITY.md), and the validation record is in [Agentlab validation](AGENTLAB-VALIDATION.md). The host owner reports that the previous default `pi` password has been changed to a stronger password; this is owner-reported and has not been independently rechecked. Agentlab is inaccessible from this cloud environment, so SSH policy, Docker socket access, service-account separation and current host capacity could not be rechecked here. The historical inventory found `pi` in the rootful Docker group. No Rusty-Fossil image or container was created. The user designated `https://github.com/CyanAutomation/somatic` at ref `main` (observed commit `0d02873b71256892b4ec8026a3b0e2a5ab6aaa91`) as a disposable repository for testing; Rusty-Fossil is intended to work with other repositories too. No checkout or task execution was performed. A gateway-only route is not configured.
+The 2026-11-26 anonymized read-only host review is recorded in [ARM64 host compatibility](ARM64-HOST-COMPATIBILITY.md), with evidence in [ARM64 host validation](ARM64-HOST-VALIDATION.md). The operator reports replacing a prior default credential; no credential was requested or accessed. The reviewed account had rootful Docker-group authority, and SSH authentication policy could not be established from the available `sshd -T` output. Other containers were running and left untouched. No Rusty-Fossil image or container was created. The repository-preparation library has not performed a checkout or task execution. Cloudflare metadata was reviewed read-only; no credential values were read and no inference request was sent. Non-production broker/limits remain unverified, and a gateway-only worker route is not configured.
