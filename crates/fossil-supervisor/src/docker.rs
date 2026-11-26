@@ -1,6 +1,6 @@
 use bollard::models::{ContainerCreateBody, HostConfig, HostConfigLogConfig};
 use fossil_core::execution::SyntheticScenario;
-use fossil_storage::ContainerLaunchRecord;
+use fossil_storage::{ContainerLaunchRecord, WorkloadKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,6 +24,8 @@ pub enum DockerConfigError {
     InvalidSocketPath,
     #[error("Docker resource limits are outside the supported safe bounds")]
     InvalidLimits,
+    #[error("Docker runtime only accepts the configured synthetic workload")]
+    UnsupportedWorkload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +208,21 @@ impl DockerRuntimeConfig {
         .to_string()
     }
 
-    pub fn container_config(&self, launch: &ContainerLaunchRecord) -> ContainerCreateBody {
+    pub fn container_config(
+        &self,
+        launch: &ContainerLaunchRecord,
+    ) -> Result<ContainerCreateBody, DockerConfigError> {
+        if launch.workload_kind != WorkloadKind::Synthetic
+            || launch.workload_version != 1
+            || launch.profile_version != "synthetic-v1"
+            || launch.image_identity.as_deref() != Some(self.image())
+            || launch.repository_url.is_some()
+            || launch.authorized_git_ref.is_some()
+            || launch.resolved_commit.is_some()
+            || launch.workspace_identity.is_some()
+        {
+            return Err(DockerConfigError::UnsupportedWorkload);
+        }
         let labels = HashMap::from([
             ("io.rusty-fossil.managed".to_owned(), "true".to_owned()),
             (
@@ -266,7 +282,7 @@ impl DockerRuntimeConfig {
             network_mode: Some("none".to_owned()),
             ..Default::default()
         };
-        ContainerCreateBody {
+        Ok(ContainerCreateBody {
             image: Some(self.image.clone()),
             user: Some("65532:65532".to_owned()),
             attach_stdout: Some(true),
@@ -282,7 +298,7 @@ impl DockerRuntimeConfig {
             stop_timeout: Some(self.limits.cancellation_grace.as_secs() as i64),
             host_config: Some(host_config),
             ..Default::default()
-        }
+        })
     }
 }
 

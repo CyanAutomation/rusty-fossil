@@ -325,6 +325,10 @@ impl DockerSupervisor {
             || launch.image_identity.as_deref() != Some(self.config.image())
             || launch.effective_policy_json != self.config.effective_policy_json()
             || launch.runtime_limit_ms != Some(self.config.limits().max_runtime.as_millis() as i64)
+            || launch.repository_url.is_some()
+            || launch.authorized_git_ref.is_some()
+            || launch.resolved_commit.is_some()
+            || launch.workspace_identity.is_some()
         {
             return Err(SupervisorError::AmbiguousContainerState);
         }
@@ -473,7 +477,12 @@ impl DockerSupervisor {
                     .build();
                 match self
                     .docker
-                    .create_container(Some(options), self.config.container_config(&launch))
+                    .create_container(
+                        Some(options),
+                        self.config
+                            .container_config(&launch)
+                            .map_err(|_| SupervisorError::AmbiguousContainerState)?,
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -1255,6 +1264,10 @@ impl ExecutionSupervisor for DockerSupervisor {
             profile_version: WORKLOAD_VERSION.to_owned(),
             effective_policy_json: self.config.effective_policy_json(),
             runtime_limit_ms: limits.max_runtime.as_millis() as i64,
+            repository_url: None,
+            authorized_git_ref: None,
+            resolved_commit: None,
+            workspace_identity: None,
         };
         #[cfg(feature = "test-support")]
         process_test_barrier("before_launch_intent_commit").await;
@@ -1276,6 +1289,7 @@ impl ExecutionSupervisor for DockerSupervisor {
             .container_launch(prepared.run_id)
             .map_err(|_| SupervisorError::StateUnavailable)?
             .ok_or(SupervisorError::AuthorizationRejected)?;
+        self.validate_launch_profile(&launch)?;
         if prepared.container_name != launch.container_name
             || prepared.worker_id != launch.worker_id.as_str()
             || prepared.claim_callback_id != launch.claim_callback_id.to_string()

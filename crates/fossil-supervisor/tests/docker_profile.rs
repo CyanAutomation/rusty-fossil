@@ -1,7 +1,7 @@
 use fossil_core::execution::SyntheticScenario;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_storage::{ContainerLaunchRecord, ContainerLaunchState, WorkloadKind};
-use fossil_supervisor::DockerRuntimeConfig;
+use fossil_supervisor::{DockerConfigError, DockerRuntimeConfig};
 use std::collections::HashMap;
 
 const IMAGE: &str = "ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -21,6 +21,10 @@ fn launch(scenario: SyntheticScenario) -> ContainerLaunchRecord {
         image_identity: Some(IMAGE.to_owned()),
         profile_version: "synthetic-v1".to_owned(),
         effective_policy_json: "{}".to_owned(),
+        repository_url: None,
+        authorized_git_ref: None,
+        resolved_commit: None,
+        workspace_identity: None,
         runtime_limit_ms: Some(900_000),
         effective_deadline_at_ms: None,
         container_name: "rusty-fossil-synth-f8a0c4c5-d628-7b93-a7cf-4b4629a28853-15870068-6723-4b70-9e9f-53b8271e032d".to_owned(),
@@ -42,7 +46,9 @@ fn launch(scenario: SyntheticScenario) -> ContainerLaunchRecord {
 #[test]
 fn synthetic_container_profile_is_fixed_and_restrictive() {
     let config = DockerRuntimeConfig::new(IMAGE, "/var/run/docker.sock").unwrap();
-    let request = config.container_config(&launch(SyntheticScenario::Success));
+    let request = config
+        .container_config(&launch(SyntheticScenario::Success))
+        .unwrap();
     assert_eq!(request.image.as_deref(), Some(IMAGE));
     assert_eq!(request.user.as_deref(), Some("65532:65532"));
     assert!(request.cmd.is_none());
@@ -83,6 +89,18 @@ fn synthetic_container_profile_is_fixed_and_restrictive() {
     assert!(host.port_bindings.is_none());
     let tmpfs: HashMap<_, _> = host.tmpfs.unwrap();
     assert_eq!(tmpfs["/tmp"], "rw,noexec,nosuid,nodev,size=16777216");
+}
+
+#[test]
+fn synthetic_docker_config_rejects_pi_coding_launch_identity() {
+    let config = DockerRuntimeConfig::new(IMAGE, "/var/run/docker.sock").unwrap();
+    let mut pi_launch = launch(SyntheticScenario::Success);
+    pi_launch.workload_kind = WorkloadKind::PiCodingV1;
+    pi_launch.profile_version = "pi-coding-v1".to_owned();
+    assert!(matches!(
+        config.container_config(&pi_launch),
+        Err(DockerConfigError::UnsupportedWorkload)
+    ));
 }
 
 #[test]
@@ -132,7 +150,8 @@ fn controlled_scenario_is_the_only_worker_input() {
     ] {
         let request = DockerRuntimeConfig::new(IMAGE, "/var/run/docker.sock")
             .unwrap()
-            .container_config(&launch(scenario));
+            .container_config(&launch(scenario))
+            .unwrap();
         assert_eq!(
             request.env.unwrap(),
             vec![format!("FOSSIL_SCENARIO={expected}")]

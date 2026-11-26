@@ -1,6 +1,6 @@
 # ADR 0012: Keep long-running coding execution policy separate from synthetic limits
 
-- Status: Coding policy proposed; schema v5 now persists the synthetic launch profile and deadline
+- Status: Coding policy proposed; schema v7 persists the synthetic launch profile/deadline and a non-executable Pi workload identity
 - Date: 2026-11-22
 
 ## Context

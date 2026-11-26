@@ -2,7 +2,8 @@
 
 **Inventory date:** 2026-11-22
 **Access method:** Termius interactive SSH; read-only inventory only
-**Result:** Raspberry Pi ARM64 Docker host confirmed; workload deployment gate not met
+**Result:** Raspberry Pi ARM64 Docker host confirmed by historical inventory; workload deployment gate not met
+**Review update:** 2026-11-26
 
 ## Host inventory
 
@@ -28,7 +29,9 @@ Storage is an SD card, so sustained write volume and endurance should be conside
 
 ## Security and feasibility
 
-The SSH terminal displayed the warning that the default password for the `pi` account had not been changed. That same account is in the `docker` group on a rootful daemon, which gives it host-root-equivalent control over containers. This is a deployment blocker for an untrusted coding workload. No password, SSH, firewall, Docker, or account settings were changed.
+The 2026-11-22 SSH terminal displayed a warning that the default password for the `pi` account had not been changed. On 2026-11-26, the host owner reported that this password has since been changed to a stronger password. Treat the old warning as a historical finding and the password issue as owner-reported remediated; it has not been independently verified from the host. No password was requested or accessed.
+
+The 2026-11-22 inventory found the interactive `pi` account in the `docker` group on a rootful daemon. That membership grants host-root-equivalent Docker control and remains a material privilege concern until rechecked. This workspace had no authorized Agentlab connection available, so current SSH key/password-authentication policy, current group membership, restricted socket access, a dedicated supervisor service identity, unrelated-container state, memory/storage headroom and clock status were not rechecked. No host settings or workloads were changed.
 
 The RAM snapshot suggests capacity may be available for a controller and one bounded worker, but it does not establish a safe Pi workload limit. Pi, repository checkout, Node, model activity and the existing containers were not measured together. The Phase 2B synthetic worker's 256 MiB limit must not be reused for Pi without measurement.
 

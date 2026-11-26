@@ -1,7 +1,7 @@
 use fossil_core::contract::{ContractVersion, OperationalEventType};
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::{CallbackDeliveryState, LifecycleError, LocalLifecycleState};
-use fossil_core::queue::{QueueEnvelope, SoyuzRunRequest};
+use fossil_core::queue::{PublishMode, QueueEnvelope, SoyuzRunRequest, TaskMode};
 use fossil_soyuz::{
     CallbackDeliveryAuthorization, ClaimAuthorization, ExecutionGateAuthorization,
     StartAuthorizationSource, StartedAuthorization,
@@ -15,11 +15,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 const MAXIMUM_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CALLBACK_PAYLOAD_BYTES: usize = 12 * 1024;
 const MAX_PENDING_CALLBACKS: u32 = 1_000;
 const MAX_EXECUTION_DESCRIPTOR_BYTES: usize = 96 * 1024;
+const TRUSTED_PI_WORKER_IMAGE: &str = "ghcr.io/cyanautomation/rusty-fossil-pi-worker";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -167,6 +168,13 @@ pub struct ContainerLaunchRecord {
     pub image_identity: Option<String>,
     pub profile_version: String,
     pub effective_policy_json: String,
+    /// Exact repository URL and ref from the authorized descriptor. These are
+    /// populated only for Pi coding launches.
+    pub repository_url: Option<String>,
+    pub authorized_git_ref: Option<String>,
+    pub resolved_commit: Option<String>,
+    /// Opaque per-run workspace identity, never a host path.
+    pub workspace_identity: Option<String>,
     pub runtime_limit_ms: Option<i64>,
     pub effective_deadline_at_ms: Option<i64>,
     pub container_name: String,
@@ -190,12 +198,14 @@ pub struct ContainerLaunchRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadKind {
     Synthetic,
+    PiCodingV1,
 }
 
 impl WorkloadKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Synthetic => "synthetic",
+            Self::PiCodingV1 => "pi_coding_v1",
         }
     }
 }
@@ -208,6 +218,10 @@ pub struct ContainerLaunchProfile {
     pub profile_version: String,
     pub effective_policy_json: String,
     pub runtime_limit_ms: i64,
+    pub repository_url: Option<String>,
+    pub authorized_git_ref: Option<String>,
+    pub resolved_commit: Option<String>,
+    pub workspace_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -885,6 +899,25 @@ impl SqliteStore {
                 PRAGMA user_version = 6;",
             )?;
             transaction.commit()?;
+            return Self::migrate(connection);
+        }
+
+        if version == 6 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                "ALTER TABLE container_launches ADD COLUMN repository_url TEXT;
+                ALTER TABLE container_launches ADD COLUMN authorized_git_ref TEXT;
+                ALTER TABLE container_launches ADD COLUMN resolved_commit TEXT;
+                ALTER TABLE container_launches ADD COLUMN workspace_identity TEXT;
+                CREATE UNIQUE INDEX container_launches_workspace_identity_idx
+                    ON container_launches(workspace_identity)
+                    WHERE workspace_identity IS NOT NULL;
+
+                INSERT INTO schema_migrations(version, applied_at_ms) VALUES (7, 0);
+                PRAGMA user_version = 7;",
+            )?;
+            transaction.commit()?;
             return Ok(());
         }
 
@@ -1538,9 +1571,41 @@ impl SqliteStore {
         profile: ContainerLaunchProfile,
         authorization: ExecutionGateAuthorization,
     ) -> Result<ContainerLaunchRecord, StoreError> {
-        if profile.workload_kind != WorkloadKind::Synthetic
+        let kind_is_valid = match profile.workload_kind {
+            WorkloadKind::Synthetic => {
+                profile.profile_version == "synthetic-v1"
+                    && profile.repository_url.is_none()
+                    && profile.authorized_git_ref.is_none()
+                    && profile.resolved_commit.is_none()
+                    && profile.workspace_identity.is_none()
+            }
+            WorkloadKind::PiCodingV1 => {
+                // The v3 launch table requires a synthetic scenario value.
+                // Success is only a neutral compatibility sentinel here; the
+                // Docker supervisor rejects Pi records before interpreting it.
+                profile.profile_version == "pi-coding-v1"
+                    && scenario == fossil_core::execution::SyntheticScenario::Success
+                    && is_pinned_pi_worker_image(&profile.image_identity)
+                    && profile
+                        .repository_url
+                        .as_deref()
+                        .is_some_and(valid_repository_url)
+                    && profile
+                        .authorized_git_ref
+                        .as_deref()
+                        .is_some_and(valid_authorized_git_ref)
+                    && profile
+                        .resolved_commit
+                        .as_deref()
+                        .is_some_and(valid_resolved_commit)
+                    && profile
+                        .workspace_identity
+                        .as_deref()
+                        .is_some_and(valid_workspace_identity)
+            }
+        };
+        if !kind_is_valid
             || profile.workload_version != 1
-            || profile.profile_version != "synthetic-v1"
             || profile.image_identity.is_empty()
             || profile.image_identity.len() > 512
             || profile
@@ -1592,6 +1657,10 @@ impl SqliteStore {
                 || existing.profile_version != profile.profile_version
                 || existing.effective_policy_json != profile.effective_policy_json
                 || existing.runtime_limit_ms != Some(profile.runtime_limit_ms)
+                || existing.repository_url != profile.repository_url
+                || existing.authorized_git_ref != profile.authorized_git_ref
+                || existing.resolved_commit != profile.resolved_commit
+                || existing.workspace_identity != profile.workspace_identity
             {
                 return Err(StoreError::ContainerLaunchIdentityConflict);
             }
@@ -1620,6 +1689,19 @@ impl SqliteStore {
         if descriptor.run_id != run_id || !descriptor.validate() {
             return Err(StoreError::InvalidExecutionDescriptor);
         }
+        if profile.workload_kind == WorkloadKind::PiCodingV1 {
+            let request = &descriptor.request;
+            let canonical_timeout_ms = i64::from(request.timeout_seconds.unwrap_or(7_200)) * 1_000;
+            if request.task_mode != TaskMode::Patch
+                || request.publish_mode != PublishMode::None
+                || profile.repository_url.as_deref() != Some(request.repo_url.as_str())
+                || profile.authorized_git_ref.as_deref() != Some(request.git_ref.as_str())
+                || profile.runtime_limit_ms > canonical_timeout_ms
+                || profile.runtime_limit_ms > 10_800_000
+            {
+                return Err(StoreError::InvalidContainerLaunchResult);
+            }
+        }
 
         let other_launch: Option<String> = transaction
             .query_row(
@@ -1633,16 +1715,21 @@ impl SqliteStore {
             return Err(StoreError::ExecutionSlotOccupied);
         }
 
-        let container_name = stable_container_name(run_id, authorization.start_callback_id());
+        let container_name = stable_container_name(
+            run_id,
+            authorization.start_callback_id(),
+            profile.workload_kind,
+        );
         let now = now_ms();
         transaction.execute(
             "INSERT INTO container_launches (
                 run_id, worker_id, claim_callback_id, start_callback_id, scenario,
                 container_name, state, created_at_ms, updated_at_ms, workload_kind,
                 workload_version, image_identity, profile_version, effective_policy_json,
-                runtime_limit_ms
+                runtime_limit_ms, repository_url, authorized_git_ref, resolved_commit,
+                workspace_identity
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'launch_intent_persisted', ?7, ?7,
-                       ?8, ?9, ?10, ?11, ?12, ?13)",
+                       ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 run_id.to_string(),
                 run.worker_id.as_str(),
@@ -1657,6 +1744,10 @@ impl SqliteStore {
                 profile.profile_version,
                 profile.effective_policy_json,
                 profile.runtime_limit_ms,
+                profile.repository_url,
+                profile.authorized_git_ref,
+                profile.resolved_commit,
+                profile.workspace_identity,
             ],
         )?;
         let launch = load_container_launch(&transaction, run_id)?;
@@ -2839,7 +2930,8 @@ fn load_container_launch_optional(
                     stop_reason, stop_requested_at_ms, started_at_ms, completed_at_ms,
                     updated_at_ms, workload_kind, workload_version, image_identity,
                     profile_version, runtime_limit_ms, effective_deadline_at_ms,
-                    effective_policy_json
+                    effective_policy_json, repository_url, authorized_git_ref,
+                    resolved_commit, workspace_identity
              FROM container_launches WHERE run_id = ?1",
             [run_id.to_string()],
             |row| {
@@ -2868,6 +2960,10 @@ fn load_container_launch_optional(
                     row.get::<_, Option<i64>>(21)?,
                     row.get::<_, Option<i64>>(22)?,
                     row.get::<_, String>(23)?,
+                    row.get::<_, Option<String>>(24)?,
+                    row.get::<_, Option<String>>(25)?,
+                    row.get::<_, Option<String>>(26)?,
+                    row.get::<_, Option<String>>(27)?,
                 ))
             },
         )
@@ -2898,6 +2994,10 @@ fn load_container_launch_optional(
             runtime_limit_ms,
             effective_deadline_at_ms,
             effective_policy_json,
+            repository_url,
+            authorized_git_ref,
+            resolved_commit,
+            workspace_identity,
         )| {
             let workload_version = u32::try_from(workload_version)
                 .map_err(|_| StoreError::InvalidStoredValue("workload version"))?;
@@ -2915,6 +3015,10 @@ fn load_container_launch_optional(
                 image_identity,
                 profile_version,
                 effective_policy_json,
+                repository_url,
+                authorized_git_ref,
+                resolved_commit,
+                workspace_identity,
                 runtime_limit_ms,
                 effective_deadline_at_ms,
                 container_name,
@@ -2944,8 +3048,87 @@ fn load_container_launch_optional(
 fn parse_workload_kind(value: &str) -> Result<WorkloadKind, StoreError> {
     match value {
         "synthetic" => Ok(WorkloadKind::Synthetic),
+        "pi_coding_v1" => Ok(WorkloadKind::PiCodingV1),
         _ => Err(StoreError::InvalidStoredValue("container workload kind")),
     }
+}
+
+fn valid_repository_url(value: &str) -> bool {
+    // This canonical-format check is not a repository allowlist or an egress
+    // control. The not-yet-enabled repository preparer must enforce both.
+    if value.len() > 2_048 || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.port_or_known_default() == Some(443)
+        && host.parse::<std::net::IpAddr>().is_err()
+        && !host.eq_ignore_ascii_case("localhost")
+        && !host.to_ascii_lowercase().ends_with(".localhost")
+        && !host.to_ascii_lowercase().ends_with(".local")
+        && url.as_str() == value
+}
+
+fn valid_authorized_git_ref(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 512
+        || value.starts_with('-')
+        || value == "@"
+        || value.contains("..")
+        || value.contains("@{")
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("//")
+    {
+        return false;
+    }
+    value.split('/').all(|component| {
+        !component.is_empty()
+            && !component.starts_with('.')
+            && !component.to_ascii_lowercase().ends_with(".lock")
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    })
+}
+
+fn valid_resolved_commit(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_workspace_identity(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("wsp_") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid
+            .parse::<uuid::Uuid>()
+            .is_ok_and(|parsed| parsed.to_string() == uuid)
+}
+
+fn is_sha256_digest(digest: Option<&str>) -> bool {
+    digest.is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn is_pinned_pi_worker_image(image: &str) -> bool {
+    let Some((repository, digest)) = image.split_once("@sha256:") else {
+        return false;
+    };
+    repository == TRUSTED_PI_WORKER_IMAGE && is_sha256_digest(Some(digest))
 }
 
 fn parse_synthetic_scenario(
@@ -2964,8 +3147,16 @@ fn parse_synthetic_scenario(
     }
 }
 
-fn stable_container_name(run_id: RunId, start_callback_id: EventId) -> String {
-    format!("rusty-fossil-synth-{run_id}-{start_callback_id}")
+fn stable_container_name(
+    run_id: RunId,
+    start_callback_id: EventId,
+    workload_kind: WorkloadKind,
+) -> String {
+    let workload_prefix = match workload_kind {
+        WorkloadKind::Synthetic => "synth",
+        WorkloadKind::PiCodingV1 => "pi",
+    };
+    format!("rusty-fossil-{workload_prefix}-{run_id}-{start_callback_id}")
 }
 
 fn parse_callback_delivery(value: &str) -> Result<CallbackDeliveryState, StoreError> {
