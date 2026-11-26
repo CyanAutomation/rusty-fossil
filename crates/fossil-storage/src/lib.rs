@@ -3150,7 +3150,10 @@ fn valid_workspace_identity(value: &str) -> bool {
 
 fn is_sha256_digest(digest: Option<&str>) -> bool {
     digest.is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     })
 }
 

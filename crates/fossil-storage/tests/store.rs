@@ -809,6 +809,11 @@ async fn pi_launch_rejects_nonpilot_descriptor_and_mismatched_git_identity() {
     bad_repository.repository_url = Some("https://user:secret@example.com/repo".to_owned());
     let mut bad_image = pi_launch_profile(7_200_000);
     bad_image.image_identity = format!("docker.io/untrusted/pi-worker@sha256:{}", "c".repeat(64));
+    let mut noncanonical_image_digest = pi_launch_profile(7_200_000);
+    noncanonical_image_digest.image_identity = format!(
+        "ghcr.io/cyanautomation/rusty-fossil-pi-worker@sha256:{}",
+        "C".repeat(64)
+    );
     let too_long_for_soyuz = pi_launch_profile(7_200_001);
 
     for profile in [
@@ -817,6 +822,7 @@ async fn pi_launch_rejects_nonpilot_descriptor_and_mismatched_git_identity() {
         bad_workspace,
         bad_repository,
         bad_image,
+        noncanonical_image_digest,
         too_long_for_soyuz,
     ] {
         assert!(matches!(
