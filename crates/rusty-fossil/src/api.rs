@@ -149,10 +149,6 @@ async fn docs_script() -> Response {
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                DOCS_CONTENT_SECURITY_POLICY,
-            ),
         ],
         DOCS_SCRIPT,
     )

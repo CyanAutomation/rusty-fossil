@@ -434,6 +434,16 @@ async fn docs_page_is_local_and_serves_its_typescript_compiled_asset() {
             .unwrap()
             .starts_with("text/javascript; charset=utf-8")
     );
+    assert!(
+        !script
+            .headers()
+            .contains_key(axum::http::header::CONTENT_SECURITY_POLICY),
+        "CSP belongs on the HTML document, not the JavaScript response"
+    );
+    assert_eq!(
+        script.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
     let script = script.into_body().collect().await.unwrap().to_bytes();
     let script = std::str::from_utf8(&script).unwrap();
     assert!(script.contains("fetch("));
