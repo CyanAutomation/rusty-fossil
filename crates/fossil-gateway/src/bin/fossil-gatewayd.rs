@@ -1,0 +1,181 @@
+use fossil_gateway::{
+    DEFAULT_BIND_ADDRESS, GatewayBroker, GatewayEndpoint, GatewayRequestLedger,
+    GatewayRequestLimits, GatewayTokenSigner,
+};
+use secrecy::SecretString;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use tokio::net::TcpListener;
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
+    let endpoint = GatewayEndpoint::parse(&required("FOSSIL_GATEWAY_ENDPOINT")?)?;
+    let model = required("FOSSIL_GATEWAY_MODEL")?;
+    let gateway_auth_token = read_secret_file("FOSSIL_GATEWAY_AUTH_TOKEN_FILE", 32, 4096)?;
+    let signing_key = read_secret_file("FOSSIL_GATEWAY_SIGNING_KEY_FILE", 32, 512)?;
+    let ledger_path = PathBuf::from(
+        std::env::var_os("FOSSIL_GATEWAY_LEDGER_PATH")
+            .unwrap_or_else(|| "/var/lib/fossil-gateway/ledger.sqlite3".into()),
+    );
+    if !ledger_path.is_absolute() {
+        return Err("FOSSIL_GATEWAY_LEDGER_PATH must be absolute".into());
+    }
+    let limits = GatewayRequestLimits::new(
+        optional_u32("FOSSIL_GATEWAY_MAX_REQUESTS_PER_RUN", 64)?,
+        optional_u64("FOSSIL_GATEWAY_MAX_REQUEST_BYTES_PER_RUN", 16 * 1024 * 1024)?,
+        optional_u32("FOSSIL_GATEWAY_MAX_OUTPUT_TOKENS", 4096)?,
+    )?;
+    let bind: SocketAddr = std::env::var("FOSSIL_GATEWAY_BIND")
+        .unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned())
+        .parse()?;
+
+    let ledger = GatewayRequestLedger::open(&ledger_path)?;
+    let signer = GatewayTokenSigner::new(signing_key)?;
+    let broker = std::sync::Arc::new(GatewayBroker::new(
+        endpoint,
+        model,
+        gateway_auth_token,
+        signer,
+        ledger,
+        limits,
+    )?);
+    let listener = TcpListener::bind(bind).await?;
+    tracing::info!(address = %bind, "restricted model gateway broker listening");
+    axum::serve(listener, broker.router())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+fn required(name: &'static str) -> Result<String, Box<dyn std::error::Error>> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("missing required configuration {name}").into())
+}
+
+fn optional_u64(name: &'static str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be an integer").into()),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} must be valid Unicode").into())
+        }
+    }
+}
+
+fn optional_u32(name: &'static str, default: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    let value = optional_u64(name, u64::from(default))?;
+    u32::try_from(value).map_err(|_| format!("{name} is too large").into())
+}
+
+fn read_secret_file(
+    variable: &'static str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<SecretString, Box<dyn std::error::Error>> {
+    let path = PathBuf::from(required(variable)?);
+    read_private_secret_file(&path, variable, minimum, maximum)
+}
+
+fn read_private_secret_file(
+    path: &std::path::Path,
+    variable: &'static str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<SecretString, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs::OpenOptions, io::Read};
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > maximum as u64
+    {
+        return Err(format!("{variable} must reference a private regular file").into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(format!("{variable} contains an invalid secret").into());
+    }
+    let mut value = String::from_utf8(bytes)?;
+    while value.ends_with('\n') || value.ends_with('\r') {
+        value.pop();
+    }
+    if !(minimum..=maximum).contains(&value.len())
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(format!("{variable} contains an invalid secret").into());
+    }
+    Ok(SecretString::from(value))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("register SIGTERM handler");
+        signal.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_private_secret_file;
+    use secrecy::ExposeSecret;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn reads_only_bounded_private_regular_secret_files_without_following_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secret");
+        std::fs::write(&path, "secret-value-0123456789abcdef0123\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let secret = read_private_secret_file(&path, "TEST_SECRET", 32, 64).unwrap();
+        assert_eq!(secret.expose_secret(), "secret-value-0123456789abcdef0123");
+
+        let public = directory.path().join("public");
+        std::fs::write(&public, "secret-value-0123456789abcdef0123").unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(read_private_secret_file(&public, "TEST_SECRET", 32, 64).is_err());
+
+        let target = directory.path().join("target");
+        std::fs::write(&target, "secret-value-0123456789abcdef0123").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_private_secret_file(&link, "TEST_SECRET", 32, 64).is_err());
+
+        let oversized = directory.path().join("oversized");
+        std::fs::write(&oversized, "x".repeat(65)).unwrap();
+        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(read_private_secret_file(&oversized, "TEST_SECRET", 32, 64).is_err());
+    }
+}

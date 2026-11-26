@@ -5,9 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   MAX_TASK_PROMPT_BYTES,
+  GATEWAY_TOKEN_PATH,
   TASK_PROMPT_PATH,
+  buildPiModelsConfig,
   buildPiInvocation,
   parseTaskPrompt,
+  readGatewayTokenFile,
   readTaskPromptFile,
 } from "./worker.mjs";
 
@@ -62,6 +65,71 @@ test("rejects oversized, empty, invalid UTF-8, and symlink payload files", async
   await assert.rejects(readTaskPromptFile(promptPath));
 });
 
+test("reads a bounded run-scoped gateway token from an immutable payload file", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "rusty-fossil-pi-gateway-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const tokenPath = join(directory, "gateway-token.txt");
+  const token = "run-token-" + "a".repeat(48);
+  await writeFile(tokenPath, token, { mode: 0o400 });
+
+  assert.equal(GATEWAY_TOKEN_PATH, "/run/fossil/gateway-token");
+  assert.equal(await readGatewayTokenFile(tokenPath), token);
+});
+
+test("rejects writable, oversized, malformed, empty, and symlink gateway tokens", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "rusty-fossil-pi-gateway-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const tokenPath = join(directory, "gateway-token.txt");
+
+  await writeFile(tokenPath, "run-token-" + "a".repeat(48), { mode: 0o600 });
+  await assert.rejects(readGatewayTokenFile(tokenPath), /invalid gateway token/);
+  await writeFile(tokenPath, "run-token-" + "a".repeat(600), { mode: 0o444 });
+  await assert.rejects(readGatewayTokenFile(tokenPath), /invalid gateway token/);
+  await writeFile(tokenPath, "run-token-" + "a".repeat(47) + "!", { mode: 0o444 });
+  await assert.rejects(readGatewayTokenFile(tokenPath), /invalid gateway token/);
+  await writeFile(tokenPath, "", { mode: 0o444 });
+  await assert.rejects(readGatewayTokenFile(tokenPath), /invalid gateway token/);
+
+  const targetPath = join(directory, "target.txt");
+  await writeFile(targetPath, "run-token-" + "a".repeat(48), { mode: 0o444 });
+  await rm(tokenPath);
+  await symlink(targetPath, tokenPath);
+  await assert.rejects(readGatewayTokenFile(tokenPath));
+});
+
+test("writes a static OpenAI-compatible Pi model behind the fixed broker", () => {
+  const model = "workers-ai/@cf/meta/disposable-test-model";
+  const token = "run-token-" + "a".repeat(48);
+  const cost = { input: 0.25, output: 1.5, cacheRead: 0.05, cacheWrite: 0.1 };
+  assert.deepEqual(buildPiModelsConfig(model, token, cost), {
+    providers: {
+      "fossil-gateway": {
+        baseUrl: "http://fossil-gateway:8787/v1",
+        apiKey: token,
+        authHeader: true,
+        api: "openai-completions",
+        models: [
+          {
+            id: model,
+            name: model,
+            reasoning: false,
+            input: ["text"],
+            cost,
+            contextWindow: 32768,
+            maxTokens: 4096,
+          },
+        ],
+      },
+    },
+  });
+  assert.throws(() => buildPiModelsConfig(model, "short", cost), /invalid gateway token/);
+  assert.throws(() => buildPiModelsConfig(model, token), /invalid model pricing/);
+  assert.throws(
+    () => buildPiModelsConfig(model, token, { ...cost, output: Number.POSITIVE_INFINITY }),
+    /invalid model pricing/,
+  );
+});
+
 test("builds a fixed Pi JSON-mode invocation without a shell or prompt argument", () => {
   const invocation = buildPiInvocation("gateway/disposable-test-model");
   assert.equal(invocation.file, "/opt/pi/node_modules/.bin/pi");
@@ -75,6 +143,8 @@ test("builds a fixed Pi JSON-mode invocation without a shell or prompt argument"
     "--no-context-files",
     "--tools",
     "read,bash,edit,write",
+    "--provider",
+    "fossil-gateway",
     "--model",
     "gateway/disposable-test-model",
   ]);
@@ -122,6 +192,7 @@ test("pins a multiarch Node image and runs the worker without root", async () =>
   assert.match(dockerfile, /ca-certificates git/);
   assert.match(dockerfile, /mkdir -p [^\n]*\/run\/fossil/);
   assert.match(dockerfile, /touch \/run\/fossil\/task-prompt\.txt/);
+  assert.match(dockerfile, /\/run\/fossil\/gateway-token/);
   assert.match(dockerfile, /chown -R 65532:65532 [^\n]*\/run\/fossil/);
   assert.doesNotMatch(dockerfile, /\bnode:latest\b/);
 });

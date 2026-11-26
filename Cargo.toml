@@ -7,6 +7,7 @@ members = [
     "crates/fossil-queue",
     "crates/fossil-supervisor",
     "crates/fossil-workspace",
+    "crates/fossil-gateway",
     "crates/fossil-synthetic-worker",
     "crates/rusty-fossil",
 ]
@@ -30,7 +31,9 @@ fossil-storage = { path = "crates/fossil-storage" }
 fossil-supervisor = { path = "crates/fossil-supervisor" }
 bollard = { version = "=0.21.1", default-features = false, features = ["http", "pipe"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ring = "0.17"
 rusqlite = { version = "0.43", features = ["bundled"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

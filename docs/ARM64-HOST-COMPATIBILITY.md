@@ -1,44 +1,33 @@
-# ARM64 host compatibility report
+# ARM64 host compatibility reference
 
-**Latest check:** 2026-11-26
-**Host alias:** Agentlab
-**Access:** Existing Termius SSH connection; read-only checks
+**Updated:** 2026-11-26
+**Scope:** Representative Raspberry Pi host profile; host identity and access details are omitted
 **Disposition:** Pi coding-worker deployment remains gated
 
-## Verified host state
+## Representative platform
 
-| Property | Observation |
+The following characteristics describe a representative Raspberry Pi 4-class test host. They are useful for planning the ARM64 worker, but do not certify any particular deployment or establish safe sustained workload limits.
+
+| Property | Representative observation |
 | --- | --- |
-| Hardware and architecture | Raspberry Pi 4 Model B Rev 1.5; ARM64 (`aarch64`) |
-| Operating system | Debian 13; Linux `6.18.50+rpt-rpi-v8` |
-| Docker | Engine 29.9.2; rootful; cgroup v2; `overlayfs`; built-in seccomp profile reported; Docker Compose v5.6.1 |
-| Docker socket | `/run/docker.sock`, mode `0660`, owned by `root:docker` |
-| Interactive account | `pi` UID 1000, primary GID 1000; member of Docker GID 985 and able to use the rootful daemon |
-| Dedicated Rusty-Fossil account | Absent; the owner expects Rusty-Fossil to run as `pi` |
-| Memory | 3.71 GiB total; 3.20 GiB available at the check |
-| Swap | 2.00 GiB total and free at the check |
-| Root filesystem | 58.0 GiB total; 33.3 GiB available at the check (filesystem block counts) |
-| Running containers | Three healthy containers observed; the earlier inventory recorded two |
-| Clock | `timedatectl` reported synchronized |
+| Hardware | Raspberry Pi 4 Model B class; ARM64 (`aarch64`), four Cortex-A72 cores |
+| Operating system | Debian 13 class Linux |
+| Container runtime | Docker Engine 29.x; rootful daemon; cgroup v2; `overlayfs`; built-in seccomp support reported |
+| Memory | Approximately 4 GiB |
+| Storage | Approximately 60 GiB SD-backed root storage |
+| Existing workloads | Other host workloads may be present; reserve capacity before a pilot |
+| Clock | Synchronized during the inventory |
 
-The container count differs from the earlier inventory. The running services were not changed. These point-in-time measurements do not establish safe sustained memory, CPU, storage-write, or thermal limits for a Pi coding task.
+Exact kernel, daemon patch, capacity readings, host/account identifiers, access method, network details, and provider-account configuration are intentionally excluded. These values are indicative and must be rechecked on the target host before deployment.
 
-## SSH and credential status
+## Security and readiness
 
-An SSH session through the saved Termius connection succeeded as `pi`. This confirms that the configured connection works; it does not establish whether this session used a password, key, certificate, or another method. The standard `/home/pi/.ssh/authorized_keys` file was absent. Reading the effective `sshd -T` configuration failed because the `pi` account could not read `/etc/ssh/sshd_config.d/50-cloud-init.conf`; password authentication and other key sources therefore remain unverified.
+A read-only remote session was established for the inventory, but its authentication method and effective SSH policy were not established. No credentials were requested or accessed. Host-specific account membership and Docker socket permissions are omitted from this repository report.
 
-The host owner reports that the previous default password was changed. This is recorded as owner-reported remediation. No password or credential was requested, read, printed, or stored.
+The observed Docker daemon is rootful. Treat Docker access as host-level authority. A dedicated supervisor identity and restricted socket boundary must be provisioned and verified by an operator before running a shell-capable coding worker. Do not infer that a container-level mount split limits the authority of an interactive account or of the trusted supervisor.
 
-## Rusty-Fossil service identity
+No repository checkout or model inference was performed. The repository-preparation library is not wired into the supervisor. The broker prototype is not integrated, has no dollar-spend ceiling, and has not been tested against a live provider or host egress policy. No Pi workload, cancellation, restart, callback, cleanup, or under-load resource test was run.
 
-Rusty-Fossil is expected to run as `pi`; the Compose configuration maps both containers to UID/GID 1000:1000 on the current host. Only the supervisor receives the Docker socket bind and numeric Docker group 985. The controller has no socket bind or Docker group. The Compose files do not provision an account or change host group membership and have not been installed or verified on Agentlab.
+## Deployment gate
 
-The interactive `pi` account still has rootful Docker authority. The container split hides the socket mount from the controller process; it does not reduce the authority of an interactive `pi` shell or the trusted supervisor. Before starting the Compose stack, an operator must verify that Docker does not listen on a TCP socket and that the controller container cannot reach another Engine endpoint. No Compose container was created or started during this inventory.
-
-## Repository and model access
-
-`fossil-workspace` has a fixed pilot repository policy and bounded Git transport, but it has not fetched or checked out the repository and is not wired into the supervisor. A read-only Cloudflare account metadata check found one existing default AI Gateway with authentication enabled, request logging enabled, a 50-request/60-second rate limit, and spend limits disabled. It is not designated for non-production worker use and was not used for inference. No credential values were read, and no account configuration was changed. No broker, non-production inference credential, or enforced worker egress policy was verified.
-
-## Host changes
-
-None. Only read-only inventory commands were run, including checking the account and group IDs and Compose CLI version. No accounts, SSH settings, firewall rules, Docker settings, images, containers, volumes, networks, files, or credentials were changed.
+Keep Pi execution disabled until the supervisor integration, repository and workspace isolation, broker token lifecycle, cost controls, enforced egress, cancellation/recovery tests, and operator-reviewed host boundary are complete. The representative hardware profile and ARM64 builds are not native task validation. No host configuration or unrelated workload was changed during the read-only inventory.
