@@ -24,7 +24,7 @@ RUN apt-get update \
     && mkdir -p /opt/worker /workspace /tmp/pi-home /tmp/pi-agent /run/fossil \
     && touch /run/fossil/task-prompt.txt \
     && chmod 0444 /run/fossil/task-prompt.txt \
-    && chown -R 65532:65532 /workspace /tmp/pi-home /tmp/pi-agent
+    && chown -R 65532:65532 /workspace /tmp/pi-home /tmp/pi-agent /run/fossil
 
 WORKDIR /workspace
 COPY --from=dependencies --chown=65532:65532 /opt/pi/node_modules /opt/pi/node_modules
