@@ -72,7 +72,7 @@ The implementation persists claim and start callback IDs before the correspondin
 
 ## Host service identity and Docker access
 
-Agentlab's owner expects both Rusty-Fossil services to run as the existing `pi` user. The [systemd examples](../deploy/systemd/) give the Docker group to `fossil-supervisord` and mask `/run/docker.sock` inside the controller service. The host `pi` account remains in the rootful Docker group, so an interactive `pi` shell and the trusted supervisor retain Docker authority. The controller boundary depends on the service mount namespace and on Docker not exposing a TCP API. The example units have not been installed or tested on Agentlab; this documents the intended process boundary, not verified host enforcement.
+Agentlab's owner expects both Rusty-Fossil containers to run with the existing `pi` UID/GID. The [Docker Compose definition](../docker-compose.yml) adds the Docker group and mounts `/run/docker.sock` only into `fossil-supervisord`; the controller container receives neither. The host `pi` account remains in the rootful Docker group, so an interactive `pi` shell and the trusted supervisor retain Docker authority. The controller also uses an internal Compose network, and the Docker daemon must not expose an alternate TCP API. This Compose configuration has not been deployed or tested on Agentlab; it documents the intended container boundary, not verified host enforcement.
 
 ## Startup and periodic recovery
 

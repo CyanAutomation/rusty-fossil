@@ -12,23 +12,42 @@ Phase 2B is a synthetic-only execution capability. It does not consume Queue mes
 
 The Docker Engine socket grants substantial host authority. Give access only to the dedicated supervisor account. Membership in the rootful `docker` group is effectively root-equivalent; protect the host and that account accordingly. A rootless Docker socket reduces daemon privilege but still grants the supervisor control of that user's containers and files; use a dedicated account and verify its cgroup limits. Do not mount the Docker socket into the controller container.
 
-Agentlab is a host-specific exception to the separate-account recommendation: its owner expects both services to run as `pi`. The proposed systemd controller unit masks the Docker socket in its mount namespace while the supervisor receives socket access. This is process confinement under a shared Unix identity, not service-account separation; interactive `pi` remains rootful-Docker capable. The unit files are not installed or verified. See the [Agentlab deployment notes](PHASE-2C-A-OPERATIONS.md#running-the-host-services-as-pi).
+Agentlab is a host-specific exception to the separate-account recommendation: its owner expects both containers to run with the existing `pi` UID/GID. The root Compose file bind-mounts the Docker socket only into `fossil-supervisord` and adds only that container to the Docker socket's numeric group. This is process confinement under a shared Unix identity, not service-account separation; interactive `pi` remains rootful-Docker capable. The Compose stack has not been deployed or verified on Agentlab. See the [Agentlab deployment notes](PHASE-2C-A-OPERATIONS.md#running-the-docker-compose-stack-as-pi).
 
 The callback outbox is capped at 1,000 pending or blocked rows. Intake already stops at 999. SQLite also enforces the reserved slot during callback insertion: heartbeat and other optional event callbacks at 999 return a capacity-suppressed result, which increments a supervisor counter and does not stop the workload. An admitted active run can persist its mandatory terminal callback as row 1,000. The local recovery journal has an absolute 90-day expiry from canonical Soyuz queue creation; callback payloads and execution descriptors are removed at expiry and cannot be recreated by delayed Queue replay. Until then, callback rows are not deleted to recover capacity. Restore callback delivery or resolve blocked entries through the approved operator process.
 
-The image runs as UID/GID 65532 with a read-only root filesystem, no network, no capabilities, no-new-privileges, default seccomp, no host namespaces, ports, devices, bind mounts or volumes, one bounded `/tmp` tmpfs, capped JSON logs, and no automatic restart. Default limits are 500 millicores, 256 MiB memory with no swap, 32 PIDs, 16 MiB tmpfs, 15 minutes, 5 seconds graceful stop, 30 seconds Soyuz-outage grace and 64 KiB captured output. `SupervisorLimits` validates any overrides within the supported hard bounds; a Docker host without required cgroup controls is rejected before the socket is served. The maximum normal runtime remains far below the 90-day persistence deadline.
+The disposable synthetic worker runs as UID/GID 65532 with a read-only root filesystem, no network, no capabilities, no-new-privileges, default seccomp, no host namespaces, ports, devices, bind mounts or volumes, one bounded `/tmp` tmpfs, capped JSON logs, and no automatic restart. Default worker limits are 500 millicores, 256 MiB memory with no swap, 32 PIDs, 16 MiB tmpfs, 15 minutes, 5 seconds graceful stop, 30 seconds Soyuz-outage grace and 64 KiB captured output. `SupervisorLimits` validates any overrides within the supported hard bounds; a Docker host without required cgroup controls is rejected before the socket is served. The maximum normal runtime remains far below the 90-day persistence deadline.
 
 Docker references: [Engine API](https://docs.docker.com/reference/api/engine/), [SDK guidance](https://docs.docker.com/reference/api/engine/sdk/), [Engine security](https://docs.docker.com/engine/security/), [container run controls](https://docs.docker.com/engine/containers/run/) and [rootless mode](https://docs.docker.com/engine/security/rootless/).
 
-## Configure and start
+## Configure and start with Compose
 
-Copy [`fossil-supervisord.env.example`](../fossil-supervisord.env.example) to a root-managed configuration directory and replace the placeholder image digest, worker ID, Soyuz origin and secret-file paths. Obtain the worker token through the existing authorized Soyuz process; do not reuse the Cloudflare or Senku token. Set the image digest only after the image is built and inspected for the host architecture.
+Copy `.env.example` to `.env`. Set the numeric host UID/GID for `pi`, the Docker socket's numeric group ID, the private state/runtime paths, Soyuz worker ID and API origin, and the digest of the trusted fixed synthetic worker image. The image must be available locally under that exact digest before startup; the supervisor never pulls it. Obtain the worker token through the authorized Soyuz process, do not reuse the Cloudflare or Senku token, and do not place secret contents in `.env`.
 
-Create the private state and runtime directories for the dedicated service account, then install the environment file so only that account and root can read it. Set up `FOSSIL_SUPERVISOR_STATE_DB` to the exact `fossil.sqlite3` file used by the controller. Start the `fossil-supervisord` executable under a service manager with restart-on-failure, SIGTERM forwarding, a finite stop timeout above the container grace period, and no Docker socket access for the controller service. `fossil-supervisord` checks configuration, the API version and host resource controls before creating its private socket.
+Create the host directories and secret files with owner `pi:pi` and the required modes, then validate and start the stack:
 
-When stopping or upgrading the supervisor, send SIGTERM through the service manager. It stops accepting IPC, persists an `execution_uncertain` stop intent for any in-flight launch, waits for the exact container to stop and clean up, and exits after the active work drains. If Docker or the state store is unavailable and it cannot finish within 60 seconds, it exits with an error while retaining the durable stop intent; restart the service after the dependency is restored. A service restart may resume only a persisted, identifiable launch; ambiguous create/start state remains fenced for review. Do not delete the SQLite file or Docker state as a shutdown shortcut.
+```sh
+sudo install -d -o pi -g pi -m 0700 /var/lib/rusty-fossil /var/lib/rusty-fossil/run
+install -d -m 0700 secrets
+# Copy the authorized Soyuz worker token into secrets/soyuz_worker_api_token.
+umask 077
+openssl rand -hex 32 > secrets/fossil_supervisor_ipc_token
+chmod 0400 secrets/soyuz_worker_api_token secrets/fossil_supervisor_ipc_token
+sudo chown pi:pi secrets/soyuz_worker_api_token secrets/fossil_supervisor_ipc_token
+docker compose config --quiet
+# Replace this placeholder with the digest configured in .env.
+docker pull ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:REPLACE_WITH_64_HEX_DIGEST
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs -f rusty-fossil fossil-supervisord
+```
 
-The included env file is a configuration example, not a complete service-manager policy. Provision runtime directories, file ownership, credentials and socket permissions through the host's existing secret and service-management system.
+The Compose stack points `FOSSIL_SUPERVISOR_STATE_DB` to the exact `fossil.sqlite3` file used by the controller. It applies restart policies, forwards SIGTERM, gives the supervisor a 90-second stop window and mounts the Docker socket only into that container. `fossil-supervisord` checks configuration, the API version and host resource controls before creating its private socket. The controller diagnostics endpoint is published on host loopback only.
+
+When stopping or upgrading the supervisor, use `docker compose stop -t 90 fossil-supervisord`. It stops accepting IPC, persists an `execution_uncertain` stop intent for any in-flight launch, waits for the exact container to stop and clean up, and exits after the active work drains. If Docker or the state store is unavailable and it cannot finish within 60 seconds, it exits with an error while retaining the durable stop intent; restore the dependency and run `docker compose up -d fossil-supervisord`. A container restart may resume only a persisted, identifiable launch; ambiguous create/start state remains fenced for review. Do not delete the SQLite file or Docker state as a shutdown shortcut.
+
+The Compose supervisor network permits outbound connectivity required for the Soyuz API client. It is not an egress allowlist for future coding workers. Per-run workers created by the current synthetic-only supervisor use their own restricted Docker profile and no network; the Pi worker has not been admitted. `docker compose down` removes this project's containers and network but preserves the bind-mounted SQLite state and secret files. Keep secrets out of source control and back up the state directory before upgrades.
 
 ## Run the Docker integration suite
 

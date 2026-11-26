@@ -1,32 +1,114 @@
+x-runtime-image: &runtime-image
+  image: ${RUSTY_FOSSIL_IMAGE:-rusty-fossil:local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+
 services:
   rusty-fossil:
-    build: .
+    <<: *runtime-image
+    user: "${RUSTY_FOSSIL_UID:?Set the host UID for the pi account}:${RUSTY_FOSSIL_GID:?Set the host GID for the pi account}"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${RUSTY_FOSSIL_HOST_PORT:-8080}:8080"
     environment:
-      RUSTY_FOSSIL_ENV: development
+      RUSTY_FOSSIL_ENV: production
       RUSTY_FOSSIL_BIND: 0.0.0.0:8080
       RUSTY_FOSSIL_STATE_DIR: /var/lib/rusty-fossil
-      RUSTY_FOSSIL_LOG_LEVEL: info
-      SOYUZ_API_ORIGIN: ${SOYUZ_API_ORIGIN:-}
-      SOYUZ_WORKER_ID: ${SOYUZ_WORKER_ID:-}
+      RUSTY_FOSSIL_LOG_LEVEL: ${RUSTY_FOSSIL_LOG_LEVEL:-info}
+    volumes:
+      - type: bind
+        source: ${RUSTY_FOSSIL_HOST_STATE_DIR:?Set a private host state directory}
+        target: /var/lib/rusty-fossil
+        bind:
+          create_host_path: false
+    networks:
+      - controller_internal
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cpus: 0.50
+    mem_limit: 128m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  fossil-supervisord:
+    <<: *runtime-image
+    depends_on:
+      rusty-fossil:
+        condition: service_started
+    entrypoint:
+      - /usr/local/bin/fossil-supervisord
+    user: "${RUSTY_FOSSIL_UID:?Set the host UID for the pi account}:${RUSTY_FOSSIL_GID:?Set the host GID for the pi account}"
+    group_add:
+      - "${DOCKER_GID:?Set the numeric group ID for the Docker socket}"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      FOSSIL_SUPERVISOR_SOCKET: /run/rusty-fossil/supervisor.sock
+      FOSSIL_SUPERVISOR_STATE_DB: /var/lib/rusty-fossil/fossil.sqlite3
+      FOSSIL_SUPERVISOR_IMAGE: ${FOSSIL_SUPERVISOR_IMAGE:?Set the trusted synthetic worker image digest}
+      FOSSIL_SUPERVISOR_IPC_TOKEN_FILE: /run/secrets/fossil_supervisor_ipc_token
+      FOSSIL_SUPERVISOR_SCENARIO: ${FOSSIL_SUPERVISOR_SCENARIO:-success}
+      SOYUZ_API_ORIGIN: ${SOYUZ_API_ORIGIN:?Set the Soyuz worker API origin}
+      SOYUZ_WORKER_ID: ${SOYUZ_WORKER_ID:?Set the canonical Soyuz worker ID}
       SOYUZ_WORKER_API_TOKEN_FILE: /run/secrets/soyuz_worker_api_token
-      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
-      CLOUDFLARE_QUEUE_ID: ${CLOUDFLARE_QUEUE_ID:-}
-      CLOUDFLARE_QUEUE_TOKEN_FILE: /run/secrets/cloudflare_queue_token
-      CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS: ${CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS:-60000}
+      RUST_LOG: ${RUSTY_FOSSIL_LOG_LEVEL:-info}
     secrets:
       - soyuz_worker_api_token
-      - cloudflare_queue_token
+      - fossil_supervisor_ipc_token
     volumes:
-      - rusty-fossil-state:/var/lib/rusty-fossil
+      - type: bind
+        source: ${RUSTY_FOSSIL_HOST_STATE_DIR:?Set a private host state directory}
+        target: /var/lib/rusty-fossil
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RUSTY_FOSSIL_RUNTIME_DIR:?Set a private host runtime directory}
+        target: /run/rusty-fossil
+        bind:
+          create_host_path: false
+      # The Docker socket grants host-level authority. The controller never
+      # receives this bind mount; :ro would not make the Engine API read-only.
+      - type: bind
+        source: ${DOCKER_SOCKET_PATH:-/run/docker.sock}
+        target: /var/run/docker.sock
+    networks:
+      - supervisor_egress
     restart: unless-stopped
+    stop_grace_period: 90s
+    cpus: 0.50
+    mem_limit: 256m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
 secrets:
   soyuz_worker_api_token:
-    file: ./secrets/soyuz_worker_api_token
-  cloudflare_queue_token:
-    file: ./secrets/cloudflare_queue_token
+    file: ${SOYUZ_WORKER_API_TOKEN_HOST_FILE:?Create the private Soyuz worker token file}
+  fossil_supervisor_ipc_token:
+    file: ${FOSSIL_SUPERVISOR_IPC_TOKEN_HOST_FILE:?Create the private supervisor IPC token file}
 
-volumes:
-  rusty-fossil-state:
+networks:
+  controller_internal:
+    internal: true
+  supervisor_egress: {}

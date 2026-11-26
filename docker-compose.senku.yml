@@ -2,6 +2,9 @@
 # Start with: docker compose -f docker-compose.yml -f docker-compose.senku.yml up
 services:
   rusty-fossil:
+    networks:
+      - controller_internal
+      - senku_egress
     environment:
       SENKU_API_ORIGIN: ${SENKU_API_ORIGIN:-https://senku.scheimann.workers.dev}
       SENKU_API_TOKEN_FILE: /run/secrets/senku_api_token
@@ -10,4 +13,7 @@ services:
 
 secrets:
   senku_api_token:
-    file: ./secrets/senku_api_token
+    file: ${SENKU_API_TOKEN_HOST_FILE:?Create the private Senku token file}
+
+networks:
+  senku_egress: {}

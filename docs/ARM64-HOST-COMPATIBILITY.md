@@ -11,9 +11,9 @@
 | --- | --- |
 | Hardware and architecture | Raspberry Pi 4 Model B Rev 1.5; ARM64 (`aarch64`) |
 | Operating system | Debian 13; Linux `6.18.50+rpt-rpi-v8` |
-| Docker | Engine 29.9.2; rootful; cgroup v2; `overlayfs`; built-in seccomp profile reported |
+| Docker | Engine 29.9.2; rootful; cgroup v2; `overlayfs`; built-in seccomp profile reported; Docker Compose v5.6.1 |
 | Docker socket | `/run/docker.sock`, mode `0660`, owned by `root:docker` |
-| Interactive account | `pi`; member of the `docker` group and able to use the rootful daemon |
+| Interactive account | `pi` UID 1000, primary GID 1000; member of Docker GID 985 and able to use the rootful daemon |
 | Dedicated Rusty-Fossil account | Absent; the owner expects Rusty-Fossil to run as `pi` |
 | Memory | 3.71 GiB total; 3.20 GiB available at the check |
 | Swap | 2.00 GiB total and free at the check |
@@ -31,9 +31,9 @@ The host owner reports that the previous default password was changed. This is r
 
 ## Rusty-Fossil service identity
 
-Rusty-Fossil is expected to run as `pi`; these files do not provision another account or change host group membership. The proposed systemd units in [`deploy/systemd`](../deploy/systemd/) run both processes as `pi`. The supervisor receives the `docker` group and uses the Docker socket. The controller unit masks `/run/docker.sock` with `InaccessiblePaths`; the controller must not receive a Docker socket bind, a Docker-specific environment variable, or another route to the Engine.
+Rusty-Fossil is expected to run as `pi`; the Compose configuration maps both containers to UID/GID 1000:1000 on the current host. Only the supervisor receives the Docker socket bind and numeric Docker group 985. The controller has no socket bind or Docker group. The Compose files do not provision an account or change host group membership and have not been installed or verified on Agentlab.
 
-The interactive `pi` account still has rootful Docker authority. The systemd unit split constrains the controller process; it does not reduce the authority of an interactive `pi` shell or the trusted supervisor. Before installing the units, an operator must verify the effective unit sandbox and confirm the Docker daemon does not expose a TCP API. No unit was installed or started during this inventory.
+The interactive `pi` account still has rootful Docker authority. The container split hides the socket mount from the controller process; it does not reduce the authority of an interactive `pi` shell or the trusted supervisor. Before starting the Compose stack, an operator must verify that Docker does not listen on a TCP socket and that the controller container cannot reach another Engine endpoint. No Compose container was created or started during this inventory.
 
 ## Repository and model access
 
@@ -41,4 +41,4 @@ The interactive `pi` account still has rootful Docker authority. The systemd uni
 
 ## Host changes
 
-None. Only read-only inventory commands were run. No accounts, SSH settings, firewall rules, Docker settings, images, containers, volumes, networks, files, or credentials were changed.
+None. Only read-only inventory commands were run, including checking the account and group IDs and Compose CLI version. No accounts, SSH settings, firewall rules, Docker settings, images, containers, volumes, networks, files, or credentials were changed.

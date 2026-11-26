@@ -6,13 +6,33 @@ The branch contains a Pi 1.6.0 worker wrapper, a locked runtime dependency graph
 
 This is still not an operational coding runtime. The supervisor accepts only its synthetic workload. It does not call the repository library, mount a repository, provide Pi configuration, contact a gateway, persist Pi event counters, or select this image. The durable Pi record is not permission to launch; do not launch the image as an execution fallback.
 
-## Running the host services as `pi`
+## Running the Docker Compose stack as `pi`
 
-The host owner expects Rusty-Fossil to run as the existing `pi` account. Do not provision a separate host account for this deployment. Example units are in [`deploy/systemd`](../deploy/systemd/): both services run with `User=pi` and `Group=pi`; `fossil-supervisord` receives Docker socket access through the `docker` group, while the controller unit masks `/run/docker.sock` with `InaccessiblePaths` and has no Docker socket setting.
+The host owner expects Rusty-Fossil to run as the existing `pi` account. The root [`docker-compose.yml`](../docker-compose.yml) maps both containers to the numeric UID/GID for `pi`; the supervisor alone gets the numeric Docker group and `/run/docker.sock`. The controller has no Docker socket mount, no Docker group, no supervisor secret mount, and runs on an internal Compose network. Diagnostics are published on host loopback only. Compose-managed restart policies let Docker Engine bring the containers back after a daemon restart.
 
-The `pi` account itself remains in the rootful Docker group. systemd's `SupplementaryGroups=` extends the account's supplementary groups, so the controller unit does not rely on group removal; its boundary is the service mount namespace and the absence of another Docker API endpoint. This process sandbox is not a separate Unix security principal. An interactive shell as `pi` and the trusted supervisor retain Docker authority. The host operator must verify that Docker does not listen on a TCP socket and that the installed controller unit cannot see or connect to the Unix socket.
+Both services share the same host UID and SQLite directory. The container split hides the Docker socket mount and credentials from the controller container, but it is not a separate Unix security principal: interactive `pi` and `fossil-supervisord` retain rootful Docker authority. Verify the Docker daemon has no reachable TCP API. The controller network is marked internal, but that configuration is not a substitute for checking the host's daemon listeners and firewall.
 
-The example units are not installed or enabled. Before installation, place the binaries and root-owned `EnvironmentFile`s at the paths named in the units, make required secret files readable only by `pi` (for example `root:pi` mode `0640`), and keep the SQLite state directory private to `pi`. Run `systemd-analyze verify` on the units, inspect the effective unit properties, and verify the controller's masked socket from inside its service sandbox. Do not start either service for coding workloads until the Pi launch path, repository preparation, broker, egress policy, and recovery tests are complete.
+On Agentlab, configure `.env` from [`.env.example`](../.env.example). The values 1000, 1000 and 985 were verified read-only on 2026-11-26; recheck with `id -u pi`, `id -g pi`, and `getent group docker | cut -d: -f3` before deployment. Confirm `DOCKER_SOCKET_PATH` matches the host socket. Create the state/runtime directories with `pi:pi` ownership and mode 0700. Put the authorized Soyuz worker token and a generated 32–256 byte visible-ASCII IPC token in `secrets/`, owned by `pi:pi` with mode 0400. Keep these files out of source control.
+
+Set `FOSSIL_SUPERVISOR_IMAGE` to the fixed trusted GHCR synthetic-worker repository with a published SHA-256 digest and pull that exact image before startup; the supervisor never pulls it. The current `fossil-supervisord` only accepts synthetic scenarios. Validate and start the containers with:
+
+```sh
+docker compose config --quiet
+# Replace the placeholder with the digest configured in .env.
+docker pull ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:REPLACE_WITH_64_HEX_DIGEST
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs -f rusty-fossil fossil-supervisord
+```
+
+For normal stop/restart recovery, use `docker compose stop -t 90 fossil-supervisord` and `docker compose up -d fossil-supervisord`. `docker compose down` removes this project's containers and network but preserves the bind-mounted state and secret files. If upgrading from the previous Compose definition, back up the existing named `rusty-fossil-state` volume before switching to the bind-mounted state path; inspect and verify the copied SQLite database before retiring that volume.
+
+## Update and rollback
+
+Use a unique local image tag for each controller/supervisor build and keep the previous tag. Before an upgrade, stop both containers and back up the entire state directory. To roll back the binaries, set `RUSTY_FOSSIL_IMAGE` in `.env` to the previous tag and run `docker compose up -d --no-build`. Preserve the current state and secrets. SQLite migrations are forward-only; only restore an older state backup when no run is active and the prior binaries and database backup are a matching pair. Never use `docker compose down -v` or Docker-wide prune commands for rollback.
+
+The supervisor's default bridge allows outbound connectivity and does not provide destination filtering. The disposable synthetic workers currently receive `network_mode: none`. Do not use Compose networking as the future Pi worker's egress control. Do not start coding workloads until the Pi launch path, repository preparation, broker, enforced egress policy, and recovery tests are complete.
 
 When durable prompt delivery is integrated, stage the canonical descriptor prompt as an atomically created per-run file under the private workspace root before any Docker create/start request. The file must be bounded, complete, read-only, readable by container UID `65532` (normally mode `0444` inside a parent directory private to `pi`), and mounted read-only at `/run/fossil/task-prompt.txt`. Persist the payload identity before Docker side effects, never put the prompt in environment, labels or command arguments, and never rewrite or replay it into a second container after ambiguous launch state. The wrapper's file reader alone does not implement these lifecycle guarantees.
 
@@ -57,4 +77,4 @@ Production Queue polling, Senku inference and publication remain out of scope. T
 
 ## Current ARM64 host disposition
 
-The 2026-11-26 read-only host review is recorded in [Agentlab compatibility](AGENTLAB-COMPATIBILITY.md) and [Agentlab validation](AGENTLAB-VALIDATION.md), with the ARM64 inventory in [host compatibility](ARM64-HOST-COMPATIBILITY.md). The password change is owner-reported. SSH authentication policy could not be established from the `pi` account. Three healthy containers were observed; all were left untouched. No Rusty-Fossil image or container was created. The `pi` account has rootful Docker access; the new systemd examples are not installed or verified. The repository-preparation library has not performed a checkout or task execution. Cloudflare read-only metadata showed the existing default AI Gateway has request logging enabled and no spend limit; it was not used for inference. A dedicated non-production gateway, broker and worker egress policy remain unverified.
+The 2026-11-26 read-only host review is recorded in [Agentlab compatibility](AGENTLAB-COMPATIBILITY.md) and [Agentlab validation](AGENTLAB-VALIDATION.md), with the ARM64 inventory in [host compatibility](ARM64-HOST-COMPATIBILITY.md). The password change is owner-reported. SSH authentication policy could not be established from the `pi` account. Three healthy containers were observed; all were left untouched. No Rusty-Fossil image or container was created. The `pi` account has rootful Docker access; the Compose stack has not been installed or verified. The repository-preparation library has not performed a checkout or task execution. Cloudflare read-only metadata showed the existing default AI Gateway has request logging enabled and no spend limit; it was not used for inference. A dedicated non-production gateway, broker and worker egress policy remain unverified.
