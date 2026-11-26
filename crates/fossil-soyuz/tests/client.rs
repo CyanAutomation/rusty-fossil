@@ -9,6 +9,9 @@ use std::time::Duration;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "../../../tests/support/http_faults.rs"]
+mod http_faults;
+
 const RUN_ID: &str = "f8a0c4c5-d628-7b93-a7cf-4b4629a28853";
 const WORKER_ID: &str = "fossil-host-01";
 const CLAIM_ID: &str = "d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133";
@@ -163,6 +166,65 @@ async fn timeout_is_a_non_authorizing_error() {
         .await
         .unwrap_err();
     assert!(matches!(error, SoyuzClientError::Timeout));
+}
+
+#[tokio::test]
+async fn soyuz_http_faults_are_classified_without_retries_or_remote_body_leaks() {
+    use http_faults::{HttpFaultScenario, mount_http_fault};
+
+    let scenarios = [
+        (
+            HttpFaultScenario::Status(429),
+            SoyuzClientError::RateLimited,
+            true,
+        ),
+        (
+            HttpFaultScenario::Status(503),
+            SoyuzClientError::Unavailable,
+            true,
+        ),
+        (
+            HttpFaultScenario::MalformedJson,
+            SoyuzClientError::Protocol,
+            false,
+        ),
+        (
+            HttpFaultScenario::Oversized {
+                bytes: 96 * 1024 + 1,
+            },
+            SoyuzClientError::Protocol,
+            false,
+        ),
+        (
+            HttpFaultScenario::Delayed {
+                duration: Duration::from_millis(250),
+            },
+            SoyuzClientError::Timeout,
+            true,
+        ),
+    ];
+
+    for (scenario, expected, retryable) in scenarios {
+        let server = MockServer::start().await;
+        mount_http_fault(
+            &server,
+            "GET",
+            &format!("/v1/worker/runs/{RUN_ID}"),
+            scenario,
+        )
+        .await;
+        let timeout = if expected == SoyuzClientError::Timeout {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        let client = SoyuzClient::new(client_config(&server, timeout)).unwrap();
+
+        let error = client.get_run(run_id()).await.unwrap_err();
+        assert_eq!(error, expected);
+        assert_eq!(error.is_retryable(), retryable);
+        assert!(!error.to_string().contains("PRIVATE_UPSTREAM_DIAGNOSTIC"));
+    }
 }
 
 #[tokio::test]

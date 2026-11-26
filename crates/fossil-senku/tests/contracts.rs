@@ -11,6 +11,9 @@ use url::Url;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "../../../tests/support/http_faults.rs"]
+mod http_faults;
+
 fn task_admission() -> ProfileEvaluation {
     ProfileEvaluation::task_admission(TaskAdmissionInput {
         repo_url: "https://example.test/acme/project".to_owned(),
@@ -299,4 +302,80 @@ async fn sends_one_authenticated_request_and_validates_the_profile_response() {
     assert_eq!(decision.profile_id, ProfileId::TaskAdmission);
     assert_eq!(decision.request_id, "dec-test-001");
     assert!(decision.answers.contains_key("risk_level"));
+}
+
+#[tokio::test]
+async fn upstream_faults_are_bounded_classified_and_never_retried() {
+    use fossil_senku::DecisionError;
+    use http_faults::{HttpFaultScenario, mount_http_fault};
+
+    let scenarios = [
+        (
+            HttpFaultScenario::Status(429),
+            DecisionError::RateLimited,
+            true,
+        ),
+        (
+            HttpFaultScenario::Status(503),
+            DecisionError::Unavailable,
+            true,
+        ),
+        (
+            HttpFaultScenario::MalformedJson,
+            DecisionError::InvalidResponse,
+            false,
+        ),
+        (
+            HttpFaultScenario::Oversized {
+                bytes: 64 * 1024 + 1,
+            },
+            DecisionError::InvalidResponse,
+            false,
+        ),
+        (
+            HttpFaultScenario::Delayed {
+                duration: Duration::from_millis(250),
+            },
+            DecisionError::Timeout,
+            true,
+        ),
+    ];
+
+    for (scenario, expected, retryable) in scenarios {
+        let server = MockServer::start().await;
+        mount_http_fault(
+            &server,
+            "POST",
+            "/v1/profiles/task_admission_v1/evaluate",
+            scenario,
+        )
+        .await;
+        let timeout = if expected == DecisionError::Timeout {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        let client = SenkuClient::new(
+            SenkuClientConfig::new(
+                Url::parse(&server.uri()).unwrap(),
+                SecretString::from("synthetic-senku-token-000000000000".to_owned()),
+                timeout,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = client.evaluate(task_admission()).await.unwrap_err();
+        assert_eq!(error, expected);
+        assert_eq!(error.is_retryable(), retryable);
+        assert!(!error.to_string().contains("PRIVATE_UPSTREAM_DIAGNOSTIC"));
+        let metric = client.metrics().profiles[0];
+        assert_eq!(metric.attempts, 1);
+        assert_eq!(metric.successes, 0);
+        if retryable {
+            assert_eq!(metric.transport_failures, 1);
+        } else {
+            assert_eq!(metric.invalid_responses, 1);
+        }
+    }
 }
