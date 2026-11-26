@@ -17,7 +17,8 @@
 | Password remediation | Host owner reports the previous default `pi` password has been changed to a stronger password; no password was requested or accessed. The remediation is not independently verified from the host. |
 | SSH and Docker authority review | Current SSH authentication policy and Docker group/socket access were not rechecked. The historical 2026-11-22 inventory found `pi` in the rootful Docker group. No dedicated supervisor identity or restricted socket access was verified. |
 | User-designated pilot repository | `https://github.com/CyanAutomation/somatic`, ref `main`, observed at `0d02873b71256892b4ec8026a3b0e2a5ab6aaa91`; selected from GitHub metadata on 2026-11-26. No checkout or task execution was performed. |
-| Non-production model route | Not supplied/configured; outbound HTTPS and proxy policy not verified |
+| Cloudflare AI Gateway inventory | Read-only Cloudflare inspection found a gateway named `default`. Its production status, provider/model, access policy, spending controls and broker suitability were not established; no credentials were read and no inference request was sent. |
+| Approved non-production model route | Not identified/configured; outbound HTTPS and proxy policy not verified |
 | Pi image build | CI job added; not run in this worktree. Local Docker Engine socket is unavailable to this development environment. |
 | Pi task, memory measurement, cancellation and restart recovery | Not run; no Pi supervisor workload type or secure egress path exists in this branch |
 | Cleanup | No Rusty-Fossil Docker resources were created, so none required cleanup |
