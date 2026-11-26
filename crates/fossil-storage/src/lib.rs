@@ -21,13 +21,6 @@ const MAX_CALLBACK_PAYLOAD_BYTES: usize = 12 * 1024;
 const MAX_PENDING_CALLBACKS: u32 = 1_000;
 const MAX_EXECUTION_DESCRIPTOR_BYTES: usize = 96 * 1024;
 const TRUSTED_PI_WORKER_IMAGE: &str = "ghcr.io/cyanautomation/rusty-fossil-pi-worker";
-// Single Phase 2C-A pilot pin designated by the user and observed from GitHub
-// metadata on 2026-11-26. Repository preparation must still resolve and verify
-// this exact revision before checkout; this is not an egress or checkout guard.
-const PI_PILOT_REPOSITORY_URL: &str = "https://github.com/CyanAutomation/somatic";
-const PI_PILOT_GIT_REF: &str = "main";
-const PI_PILOT_RESOLVED_COMMIT: &str = "0d02873b71256892b4ec8026a3b0e2a5ab6aaa91";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecutionDescriptor {
@@ -1596,18 +1589,18 @@ impl SqliteStore {
                 profile.profile_version == "pi-coding-v1"
                     && scenario == fossil_core::execution::SyntheticScenario::Success
                     && is_pinned_pi_worker_image(&profile.image_identity)
-                    && profile.repository_url.as_deref().is_some_and(|url| {
-                        valid_repository_url(url) && url == PI_PILOT_REPOSITORY_URL
-                    })
+                    && profile
+                        .repository_url
+                        .as_deref()
+                        .is_some_and(valid_repository_url)
                     && profile
                         .authorized_git_ref
                         .as_deref()
-                        .is_some_and(|git_ref| {
-                            valid_authorized_git_ref(git_ref) && git_ref == PI_PILOT_GIT_REF
-                        })
-                    && profile.resolved_commit.as_deref().is_some_and(|commit| {
-                        valid_resolved_commit(commit) && commit == PI_PILOT_RESOLVED_COMMIT
-                    })
+                        .is_some_and(valid_authorized_git_ref)
+                    && profile
+                        .resolved_commit
+                        .as_deref()
+                        .is_some_and(valid_resolved_commit)
                     && profile
                         .workspace_identity
                         .as_deref()
