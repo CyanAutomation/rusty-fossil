@@ -72,11 +72,15 @@ cargo run -p rusty-fossil
 
 The service binds to `127.0.0.1:8080` by default and creates `./state/fossil.sqlite3`.
 
+- `GET /docs/` serves the hand-built API reference; `/docs` redirects there.
+- `GET /openapi.json` serves the OpenAPI 3.1.1 contract used by the page. The page renderer is written in TypeScript and compiled to a checked-in static asset without a runtime UI dependency.
 - `GET /health` reports process liveness.
 - `GET /ready` reports configuration, local state, Queue probe, recovery backlog, handoff readiness, supervisor probe state, synthetic execution availability, and production coding readiness. It returns 503 because production Queue intake and the supervisor handoff are not wired into `main`.
 - `GET /metrics` reports read-only diagnostics, callback backlog, recovery outcomes, intake blocking, local slot availability, Docker-supervisor probe state, synthetic execution availability, and production coding readiness. Senku client snapshots include per-profile attempts, successes, invalid responses, transport failures, degraded evaluations, and duration totals; they are not wired into the service endpoint while the production client remains disabled.
 
 There are no `POST /runs`, `POST /execute`, retry, claim, or start routes. The supervisor IPC accepts only a canonical run ID, authenticates a private token, reloads the persisted handoff, and revalidates Soyuz. Queue intake and Senku inference are not enabled by the service binary.
+
+To rebuild the TypeScript API docs renderer after editing `docs-ui/src/docs.ts`, run `npm ci --ignore-scripts --no-audit --no-fund && npm run build` from `docs-ui/`. CI checks that the generated static bundle is current.
 
 ## Configuration
 

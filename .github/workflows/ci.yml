@@ -77,6 +77,26 @@ jobs:
       - name: Test the worker wrapper
         run: node --test worker/pi/worker.test.mjs
 
+  api-docs:
+    name: Type-check the API docs renderer and verify its bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - name: Install the TypeScript compiler
+        working-directory: docs-ui
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Type-check the documentation renderer
+        working-directory: docs-ui
+        run: npm run check
+      - name: Build the checked-in documentation asset
+        working-directory: docs-ui
+        run: npm run build
+      - name: Verify the generated asset is up to date
+        run: git diff --exit-code -- crates/rusty-fossil/static/docs.js
+
   pi-worker-multiplatform:
     name: Build Pi worker (AMD64 and ARM64) with SBOM
     runs-on: ubuntu-latest

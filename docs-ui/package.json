@@ -1,0 +1,13 @@
+{
+  "name": "rusty-fossil-api-docs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Build the dependency-free TypeScript renderer for the Rusty-Fossil API docs page",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "check": "tsc --project tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

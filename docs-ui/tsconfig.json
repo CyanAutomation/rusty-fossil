@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "none",
+    "strict": true,
+    "skipLibCheck": true,
+    "removeComments": true,
+    "noEmitOnError": true,
+    "outFile": "../crates/rusty-fossil/static/docs.js"
+  },
+  "files": ["src/docs.ts"]
+}
