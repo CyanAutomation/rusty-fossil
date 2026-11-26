@@ -4,7 +4,7 @@ Rusty-Fossil is the host-side controller foundation for disposable repository wo
 
 Phase 2A.1 and 2A-S provide independent durable reconciliation, callback-outbox headroom, observable Queue failures, and an optional contract-validated Senku advisory client. Phase 2B adds an authenticated supervisor process, durable single-container Docker lifecycle, bounded security profile, and a fixed synthetic worker. Phase 2B.1 hardens outbox capacity, adds coordinator-to-supervisor process integration and restart coverage, and builds both controller and supervisor for Linux AMD64 and ARM64. Senku remains advisory and Soyuz remains the sole run authority. Production `main` still does not construct a Queue poller, callback replay loop, Senku client, or supervisor IPC client; `/ready` remains false until a controlled runtime is wired.
 
-Phase 2C-A adds a pinned Pi 1.6.0 worker image and bounded prompt wrapper. The Rust Pi event parser processes JSONL incrementally with strict stream, record and event-count bounds, and classifies completion together with the actual process exit. The supervisor terminal path can parse bounded Pi Docker output, and SQLite/outbox supports distinct Pi terminal classes with stable callback identity. Schema v7 persists the synthetic profile and deadline and can record a versioned `PiCodingV1` identity for any per-run repository URL, authorized ref and resolved commit that pass validation. `CyanAutomation/somatic` is a disposable test repository, not a product allowlist. Repository preparation remains unimplemented, and the supervisor rejects Pi launches before Docker create, so the result path is not reachable from a live worker; gateway isolation is not enabled.
+Phase 2C-A adds a pinned Pi 1.6.0 worker image and bounded prompt wrapper. The Rust Pi event parser processes JSONL incrementally with strict stream, record and event-count bounds, and classifies completion together with the actual process exit. The supervisor terminal path can parse bounded Pi Docker output, and SQLite/outbox supports distinct Pi terminal classes with stable callback identity. Schema v7 persists the synthetic profile and deadline and can record a versioned `PiCodingV1` identity for any per-run repository URL, authorized ref and resolved commit that pass validation. The new `fossil-workspace` library adds a private checkout root, exact operator allowlist, branch/commit checks, bounded tree validation, and hostname-restricted Git HTTPS transport for the disposable `CyanAutomation/somatic` pilot. It is not wired into the supervisor, and no remote checkout was performed. The supervisor still rejects Pi launches before Docker create, so the result path is not reachable from a live worker; gateway isolation is not enabled.
 
 ## Workspace
 
@@ -14,6 +14,7 @@ Phase 2C-A adds a pinned Pi 1.6.0 worker image and bounded prompt wrapper. The R
 - `crates/fossil-storage` — SQLite migrations, private local state, durable descriptors and intents, one-slot reservation, recovery, and callback outbox.
 - `crates/fossil-senku` — versioned profile inputs, bounded authenticated transport, strict response validation, evidence redaction, and advisory metrics.
 - `crates/fossil-supervisor` — proof-gated Docker supervisor, restricted Unix IPC, crash recovery, and the `fossil-supervisord` service binary.
+- `crates/fossil-workspace` — isolated, allowlisted Git repository preparation policy and bounded HTTPS fetch/checkout (library only; not supervisor-integrated).
 - `crates/fossil-synthetic-worker` — six fixed synthetic scenarios for lifecycle tests; no shell or prompt interpretation.
 - `crates/rusty-fossil` — controller configuration, authorization coordinator, opt-in supervisor handoff, read-only diagnostics, and callback replay logic.
 - `docs/` — contracts, architecture, compatibility evidence, decisions, and follow-on plan.
@@ -107,8 +108,9 @@ Default tests use local HTTP mocks and a stateful Soyuz worker API simulator; th
 - [Compatibility inventory](docs/COMPATIBILITY.md)
 - [Phase 2B supervisor operations](docs/PHASE-2B-OPERATIONS.md)
 - [Phase 2C-A operations](docs/PHASE-2C-A-OPERATIONS.md)
-- [Agentlab compatibility and validation](docs/AGENTLAB-COMPATIBILITY.md)
-- [Agentlab validation record](docs/AGENTLAB-VALIDATION.md)
+- [ARM64 host compatibility](docs/ARM64-HOST-COMPATIBILITY.md)
+- [ARM64 host validation record](docs/ARM64-HOST-VALIDATION.md)
 - [Architecture decisions](docs/DECISIONS/)
 - [Implementation plan and Phase 2B status](docs/IMPLEMENTATION-PLAN.md)
 - [Phase 2C-A long-running execution policy proposal](docs/DECISIONS/0012-phase-2c-long-running-execution-policy.md)
+- [Repository preparation trust boundary](docs/DECISIONS/0013-repository-preparation-boundary.md)

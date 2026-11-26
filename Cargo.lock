@@ -507,6 +507,19 @@ name = "fossil-synthetic-worker"
 version = "0.1.0"
 
 [[package]]
+name = "fossil-workspace"
+version = "0.1.0"
+dependencies = [
+ "fossil-core",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
