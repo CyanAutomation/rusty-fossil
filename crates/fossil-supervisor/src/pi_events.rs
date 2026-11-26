@@ -44,6 +44,44 @@ pub enum PiExecutionClass {
     ExecutionUncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PiDurableOutcome {
+    pub outcome_class: &'static str,
+    pub diagnostic_summary: &'static str,
+    pub output_truncated: bool,
+}
+
+impl PiExecutionClass {
+    /// Convert protocol/process evidence into a transcript-free durable result.
+    pub const fn durable_outcome(self) -> PiDurableOutcome {
+        let (outcome_class, diagnostic_summary, output_truncated) = match self {
+            Self::Completed => ("pi_completed", "Pi coding task completed", false),
+            Self::ProviderError => ("provider_error", "Pi model provider failed", false),
+            Self::PiProcessFailure => ("pi_process_failure", "Pi process failed", false),
+            Self::Cancelled => ("cancelled", "Pi coding task cancelled", false),
+            Self::TimedOut => ("timeout", "Pi coding task timed out", false),
+            Self::InvalidEventStream => {
+                ("invalid_event_stream", "Pi event stream was invalid", false)
+            }
+            Self::OutputTruncated => (
+                "output_truncated",
+                "Pi output exceeded capture limits",
+                true,
+            ),
+            Self::ExecutionUncertain => (
+                "execution_uncertain",
+                "Pi execution result was incomplete or uncertain",
+                false,
+            ),
+        };
+        PiDurableOutcome {
+            outcome_class,
+            diagnostic_summary,
+            output_truncated,
+        }
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum PiStreamError {
     #[error("Pi JSONL stream exceeds the configured bound")]
@@ -157,6 +195,12 @@ impl PiEventParser {
             .and_then(|object| object.get("type"))
             .and_then(Value::as_str)
             .ok_or(PiStreamError::MalformedRecord)?;
+
+        if (self.event_count == 0 && event != "session")
+            || (self.event_count > 0 && event == "session")
+        {
+            return Err(PiStreamError::InvalidSequence);
+        }
 
         self.event_count += 1;
         if self.event_count > MAX_PI_EVENT_COUNT {
@@ -276,12 +320,16 @@ mod tests {
     #[test]
     fn classifies_provider_errors_and_aborts_without_reading_assistant_text() {
         let provider_error = concat!(
+            r#"{"type":"session"}"#,
+            "\n",
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"private diagnostic","content":[]}}"#,
             "\n",
             r#"{"type":"agent_settled","aborted":false}"#,
             "\n"
         );
         let aborted = concat!(
+            r#"{"type":"session"}"#,
+            "\n",
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"aborted","content":[]}}"#,
             "\n",
             r#"{"type":"agent_settled","aborted":true}"#,
@@ -304,10 +352,15 @@ mod tests {
 
     #[test]
     fn marks_partial_or_truncated_streams_incomplete() {
-        let no_settled =
-            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}"#;
+        let no_settled = concat!(
+            r#"{"type":"session"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}"#
+        );
         let successful_but_truncated = SUCCESS;
         let reached_token_limit = concat!(
+            r#"{"type":"session"}"#,
+            "\n",
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"length"}}"#,
             "\n",
             r#"{"type":"agent_settled","aborted":false}"#,
@@ -348,6 +401,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_success_shaped_stream_without_the_initial_session_record() {
+        let stream = concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[]}}"#,
+            "\n",
+            r#"{"type":"agent_settled","aborted":false}"#,
+            "\n"
+        );
+        assert_eq!(
+            summarize_pi_jsonl(stream.as_bytes(), false).unwrap_err(),
+            PiStreamError::InvalidSequence
+        );
+        assert_eq!(
+            classify_pi_execution(Err(PiStreamError::InvalidSequence), Some(0), None),
+            PiExecutionClass::InvalidEventStream
+        );
+    }
+
+    #[test]
     fn enforces_total_stream_and_event_count_bounds() {
         let oversized_stream = vec![b'\n'; super::MAX_PI_EVENT_STREAM_BYTES + 1];
         assert_eq!(
@@ -355,11 +426,17 @@ mod tests {
             PiStreamError::StreamTooLarge
         );
 
-        let max_events = "{\"type\":\"x\"}\n".repeat(super::MAX_PI_EVENT_COUNT);
+        let max_events = format!(
+            "{{\"type\":\"session\"}}\n{}",
+            "{\"type\":\"x\"}\n".repeat(super::MAX_PI_EVENT_COUNT - 1)
+        );
         let summary = summarize_pi_jsonl(max_events.as_bytes(), false).unwrap();
         assert_eq!(summary.event_count, super::MAX_PI_EVENT_COUNT);
 
-        let too_many_events = "{\"type\":\"x\"}\n".repeat(super::MAX_PI_EVENT_COUNT + 1);
+        let too_many_events = format!(
+            "{{\"type\":\"session\"}}\n{}",
+            "{\"type\":\"x\"}\n".repeat(super::MAX_PI_EVENT_COUNT)
+        );
         assert_eq!(
             summarize_pi_jsonl(too_many_events.as_bytes(), false).unwrap_err(),
             PiStreamError::TooManyEvents
@@ -369,6 +446,8 @@ mod tests {
     #[test]
     fn counts_tool_calls_without_retaining_tool_arguments_or_results() {
         let stream = concat!(
+            r#"{"type":"session"}"#,
+            "\n",
             r#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"sensitive command"}}"#,
             "\n",
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[]}}"#,
@@ -397,7 +476,10 @@ mod tests {
 
     #[test]
     fn incremental_parser_accepts_streams_larger_than_legacy_cap() {
-        let stream = "{\"type\":\"x\",\"padding\":\"0123456789abcdef\"}\n".repeat(4_096);
+        let stream = format!(
+            "{{\"type\":\"session\"}}\n{}",
+            "{\"type\":\"x\",\"padding\":\"0123456789abcdef\"}\n".repeat(4_095)
+        );
         assert!(stream.len() > 64 * 1024);
 
         let mut parser = PiEventParser::default();
@@ -430,6 +512,8 @@ mod tests {
     #[test]
     fn provider_errors_and_capture_failures_never_become_success() {
         let provider_error = concat!(
+            r#"{"type":"session"}"#,
+            "\n",
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","content":[]}}"#,
             "\n",
             r#"{"type":"agent_settled","aborted":false}"#,
@@ -495,5 +579,28 @@ mod tests {
         assert!(debug.contains("buffered_line_bytes"));
         assert!(!debug.contains("pending_line"));
         assert!(!debug.contains("private assistant text"));
+    }
+
+    #[test]
+    fn durable_pi_outcomes_keep_failures_distinct_and_transcript_free() {
+        let completed = PiExecutionClass::Completed.durable_outcome();
+        let provider_error = PiExecutionClass::ProviderError.durable_outcome();
+        let process_failure = PiExecutionClass::PiProcessFailure.durable_outcome();
+        let invalid_stream = PiExecutionClass::InvalidEventStream.durable_outcome();
+        let truncated = PiExecutionClass::OutputTruncated.durable_outcome();
+
+        assert_eq!(completed.outcome_class, "pi_completed");
+        assert_eq!(provider_error.outcome_class, "provider_error");
+        assert_eq!(process_failure.outcome_class, "pi_process_failure");
+        assert_eq!(invalid_stream.outcome_class, "invalid_event_stream");
+        assert_eq!(truncated.outcome_class, "output_truncated");
+        assert!(truncated.output_truncated);
+        assert!(!provider_error.diagnostic_summary.contains("private"));
+        assert_eq!(
+            PiExecutionClass::ExecutionUncertain
+                .durable_outcome()
+                .outcome_class,
+            "execution_uncertain"
+        );
     }
 }

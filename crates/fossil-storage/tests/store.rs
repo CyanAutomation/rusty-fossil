@@ -2,7 +2,7 @@ use fossil_core::contract::OperationalEventType;
 use fossil_core::execution::SyntheticScenario;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::{CallbackDeliveryState, LocalLifecycleState};
-use fossil_core::queue::QueueEnvelope;
+use fossil_core::queue::{PublishMode, QueueEnvelope};
 use fossil_soyuz::{
     CallbackDeliveryAuthorization, ClaimAuthorization, CompletedCallback, SoyuzApi, SoyuzClient,
     SoyuzClientConfig, StartedAuthorization, StartedRequest, WorkerClaimRequest,
@@ -23,6 +23,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUN_ID: &str = "f8a0c4c5-d628-7b93-a7cf-4b4629a28853";
 const SYNTHETIC_IMAGE: &str = "ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TEST_REPOSITORY_URL: &str = "https://github.com/CyanAutomation/somatic";
+const TEST_GIT_REF: &str = "main";
+const TEST_RESOLVED_COMMIT: &str = "0d02873b71256892b4ec8026a3b0e2a5ab6aaa91";
 
 fn synthetic_launch_profile(runtime_limit_ms: i64) -> ContainerLaunchProfile {
     ContainerLaunchProfile {
@@ -32,6 +35,28 @@ fn synthetic_launch_profile(runtime_limit_ms: i64) -> ContainerLaunchProfile {
         profile_version: "synthetic-v1".to_owned(),
         effective_policy_json: r#"{"cpu_millicores":500,"memory_mib":256}"#.to_owned(),
         runtime_limit_ms,
+        repository_url: None,
+        authorized_git_ref: None,
+        resolved_commit: None,
+        workspace_identity: None,
+    }
+}
+
+fn pi_launch_profile(runtime_limit_ms: i64) -> ContainerLaunchProfile {
+    ContainerLaunchProfile {
+        workload_kind: fossil_storage::WorkloadKind::PiCodingV1,
+        workload_version: 1,
+        image_identity: format!(
+            "ghcr.io/cyanautomation/rusty-fossil-pi-worker@sha256:{}",
+            "c".repeat(64)
+        ),
+        profile_version: "pi-coding-v1".to_owned(),
+        effective_policy_json: r#"{"cpu_millicores":1000,"memory_mib":1024}"#.to_owned(),
+        runtime_limit_ms,
+        repository_url: Some(TEST_REPOSITORY_URL.to_owned()),
+        authorized_git_ref: Some(TEST_GIT_REF.to_owned()),
+        resolved_commit: Some(TEST_RESOLVED_COMMIT.to_owned()),
+        workspace_identity: Some("wsp_f8a0c4c5-d628-7b93-a7cf-4b4629a28853".to_owned()),
     }
 }
 
@@ -190,6 +215,14 @@ fn execution_descriptor() -> ExecutionDescriptor {
     ExecutionDescriptor::from(&envelope)
 }
 
+fn test_repository_execution_descriptor() -> ExecutionDescriptor {
+    let mut descriptor = execution_descriptor();
+    descriptor.request.publish_mode = PublishMode::None;
+    descriptor.request.repo_url = url::Url::parse(TEST_REPOSITORY_URL).unwrap();
+    descriptor.request.git_ref = TEST_GIT_REF.to_owned();
+    descriptor
+}
+
 async fn authorization_for(
     run_id: RunId,
     worker_id: WorkerId,
@@ -340,11 +373,16 @@ async fn callback_delivery_authorization_for(
 }
 
 async fn authorized_store(path: &std::path::Path) -> (SqliteStore, StartedAuthorization) {
+    authorized_store_with_descriptor(path, execution_descriptor()).await
+}
+
+async fn authorized_store_with_descriptor(
+    path: &std::path::Path,
+    descriptor: ExecutionDescriptor,
+) -> (SqliteStore, StartedAuthorization) {
     let store = SqliteStore::open(path).unwrap();
     store.observe_run(run_id(), worker_id()).unwrap();
-    store
-        .persist_execution_descriptor(execution_descriptor())
-        .unwrap();
+    store.persist_execution_descriptor(descriptor).unwrap();
     store
         .transition(run_id(), LocalLifecycleState::MessageValidated)
         .unwrap();
@@ -522,6 +560,284 @@ async fn docker_launch_intent_is_proof_gated_stable_and_durable() {
 }
 
 #[tokio::test]
+async fn pi_launch_persists_exact_repository_and_workspace_identity() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let descriptor = test_repository_execution_descriptor();
+    let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+
+    let profile = pi_launch_profile(7_200_000);
+    let launch = store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            profile.clone(),
+            gate.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        launch.workload_kind,
+        fossil_storage::WorkloadKind::PiCodingV1
+    );
+    assert!(launch.container_name.starts_with("rusty-fossil-pi-"));
+    assert_eq!(launch.workload_version, 1);
+    assert_eq!(launch.profile_version, "pi-coding-v1");
+    assert_eq!(launch.repository_url.as_deref(), Some(TEST_REPOSITORY_URL));
+    assert_eq!(launch.authorized_git_ref.as_deref(), Some(TEST_GIT_REF));
+    assert_eq!(
+        launch.resolved_commit.as_deref(),
+        Some(TEST_RESOLVED_COMMIT)
+    );
+    assert_eq!(
+        launch.workspace_identity.as_deref(),
+        Some("wsp_f8a0c4c5-d628-7b93-a7cf-4b4629a28853")
+    );
+    assert_eq!(
+        store
+            .begin_container_launch(run_id(), SyntheticScenario::Success, profile, gate,)
+            .unwrap(),
+        launch
+    );
+
+    drop(store);
+    let reopened = SqliteStore::open(path).unwrap();
+    let recovered = reopened.container_launch(run_id()).unwrap().unwrap();
+    assert_eq!(recovered.repository_url, launch.repository_url);
+    assert_eq!(recovered.authorized_git_ref, launch.authorized_git_ref);
+    assert_eq!(recovered.resolved_commit, launch.resolved_commit);
+    assert_eq!(recovered.workspace_identity, launch.workspace_identity);
+}
+
+#[tokio::test]
+async fn pi_provider_failure_is_durable_and_keeps_its_terminal_callback_identity() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let descriptor = test_repository_execution_descriptor();
+    let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            pi_launch_profile(7_200_000),
+            gate.clone(),
+        )
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "pi-provider-error-container")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate, 1_798_000_000_000)
+        .unwrap();
+
+    assert!(matches!(
+        store.record_container_exit(
+            run_id(),
+            Some(0),
+            "success",
+            "synthetic success must not classify a Pi run",
+            false,
+            1_798_000_001_000,
+        ),
+        Err(StoreError::InvalidContainerLaunchResult)
+    ));
+    assert!(matches!(
+        store.record_container_exit(
+            run_id(),
+            Some(0),
+            "output_truncated",
+            "Pi output exceeded capture limits",
+            false,
+            1_798_000_001_000,
+        ),
+        Err(StoreError::InvalidContainerLaunchResult)
+    ));
+
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "provider_error",
+            "Pi model provider returned an error",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let callback = CallbackOutboxRecord::new(
+        exited.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Failed {
+            worker_id: worker_id(),
+            claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                .unwrap(),
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: Some(0),
+            failure_class: "provider_error".to_owned(),
+            failure_message: "Pi model provider returned an error".to_owned(),
+            outcome_summary: None,
+        },
+    );
+    store
+        .transition_terminal_with_callback(run_id(), callback.clone())
+        .unwrap();
+    let callback_id = exited.terminal_callback_id.unwrap();
+
+    drop(store);
+    let reopened = SqliteStore::open(path).unwrap();
+    let recovered = reopened.container_launch(run_id()).unwrap().unwrap();
+    assert_eq!(recovered.outcome_class.as_deref(), Some("provider_error"));
+    assert_eq!(recovered.terminal_callback_id, Some(callback_id));
+    assert_eq!(reopened.pending_callbacks().unwrap(), vec![callback]);
+}
+
+#[tokio::test]
+async fn pi_completed_result_accepts_only_the_pi_success_class_for_callback_commit() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let descriptor = test_repository_execution_descriptor();
+    let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            pi_launch_profile(7_200_000),
+            gate.clone(),
+        )
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "pi-completed-container")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate, 1_798_000_000_000)
+        .unwrap();
+    assert!(matches!(
+        store.record_container_exit(
+            run_id(),
+            Some(0),
+            "pi_completed",
+            "Pi coding task completed",
+            true,
+            1_798_000_001_000,
+        ),
+        Err(StoreError::InvalidContainerLaunchResult)
+    ));
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "pi_completed",
+            "Pi coding task completed",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let callback = CallbackOutboxRecord::new(
+        exited.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Completed {
+            worker_id: worker_id(),
+            claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                .unwrap(),
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: Some(0),
+            summary: Some("Pi coding task completed".to_owned()),
+            published_url: None,
+            changed_file_count: None,
+            outcome_summary: None,
+        },
+    );
+    store
+        .transition_terminal_with_callback(run_id(), callback.clone())
+        .unwrap();
+
+    assert_eq!(store.pending_callbacks().unwrap(), vec![callback]);
+    assert_eq!(
+        store
+            .container_launch(run_id())
+            .unwrap()
+            .unwrap()
+            .outcome_class
+            .as_deref(),
+        Some("pi_completed")
+    );
+}
+
+#[tokio::test]
+async fn pi_launch_rejects_nonpilot_descriptor_and_mismatched_git_identity() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let (store, started_authorization) = authorized_store(&path).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+
+    let error = store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            pi_launch_profile(7_200_000),
+            gate.clone(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::InvalidContainerLaunchResult),
+        "unexpected rejection: {error:?}"
+    );
+
+    let descriptor = test_repository_execution_descriptor();
+    let other_directory = tempdir().unwrap();
+    let other_path = state_path(other_directory.path());
+    let (other_store, other_authorization) =
+        authorized_store_with_descriptor(&other_path, descriptor).await;
+    let other_gate = execution_gate_authorization_for(&other_authorization).await;
+    other_store.reserve_execution_slot(run_id()).unwrap();
+    let mut bad_ref = pi_launch_profile(7_200_000);
+    bad_ref.authorized_git_ref = Some("refs/heads/attacker-controlled".to_owned());
+    let mut bad_commit = pi_launch_profile(7_200_000);
+    bad_commit.resolved_commit = Some("main".to_owned());
+    let mut bad_workspace = pi_launch_profile(7_200_000);
+    bad_workspace.workspace_identity = Some("../../host-home".to_owned());
+    let mut bad_repository = pi_launch_profile(7_200_000);
+    bad_repository.repository_url = Some("https://user:secret@example.com/repo".to_owned());
+    let mut bad_image = pi_launch_profile(7_200_000);
+    bad_image.image_identity = format!("docker.io/untrusted/pi-worker@sha256:{}", "c".repeat(64));
+    let mut noncanonical_image_digest = pi_launch_profile(7_200_000);
+    noncanonical_image_digest.image_identity = format!(
+        "ghcr.io/cyanautomation/rusty-fossil-pi-worker@sha256:{}",
+        "C".repeat(64)
+    );
+    let too_long_for_soyuz = pi_launch_profile(7_200_001);
+
+    for profile in [
+        bad_ref,
+        bad_commit,
+        bad_workspace,
+        bad_repository,
+        bad_image,
+        noncanonical_image_digest,
+        too_long_for_soyuz,
+    ] {
+        assert!(matches!(
+            other_store.begin_container_launch(
+                run_id(),
+                SyntheticScenario::Success,
+                profile,
+                other_gate.clone(),
+            ),
+            Err(StoreError::InvalidContainerLaunchResult)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn runtime_deadline_is_persisted_from_original_start_and_survives_restart() {
     let directory = tempdir().unwrap();
     let path = state_path(directory.path());
@@ -595,9 +911,14 @@ async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline()
              ALTER TABLE container_launches DROP COLUMN effective_policy_json;
              ALTER TABLE container_launches DROP COLUMN runtime_limit_ms;
              ALTER TABLE container_launches DROP COLUMN effective_deadline_at_ms;
+             DROP INDEX container_launches_workspace_identity_idx;
+             ALTER TABLE container_launches DROP COLUMN repository_url;
+             ALTER TABLE container_launches DROP COLUMN authorized_git_ref;
+             ALTER TABLE container_launches DROP COLUMN resolved_commit;
+             ALTER TABLE container_launches DROP COLUMN workspace_identity;
              DROP INDEX run_records_expiration_idx;
              ALTER TABLE run_records DROP COLUMN expires_at_ms;
-             DELETE FROM schema_migrations WHERE version IN (5, 6);
+             DELETE FROM schema_migrations WHERE version IN (5, 6, 7);
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -615,12 +936,56 @@ async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline()
     assert_eq!(migrated.image_identity, None);
     assert_eq!(migrated.profile_version, "synthetic-v1");
     assert_eq!(migrated.effective_policy_json, "{}");
+    assert_eq!(migrated.repository_url, None);
+    assert_eq!(migrated.authorized_git_ref, None);
+    assert_eq!(migrated.resolved_commit, None);
+    assert_eq!(migrated.workspace_identity, None);
     assert_eq!(
         reopened.get_run(run_id()).unwrap().expires_at_ms,
         expires_at_ms
     );
     assert_eq!(migrated.runtime_limit_ms, None);
     assert_eq!(migrated.effective_deadline_at_ms, None);
+}
+
+#[tokio::test]
+async fn pi_launch_persists_different_authorized_repositories_refs_and_commits() {
+    let cases = [
+        (
+            "https://github.com/another-owner/another-repository",
+            "release",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "https://github.com/CyanAutomation/somatic",
+            "refs/heads/maintenance/v2",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ];
+
+    for (repository_url, git_ref, commit) in cases {
+        let directory = tempdir().unwrap();
+        let path = state_path(directory.path());
+        let mut descriptor = execution_descriptor();
+        descriptor.request.publish_mode = PublishMode::None;
+        descriptor.request.repo_url = url::Url::parse(repository_url).unwrap();
+        descriptor.request.git_ref = git_ref.to_owned();
+        let (store, started_authorization) =
+            authorized_store_with_descriptor(&path, descriptor).await;
+        let gate = execution_gate_authorization_for(&started_authorization).await;
+        store.reserve_execution_slot(run_id()).unwrap();
+        let mut profile = pi_launch_profile(7_200_000);
+        profile.repository_url = Some(repository_url.to_owned());
+        profile.authorized_git_ref = Some(git_ref.to_owned());
+        profile.resolved_commit = Some(commit.to_owned());
+
+        let launch = store
+            .begin_container_launch(run_id(), SyntheticScenario::Success, profile, gate)
+            .unwrap();
+        assert_eq!(launch.repository_url.as_deref(), Some(repository_url));
+        assert_eq!(launch.authorized_git_ref.as_deref(), Some(git_ref));
+        assert_eq!(launch.resolved_commit.as_deref(), Some(commit));
+    }
 }
 
 #[tokio::test]
@@ -1582,7 +1947,7 @@ fn schema_v2_callback_outbox_migrates_retry_state_without_losing_rows() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let columns: Vec<String> = connection
         .prepare("PRAGMA table_info(callback_outbox)")
         .unwrap()
@@ -1601,6 +1966,9 @@ fn schema_v2_callback_outbox_migrates_retry_state_without_losing_rows() {
         .unwrap();
     assert!(launch_columns.contains(&"image_identity".to_owned()));
     assert!(launch_columns.contains(&"effective_deadline_at_ms".to_owned()));
+    assert!(launch_columns.contains(&"authorized_git_ref".to_owned()));
+    assert!(launch_columns.contains(&"resolved_commit".to_owned()));
+    assert!(launch_columns.contains(&"workspace_identity".to_owned()));
     let (attempts, state): (u32, String) = connection
         .query_row(
             "SELECT attempts, delivery_state FROM callback_outbox WHERE event_id = ?1",

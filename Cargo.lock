@@ -474,6 +474,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "uuid",
  "wiremock",
 ]
 
