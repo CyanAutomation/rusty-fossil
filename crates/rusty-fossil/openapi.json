@@ -1,0 +1,210 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "Rusty-Fossil Diagnostics API",
+    "version": "0.1.0",
+    "description": "Read-only process diagnostics for Rusty-Fossil. This API does not accept or start tasks. The service binds to loopback by default."
+  },
+  "tags": [
+    {
+      "name": "Diagnostics",
+      "description": "Read-only health, readiness, and metrics endpoints."
+    },
+    {
+      "name": "Documentation",
+      "description": "This page and the machine-readable OpenAPI document."
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "tags": ["Diagnostics"],
+        "summary": "Check process liveness",
+        "description": "Returns success while the HTTP process is serving requests. This does not mean that execution dependencies are ready.",
+        "responses": {
+          "200": {
+            "description": "The process is live.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" },
+                "example": { "status": "ok" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "operationId": "getReadiness",
+        "tags": ["Diagnostics"],
+        "summary": "Check service readiness",
+        "description": "Returns the same readiness report with either status. A 503 response means one or more requirements are not met; inspect the report fields for details. Readiness checks do not pull Queue messages, create claims, or invoke inference.",
+        "responses": {
+          "200": {
+            "description": "The service reports ready.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessResponse" }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is not ready. The response has the same schema as a successful readiness response.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "getMetrics",
+        "tags": ["Diagnostics"],
+        "summary": "Read Prometheus metrics",
+        "description": "Returns low-cardinality process and recovery metrics in Prometheus text exposition format.",
+        "responses": {
+          "200": {
+            "description": "Prometheus metrics.",
+            "content": {
+              "text/plain; version=0.0.4; charset=utf-8": {
+                "schema": { "type": "string" },
+                "example": "# HELP fossil_controller_up Whether the Rusty-Fossil process is live.\n# TYPE fossil_controller_up gauge\nfossil_controller_up 1\n"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "operationId": "redirectToDocumentation",
+        "tags": ["Documentation"],
+        "summary": "Redirect to the API documentation page",
+        "responses": {
+          "308": {
+            "description": "Permanent redirect to `/docs/`.",
+            "headers": {
+              "Location": {
+                "schema": { "type": "string", "const": "./docs/" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs/": {
+      "get": {
+        "operationId": "getDocumentationPage",
+        "tags": ["Documentation"],
+        "summary": "View the API documentation",
+        "responses": {
+          "200": {
+            "description": "A self-contained documentation page that loads its local TypeScript-compiled renderer and the OpenAPI JSON document.",
+            "content": {
+              "text/html; charset=utf-8": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs/app.js": {
+      "get": {
+        "operationId": "getDocumentationRenderer",
+        "tags": ["Documentation"],
+        "summary": "Load the local documentation renderer",
+        "responses": {
+          "200": {
+            "description": "The TypeScript-compiled JavaScript used by the documentation page.",
+            "content": {
+              "text/javascript; charset=utf-8": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApiDocument",
+        "tags": ["Documentation"],
+        "summary": "Download the OpenAPI document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1.1 document used by the documentation page.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "const": "ok" }
+        }
+      },
+      "ReadinessResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ready",
+          "executionReady",
+          "executionHandoffReady",
+          "stateStoreReady",
+          "soyuzConfigured",
+          "queueConfigured",
+          "queueTransportHealthy",
+          "recoveryBacklogHealthy",
+          "outboxBackpressured",
+          "callbacksPending",
+          "callbacksBlocked",
+          "oldestPendingCallbackAgeMs",
+          "dockerSupervisorAvailable",
+          "syntheticExecutionAvailable",
+          "productionCodingExecutionReady",
+          "senkuConfigured",
+          "senkuAdvisoryHealthy",
+          "missingDependencies",
+          "limitations"
+        ],
+        "properties": {
+          "ready": { "type": "boolean", "description": "Overall service readiness." },
+          "executionReady": { "type": "boolean" },
+          "executionHandoffReady": { "type": "boolean" },
+          "stateStoreReady": { "type": "boolean" },
+          "soyuzConfigured": { "type": "boolean" },
+          "queueConfigured": { "type": "boolean" },
+          "queueTransportHealthy": { "type": ["boolean", "null"] },
+          "recoveryBacklogHealthy": { "type": "boolean" },
+          "outboxBackpressured": { "type": "boolean" },
+          "callbacksPending": { "type": "integer", "minimum": 0 },
+          "callbacksBlocked": { "type": "integer", "minimum": 0 },
+          "oldestPendingCallbackAgeMs": { "type": ["integer", "null"], "minimum": 0 },
+          "dockerSupervisorAvailable": { "type": ["boolean", "null"] },
+          "syntheticExecutionAvailable": { "type": "boolean" },
+          "productionCodingExecutionReady": { "type": "boolean" },
+          "senkuConfigured": { "type": "boolean" },
+          "senkuAdvisoryHealthy": { "type": ["boolean", "null"] },
+          "missingDependencies": { "type": "array", "items": { "type": "string" } },
+          "limitations": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

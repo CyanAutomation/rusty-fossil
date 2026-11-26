@@ -1,13 +1,18 @@
 use crate::config::{AppConfig, ReadinessReport};
 use axum::extract::State;
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use fossil_storage::SqliteStore;
 use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const OPENAPI_DOCUMENT: &str = include_str!("../openapi.json");
+const DOCS_HTML: &str = include_str!("../static/docs.html");
+const DOCS_SCRIPT: &str = include_str!("../static/docs.js");
+const DOCS_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -113,7 +118,52 @@ pub fn router(state: ApiState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
+        .route("/docs", get(docs_redirect))
+        .route("/docs/", get(docs))
+        .route("/docs/app.js", get(docs_script))
+        .route("/openapi.json", get(openapi_document))
         .with_state(state)
+}
+
+async fn docs_redirect() -> Redirect {
+    Redirect::permanent("./docs/")
+}
+
+async fn docs() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                DOCS_CONTENT_SECURITY_POLICY,
+            ),
+        ],
+        DOCS_HTML,
+    )
+        .into_response()
+}
+
+async fn docs_script() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        DOCS_SCRIPT,
+    )
+        .into_response()
+}
+
+async fn openapi_document() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        OPENAPI_DOCUMENT,
+    )
+        .into_response()
 }
 
 async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {

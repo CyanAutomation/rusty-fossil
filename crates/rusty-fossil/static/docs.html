@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Rusty-Fossil API</title>
+    <style>
+      :root { color-scheme: light dark; font: 16px/1.55 system-ui, sans-serif; }
+      body { max-width: 64rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+      header { border-bottom: 1px solid #8886; margin-bottom: 2rem; padding-bottom: 1.25rem; }
+      h1 { margin-bottom: .25rem; }
+      h2 { margin: 0; font-size: 1.2rem; }
+      h3 { font-size: 1rem; }
+      a { color: LinkText; }
+      .muted, .description { color: GrayText; }
+      .route { border: 1px solid #8886; border-radius: .6rem; margin: 1rem 0; padding: 1rem; }
+      .route-heading { align-items: baseline; display: flex; flex-wrap: wrap; gap: .75rem; }
+      .method { background: #16803c; border-radius: .25rem; color: white; font: 700 .8rem/1.4 ui-monospace, monospace; padding: .15rem .45rem; }
+      code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+      pre { background: #8882; border-radius: .35rem; overflow: auto; padding: .8rem; white-space: pre-wrap; }
+      details { margin: .75rem 0; }
+      summary { cursor: pointer; font-weight: 600; }
+      .schema { margin: .5rem 0 1rem; }
+      .error { border-left: .25rem solid #c33; padding-left: .8rem; }
+      footer { border-top: 1px solid #8886; margin-top: 2rem; padding-top: 1rem; }
+      @media (max-width: 36rem) { body { padding: 1rem .8rem 3rem; } }
+    </style>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>Rusty-Fossil API</h1>
+      <p class="muted">Read-only service diagnostics. This API does not accept or start tasks.</p>
+      <a href="../openapi.json">Open the raw OpenAPI 3.1.1 document</a>
+    </header>
+    <main id="api-docs" aria-live="polite">
+      <p id="load-status">Loading API documentation…</p>
+    </main>
+    <footer class="muted">The service binds to 127.0.0.1:8080 by default.</footer>
+  </body>
+</html>

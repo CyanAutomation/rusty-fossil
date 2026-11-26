@@ -17,6 +17,19 @@ fn config(pairs: &[(&str, &str)]) -> Result<AppConfig, ConfigError> {
     )
 }
 
+fn json_matches_openapi_type(value: &serde_json::Value, type_name: &str) -> bool {
+    match type_name {
+        "array" => value.is_array(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        "number" => value.as_f64().is_some(),
+        "object" => value.is_object(),
+        "string" => value.is_string(),
+        _ => false,
+    }
+}
+
 #[test]
 // Soyuz requirement: AUTH-CONFIG-01.
 fn missing_soyuz_configuration_prevents_execution_readiness() {
@@ -202,6 +215,245 @@ async fn health_ready_and_metrics_are_distinct_and_task_routes_do_not_exist() {
     assert!(text.contains("fossil_docker_supervisor_available 0"));
     assert!(text.contains("fossil_synthetic_execution_available 0"));
     assert!(text.contains("fossil_production_coding_execution_ready 0"));
+}
+
+#[tokio::test]
+async fn openapi_document_covers_the_api_get_routes() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
+    let app = router(ApiState::new(config(&[]).unwrap(), store));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(spec["openapi"], "3.1.1");
+
+    let paths = spec["paths"].as_object().expect("OpenAPI paths object");
+    for required_path in [
+        "/health",
+        "/ready",
+        "/metrics",
+        "/docs",
+        "/docs/",
+        "/docs/app.js",
+        "/openapi.json",
+    ] {
+        assert!(paths.contains_key(required_path), "missing {required_path}");
+    }
+    for unsupported_path in ["/runs", "/execute", "/v1/runs"] {
+        assert!(
+            !paths.contains_key(unsupported_path),
+            "unexpected task endpoint {unsupported_path}"
+        );
+    }
+
+    for (path, path_item) in paths {
+        let documented_get = path_item
+            .get("get")
+            .expect("every public path currently supports GET");
+        assert_eq!(
+            path_item.as_object().unwrap().len(),
+            1,
+            "GET {path} is the only documented method"
+        );
+        let responses = documented_get["responses"]
+            .as_object()
+            .expect("operation response map");
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status().as_u16().to_string();
+        assert!(
+            responses.contains_key(&status),
+            "GET {path} returned undocumented status {}",
+            response.status()
+        );
+        if let Some(content_type) = response.headers().get(axum::http::header::CONTENT_TYPE) {
+            let content_type = content_type.to_str().unwrap();
+            assert!(
+                responses[&status]["content"]
+                    .as_object()
+                    .is_some_and(|content| content.contains_key(content_type)),
+                "GET {path} returned undocumented content type {content_type}"
+            );
+        }
+    }
+
+    assert!(
+        spec["paths"]["/ready"]["get"]["responses"]
+            .get("503")
+            .is_some()
+    );
+    assert_eq!(
+        spec["paths"]["/docs"]["get"]["responses"]["308"]["headers"]["Location"]["schema"]["const"],
+        "./docs/"
+    );
+    assert_eq!(
+        spec["paths"]["/metrics"]["get"]["responses"]["200"]["content"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+
+    let ready = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = ready.into_body().collect().await.unwrap().to_bytes();
+    let readiness: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let actual_fields = readiness
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let schema_fields = spec["components"]["schemas"]["ReadinessResponse"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let required_fields = spec["components"]["schemas"]["ReadinessResponse"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual_fields, schema_fields);
+    assert_eq!(actual_fields, required_fields);
+    let schema_properties = spec["components"]["schemas"]["ReadinessResponse"]["properties"]
+        .as_object()
+        .unwrap();
+    for (field, field_schema) in schema_properties {
+        let expected_types = match &field_schema["type"] {
+            serde_json::Value::String(type_name) => vec![type_name.as_str()],
+            serde_json::Value::Array(type_names) => type_names
+                .iter()
+                .map(|type_name| type_name.as_str().unwrap())
+                .collect(),
+            _ => panic!("missing type for readiness field {field}"),
+        };
+        assert!(
+            expected_types
+                .iter()
+                .any(|type_name| json_matches_openapi_type(&readiness[field], type_name)),
+            "readiness field {field} does not match its OpenAPI type"
+        );
+    }
+}
+
+#[tokio::test]
+async fn docs_page_is_local_and_serves_its_typescript_compiled_asset() {
+    let directory = tempdir().unwrap();
+    let store = SqliteStore::open(directory.path().join("private-state/state.sqlite3")).unwrap();
+    let app = router(ApiState::new(config(&[]).unwrap(), store));
+
+    let redirect = app
+        .clone()
+        .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(redirect.headers()[axum::http::header::LOCATION], "./docs/");
+
+    let page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/docs/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(
+        page.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html; charset=utf-8")
+    );
+    assert!(
+        page.headers()[axum::http::header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'")
+    );
+    assert_eq!(
+        page.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+    let page = page.into_body().collect().await.unwrap().to_bytes();
+    let page = std::str::from_utf8(&page).unwrap();
+    assert!(page.contains("Rusty-Fossil API"));
+    assert!(page.contains("src=\"app.js\""));
+    assert!(page.contains("/openapi.json"));
+    assert!(
+        !page.contains("https://"),
+        "docs page loads no remote assets"
+    );
+
+    let script = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(script.status(), StatusCode::OK);
+    assert!(
+        script.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript; charset=utf-8")
+    );
+    assert!(
+        !script
+            .headers()
+            .contains_key(axum::http::header::CONTENT_SECURITY_POLICY),
+        "CSP belongs on the HTML document, not the JavaScript response"
+    );
+    assert_eq!(
+        script.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+    let script = script.into_body().collect().await.unwrap().to_bytes();
+    let script = std::str::from_utf8(&script).unwrap();
+    assert!(script.contains("fetch("));
+    assert!(script.contains("createElement"));
+    assert!(script.contains("Endpoint groups"));
+    assert!(script.contains("Headers"));
+    assert!(
+        !script.contains("https://"),
+        "docs script loads no remote code"
+    );
 }
 
 #[test]
