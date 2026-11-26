@@ -501,7 +501,7 @@ fn callback_matches_container_result(
         return false;
     }
     match (&callback.payload, launch.outcome_class.as_deref()) {
-        (CallbackPayload::Completed { exit_code, .. }, Some("success")) => {
+        (CallbackPayload::Completed { exit_code, .. }, Some("success" | "pi_completed")) => {
             *exit_code == Some(0) && launch.exit_code == Some(0)
         }
         (CallbackPayload::Cancelled { exit_code, .. }, Some("cancelled")) => {
@@ -511,6 +511,10 @@ fn callback_matches_container_result(
             CallbackPayload::Failed { exit_code, .. },
             Some(
                 "nonzero_exit"
+                | "provider_error"
+                | "pi_process_failure"
+                | "invalid_event_stream"
+                | "output_truncated"
                 | "timeout"
                 | "docker_failure"
                 | "resource_limit_failure"
@@ -2112,30 +2116,57 @@ impl SqliteStore {
             started_at_ms,
             completed_at_ms,
         } = times;
-        let valid_class = matches!(
-            outcome_class,
-            "success"
-                | "nonzero_exit"
-                | "timeout"
-                | "cancelled"
-                | "docker_failure"
-                | "resource_limit_failure"
-                | "unexpected_termination"
-                | "execution_uncertain"
-        );
-        if !valid_class
-            || diagnostic_summary.len() > 512
+        if diagnostic_summary.len() > 512
             || diagnostic_summary.chars().any(char::is_control)
             || started_at_ms.is_some_and(|started| started < 0 || started > completed_at_ms)
             || completed_at_ms < 0
-            || (outcome_class == "success" && exit_code != Some(0))
-            || (outcome_class == "nonzero_exit" && exit_code.is_none_or(|value| value == 0))
         {
             return Err(StoreError::InvalidContainerLaunchResult);
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = load_container_launch(&transaction, run_id)?;
+        let valid_class = match current.workload_kind {
+            WorkloadKind::Synthetic => matches!(
+                outcome_class,
+                "success"
+                    | "nonzero_exit"
+                    | "timeout"
+                    | "cancelled"
+                    | "docker_failure"
+                    | "resource_limit_failure"
+                    | "unexpected_termination"
+                    | "execution_uncertain"
+            ),
+            WorkloadKind::PiCodingV1 => matches!(
+                outcome_class,
+                "pi_completed"
+                    | "provider_error"
+                    | "pi_process_failure"
+                    | "invalid_event_stream"
+                    | "output_truncated"
+                    | "timeout"
+                    | "cancelled"
+                    | "docker_failure"
+                    | "resource_limit_failure"
+                    | "unexpected_termination"
+                    | "execution_uncertain"
+            ),
+        };
+        let valid_truncation_state = match current.workload_kind {
+            WorkloadKind::Synthetic => true,
+            WorkloadKind::PiCodingV1 => match outcome_class {
+                "output_truncated" => output_truncated,
+                _ => !output_truncated,
+            },
+        };
+        if !valid_class
+            || !valid_truncation_state
+            || (matches!(outcome_class, "success" | "pi_completed") && exit_code != Some(0))
+            || (outcome_class == "nonzero_exit" && exit_code.is_none_or(|value| value == 0))
+        {
+            return Err(StoreError::InvalidContainerLaunchResult);
+        }
         if current.state == ContainerLaunchState::ContainerExited {
             if current.exit_code != exit_code
                 || current.outcome_class.as_deref() != Some(outcome_class)

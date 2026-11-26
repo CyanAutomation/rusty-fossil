@@ -1,4 +1,5 @@
 use crate::docker::{DockerRuntimeConfig, classify_status};
+use crate::pi_events::{PiEventParser, PiStreamError, classify_pi_execution};
 use crate::{
     CancellationOutcome, ExecutionOutcome, ExecutionSupervisor, PreparedExecution,
     ReconciliationOutcome, SupervisorError, SyntheticScenario, TerminalReason,
@@ -35,6 +36,7 @@ const LABEL_WORKLOAD_VERSION: &str = "io.rusty-fossil.workload-version";
 const WORKLOAD_VERSION: &str = "synthetic-v1";
 const MIN_DOCKER_API_MINOR: usize = 41;
 const CREATE_RESPONSE_GRACE: Duration = Duration::from_secs(30);
+const MAX_PI_DOCKER_LOG_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct DockerSupervisor {
@@ -967,25 +969,50 @@ impl DockerSupervisor {
             .and_then(docker_timestamp_ms)
             .unwrap_or_else(now_ms);
         let started_at_ms = state.started_at.as_deref().and_then(docker_timestamp_ms);
-        let logs_truncated = self.read_bounded_logs(&launch).await?.1;
         let stop_reason = requested_reason.or(launch.stop_reason.as_deref());
         let stopped_before_exit = launch
             .stop_requested_at_ms
             .is_some_and(|requested_at| finished_at_ms > requested_at);
-        let (exit_code, class, summary) = if stopped_before_exit {
+        let (class, summary, logs_truncated) = if stopped_before_exit {
             match stop_reason {
-                Some("cancelled") => (Some(exit_code), "cancelled", "synthetic workload cancelled"),
-                Some("timeout") => (Some(exit_code), "timeout", "synthetic workload timed out"),
+                Some("cancelled") if launch.workload_kind == WorkloadKind::Synthetic => {
+                    ("cancelled", "synthetic workload cancelled", false)
+                }
+                Some("cancelled") => ("cancelled", "Pi coding task cancelled", false),
+                Some("timeout") if launch.workload_kind == WorkloadKind::Synthetic => {
+                    ("timeout", "synthetic workload timed out", false)
+                }
+                Some("timeout") => ("timeout", "Pi coding task timed out", false),
                 _ => (
-                    Some(exit_code),
                     "execution_uncertain",
                     "execution stopped after Soyuz became unavailable",
+                    false,
                 ),
             }
         } else {
-            let oom = state.oom_killed.unwrap_or(false);
-            let (code, class, summary) = classify_status(launch.scenario, exit_code, oom);
-            (code, class, summary)
+            match launch.workload_kind {
+                WorkloadKind::Synthetic => {
+                    let logs_truncated = self.read_bounded_logs(&launch).await?.1;
+                    let oom = state.oom_killed.unwrap_or(false);
+                    let (_, class, summary) = classify_status(launch.scenario, exit_code, oom);
+                    (class, summary, logs_truncated)
+                }
+                WorkloadKind::PiCodingV1 if state.oom_killed.unwrap_or(false) => (
+                    "resource_limit_failure",
+                    "Pi worker exceeded its resource limit",
+                    false,
+                ),
+                WorkloadKind::PiCodingV1 => {
+                    let stream = self.read_pi_event_stream(&launch).await?;
+                    let class = classify_pi_execution(stream, Some(exit_code), None);
+                    let outcome = class.durable_outcome();
+                    (
+                        outcome.outcome_class,
+                        outcome.diagnostic_summary,
+                        outcome.output_truncated,
+                    )
+                }
+            }
         };
         if launch.state != ContainerLaunchState::ContainerExited {
             #[cfg(feature = "test-support")]
@@ -994,7 +1021,7 @@ impl DockerSupervisor {
                 .store
                 .record_container_exit_with_times(
                     launch.run_id,
-                    exit_code,
+                    Some(exit_code),
                     class,
                     summary,
                     logs_truncated,
@@ -1150,6 +1177,51 @@ impl DockerSupervisor {
             }
         }
         Ok((bounded, truncated))
+    }
+
+    async fn read_pi_event_stream(
+        &self,
+        launch: &ContainerLaunchRecord,
+    ) -> Result<Result<crate::pi_events::PiEventSummary, PiStreamError>, SupervisorError> {
+        let options = LogsOptionsBuilder::default()
+            .follow(false)
+            .stdout(true)
+            .stderr(true)
+            .tail("all")
+            .build();
+        let mut stream = self.docker.logs(&launch.container_name, Some(options));
+        let mut parser = PiEventParser::default();
+        let mut observed_bytes = 0_usize;
+        while let Some(item) = stream.next().await {
+            let message = match item {
+                Ok(LogOutput::StdOut { message }) => {
+                    let Some(total) = observed_bytes
+                        .checked_add(message.len())
+                        .filter(|bytes| *bytes <= MAX_PI_DOCKER_LOG_BYTES)
+                    else {
+                        return Ok(Err(PiStreamError::StreamTooLarge));
+                    };
+                    observed_bytes = total;
+                    parser.push(&message)
+                }
+                Ok(LogOutput::StdErr { message }) => {
+                    let Some(total) = observed_bytes
+                        .checked_add(message.len())
+                        .filter(|bytes| *bytes <= MAX_PI_DOCKER_LOG_BYTES)
+                    else {
+                        return Ok(Err(PiStreamError::StreamTooLarge));
+                    };
+                    observed_bytes = total;
+                    continue;
+                }
+                Ok(_) => continue,
+                Err(_) => return Err(SupervisorError::DockerUnavailable),
+            };
+            if let Err(error) = message {
+                return Ok(Err(error));
+            }
+        }
+        Ok(parser.finish(false))
     }
 
     fn enqueue_heartbeat(&self, launch: &ContainerLaunchRecord) {
@@ -1487,9 +1559,12 @@ fn terminal_callback(
     let summary = launch
         .diagnostic_summary
         .as_deref()
-        .unwrap_or("synthetic execution finalized");
+        .unwrap_or(match launch.workload_kind {
+            WorkloadKind::Synthetic => "synthetic execution finalized",
+            WorkloadKind::PiCodingV1 => "Pi execution finalized",
+        });
     let payload = match launch.outcome_class.as_deref() {
-        Some("success") => CallbackPayload::Completed {
+        Some("success" | "pi_completed") => CallbackPayload::Completed {
             worker_id: launch.worker_id.clone(),
             claim_callback_id: launch.claim_callback_id,
             completed_at_ms,
@@ -1525,13 +1600,19 @@ fn outcome_from_launch(
     launch: &ContainerLaunchRecord,
 ) -> Result<ExecutionOutcome, SupervisorError> {
     let reason = match launch.outcome_class.as_deref() {
-        Some("success") => TerminalReason::Completed,
+        Some("success" | "pi_completed") => TerminalReason::Completed,
         Some("nonzero_exit") => TerminalReason::NonzeroExit,
         Some("timeout") => TerminalReason::TimedOut,
         Some("cancelled") => TerminalReason::Cancelled,
         Some("unexpected_termination") => TerminalReason::UnexpectedTermination,
         Some("resource_limit_failure") => TerminalReason::ResourceLimitFailure,
-        Some("execution_uncertain") => TerminalReason::ExecutionUncertain,
+        Some(
+            "provider_error"
+            | "pi_process_failure"
+            | "invalid_event_stream"
+            | "output_truncated"
+            | "execution_uncertain",
+        ) => TerminalReason::ExecutionUncertain,
         Some("docker_failure") => TerminalReason::DockerFailure,
         _ => return Err(SupervisorError::StateUnavailable),
     };
@@ -1544,7 +1625,10 @@ fn outcome_from_launch(
             .clone()
             .unwrap_or_else(|| "synthetic execution finalized".to_owned()),
         output_truncated: launch.output_truncated,
-        workload_id: WORKLOAD_VERSION.to_owned(),
+        workload_id: match launch.workload_kind {
+            WorkloadKind::Synthetic => WORKLOAD_VERSION.to_owned(),
+            WorkloadKind::PiCodingV1 => "pi-coding-v1".to_owned(),
+        },
         started_at: launch.started_at_ms.and_then(format_timestamp_ms),
         completed_at: launch.completed_at_ms.and_then(format_timestamp_ms),
         elapsed_ms: launch

@@ -605,6 +605,169 @@ async fn pi_launch_persists_exact_repository_and_workspace_identity() {
 }
 
 #[tokio::test]
+async fn pi_provider_failure_is_durable_and_keeps_its_terminal_callback_identity() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let mut descriptor = execution_descriptor();
+    descriptor.request.publish_mode = PublishMode::None;
+    let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            pi_launch_profile(7_200_000),
+            gate.clone(),
+        )
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "pi-provider-error-container")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate, 1_798_000_000_000)
+        .unwrap();
+
+    assert!(matches!(
+        store.record_container_exit(
+            run_id(),
+            Some(0),
+            "success",
+            "synthetic success must not classify a Pi run",
+            false,
+            1_798_000_001_000,
+        ),
+        Err(StoreError::InvalidContainerLaunchResult)
+    ));
+    assert!(matches!(
+        store.record_container_exit(
+            run_id(),
+            Some(0),
+            "output_truncated",
+            "Pi output exceeded capture limits",
+            false,
+            1_798_000_001_000,
+        ),
+        Err(StoreError::InvalidContainerLaunchResult)
+    ));
+
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "provider_error",
+            "Pi model provider returned an error",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let callback = CallbackOutboxRecord::new(
+        exited.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Failed {
+            worker_id: worker_id(),
+            claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                .unwrap(),
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: Some(0),
+            failure_class: "provider_error".to_owned(),
+            failure_message: "Pi model provider returned an error".to_owned(),
+            outcome_summary: None,
+        },
+    );
+    store
+        .transition_terminal_with_callback(run_id(), callback.clone())
+        .unwrap();
+    let callback_id = exited.terminal_callback_id.unwrap();
+
+    drop(store);
+    let reopened = SqliteStore::open(path).unwrap();
+    let recovered = reopened.container_launch(run_id()).unwrap().unwrap();
+    assert_eq!(recovered.outcome_class.as_deref(), Some("provider_error"));
+    assert_eq!(recovered.terminal_callback_id, Some(callback_id));
+    assert_eq!(reopened.pending_callbacks().unwrap(), vec![callback]);
+}
+
+#[tokio::test]
+async fn pi_completed_result_accepts_only_the_pi_success_class_for_callback_commit() {
+    let directory = tempdir().unwrap();
+    let path = state_path(directory.path());
+    let mut descriptor = execution_descriptor();
+    descriptor.request.publish_mode = PublishMode::None;
+    let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
+    let gate = execution_gate_authorization_for(&started_authorization).await;
+    store.reserve_execution_slot(run_id()).unwrap();
+    store
+        .begin_container_launch(
+            run_id(),
+            SyntheticScenario::Success,
+            pi_launch_profile(7_200_000),
+            gate.clone(),
+        )
+        .unwrap();
+    store.request_container_create(run_id()).unwrap();
+    store
+        .record_container_created(run_id(), "pi-completed-container")
+        .unwrap();
+    store.mark_container_start_requested(run_id()).unwrap();
+    store
+        .mark_container_running(run_id(), gate, 1_798_000_000_000)
+        .unwrap();
+    assert!(matches!(
+        store.record_container_exit(
+            run_id(),
+            Some(0),
+            "pi_completed",
+            "Pi coding task completed",
+            true,
+            1_798_000_001_000,
+        ),
+        Err(StoreError::InvalidContainerLaunchResult)
+    ));
+    let exited = store
+        .record_container_exit(
+            run_id(),
+            Some(0),
+            "pi_completed",
+            "Pi coding task completed",
+            false,
+            1_798_000_001_000,
+        )
+        .unwrap();
+    let callback = CallbackOutboxRecord::new(
+        exited.terminal_callback_id.unwrap(),
+        run_id(),
+        CallbackPayload::Completed {
+            worker_id: worker_id(),
+            claim_callback_id: ClaimCallbackId::parse("d744c5a2-1d8f-4a2e-bc4d-6813d6fc0133")
+                .unwrap(),
+            completed_at_ms: 1_798_000_001_000,
+            exit_code: Some(0),
+            summary: Some("Pi coding task completed".to_owned()),
+            published_url: None,
+            changed_file_count: None,
+            outcome_summary: None,
+        },
+    );
+    store
+        .transition_terminal_with_callback(run_id(), callback.clone())
+        .unwrap();
+
+    assert_eq!(store.pending_callbacks().unwrap(), vec![callback]);
+    assert_eq!(
+        store
+            .container_launch(run_id())
+            .unwrap()
+            .unwrap()
+            .outcome_class
+            .as_deref(),
+        Some("pi_completed")
+    );
+}
+
+#[tokio::test]
 async fn pi_launch_rejects_nonpilot_descriptor_and_mismatched_git_identity() {
     let directory = tempdir().unwrap();
     let path = state_path(directory.path());
