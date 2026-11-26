@@ -50,6 +50,8 @@ pub enum BrokerError {
     ProviderFailure,
     #[error("gateway request ledger is unavailable")]
     LedgerUnavailable,
+    #[error("system clock is unavailable")]
+    ClockUnavailable,
 }
 
 /// The exact Soyuz fences to which a worker's model capability is bound.
@@ -340,9 +342,6 @@ impl GatewayRequestLedger {
         {
             return Err(BrokerError::RateLimited);
         }
-        if claims.expires_at_ms <= now_ms() {
-            return Err(BrokerError::InvalidToken);
-        }
         let mut connection = self
             .connection
             .lock()
@@ -350,7 +349,8 @@ impl GatewayRequestLedger {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| BrokerError::LedgerUnavailable)?;
-        let now = now_ms();
+        let now = now_ms()?;
+        ensure_unexpired_at(claims, now)?;
         transaction
             .execute(
                 "DELETE FROM gateway_run_budget WHERE expires_at_ms <= ?1",
@@ -701,7 +701,7 @@ impl GatewayBroker {
         body: &[u8],
     ) -> Result<Response<Body>, BrokerError> {
         let token = bearer_token(headers).ok_or(BrokerError::InvalidToken)?;
-        let now = now_ms();
+        let now = now_ms()?;
         let claims = self.signer.verify(token, now)?;
         let request =
             validate_completion_request(body, &self.model, self.limits.maximum_output_tokens)?;
@@ -770,6 +770,7 @@ async fn infer(
                 BrokerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
                 BrokerError::InvalidConfiguration
                 | BrokerError::LedgerUnavailable
+                | BrokerError::ClockUnavailable
                 | BrokerError::ProviderFailure => StatusCode::BAD_GATEWAY,
             };
             if matches!(error, BrokerError::ProviderFailure) {
@@ -789,12 +790,26 @@ async fn infer(
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
+fn now_ms() -> Result<i64, BrokerError> {
+    checked_epoch_millis(std::time::SystemTime::now())
+}
+
+fn checked_epoch_millis(now: std::time::SystemTime) -> Result<i64, BrokerError> {
+    let duration = now
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(i64::MAX)
+        .map_err(|_| BrokerError::ClockUnavailable)?;
+    checked_duration_millis(duration)
+}
+
+fn checked_duration_millis(duration: Duration) -> Result<i64, BrokerError> {
+    i64::try_from(duration.as_millis()).map_err(|_| BrokerError::ClockUnavailable)
+}
+
+fn ensure_unexpired_at(claims: &GatewayTokenClaims, now: i64) -> Result<(), BrokerError> {
+    if claims.expires_at_ms <= now {
+        return Err(BrokerError::InvalidToken);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -802,6 +817,7 @@ mod tests {
     use super::*;
     use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
     use std::sync::Mutex;
+    use std::time::UNIX_EPOCH;
 
     struct MockGateway {
         expected_endpoint: String,
@@ -841,6 +857,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn system_clock_conversion_returns_errors_instead_of_expiry_sentinels() {
+        let before_epoch = UNIX_EPOCH.checked_sub(Duration::from_millis(1)).unwrap();
+        assert_eq!(
+            checked_epoch_millis(before_epoch),
+            Err(BrokerError::ClockUnavailable)
+        );
+        assert_eq!(
+            checked_duration_millis(Duration::from_millis(i64::MAX as u64 + 1)),
+            Err(BrokerError::ClockUnavailable)
+        );
+        assert_eq!(checked_epoch_millis(UNIX_EPOCH), Ok(0));
+    }
+
+    #[test]
+    fn token_expiry_is_checked_at_the_transaction_timestamp() {
+        let request_claims = claims(1_000);
+        assert_eq!(
+            ensure_unexpired_at(&request_claims, request_claims.expires_at_ms),
+            Err(BrokerError::InvalidToken)
+        );
+        assert_eq!(ensure_unexpired_at(&request_claims, 60_999), Ok(()));
+    }
+
     fn test_broker(
         response_status: u16,
         response_content_type: &str,
@@ -851,7 +891,7 @@ mod tests {
         )
         .unwrap();
         let signer = GatewayTokenSigner::new(SecretString::from("s".repeat(48))).unwrap();
-        let now = now_ms();
+        let now = now_ms().unwrap();
         let token = signer.issue(&claims(now)).unwrap();
         let mock = std::sync::Arc::new(MockGateway {
             expected_endpoint: endpoint.as_str().to_owned(),

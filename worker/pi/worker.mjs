@@ -8,9 +8,10 @@ export const MAX_TASK_PROMPT_BYTES = 32 * 1024;
 export const TASK_PROMPT_PATH = "/run/fossil/task-prompt.txt";
 export const MAX_GATEWAY_TOKEN_BYTES = 512;
 export const GATEWAY_TOKEN_PATH = "/run/fossil/gateway-token";
+export const GATEWAY_CA_CERT_PATH = "/run/fossil/gateway-ca.pem";
 export const PI_AGENT_DIRECTORY = "/tmp/pi-agent";
 export const PI_GATEWAY_PROVIDER = "fossil-gateway";
-export const PI_GATEWAY_BASE_URL = "http://fossil-gateway:8787/v1";
+export const PI_GATEWAY_BASE_URL = "https://fossil-gateway:8787/v1";
 const PI_EXECUTABLE = "/opt/pi/node_modules/.bin/pi";
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$/;
 const GATEWAY_TOKEN_PATTERN = /^[A-Za-z0-9._-]{32,512}$/;
@@ -229,6 +230,7 @@ async function runPi(prompt, model) {
     env: {
       CI: "true",
       HOME: "/tmp/pi-home",
+      NODE_EXTRA_CA_CERTS: GATEWAY_CA_CERT_PATH,
       PATH: "/opt/pi/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
       PI_CODING_AGENT_DIR: PI_AGENT_DIRECTORY,
       PI_SKIP_VERSION_CHECK: "1",

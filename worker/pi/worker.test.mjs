@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   MAX_TASK_PROMPT_BYTES,
+  GATEWAY_CA_CERT_PATH,
   GATEWAY_TOKEN_PATH,
   TASK_PROMPT_PATH,
   buildPiModelsConfig,
@@ -104,7 +105,7 @@ test("writes a static OpenAI-compatible Pi model behind the fixed broker", () =>
   assert.deepEqual(buildPiModelsConfig(model, token, cost), {
     providers: {
       "fossil-gateway": {
-        baseUrl: "http://fossil-gateway:8787/v1",
+        baseUrl: "https://fossil-gateway:8787/v1",
         apiKey: token,
         authHeader: true,
         api: "openai-completions",
@@ -122,6 +123,7 @@ test("writes a static OpenAI-compatible Pi model behind the fixed broker", () =>
       },
     },
   });
+  assert.equal(GATEWAY_CA_CERT_PATH, "/run/fossil/gateway-ca.pem");
   assert.throws(() => buildPiModelsConfig(model, "short", cost), /invalid gateway token/);
   assert.throws(() => buildPiModelsConfig(model, token), /invalid model pricing/);
   assert.throws(
@@ -193,6 +195,7 @@ test("pins a multiarch Node image and runs the worker without root", async () =>
   assert.match(dockerfile, /mkdir -p [^\n]*\/run\/fossil/);
   assert.match(dockerfile, /touch \/run\/fossil\/task-prompt\.txt/);
   assert.match(dockerfile, /\/run\/fossil\/gateway-token/);
+  assert.match(dockerfile, /\/run\/fossil\/gateway-ca\.pem/);
   assert.match(dockerfile, /chown -R 65532:65532 [^\n]*\/run\/fossil/);
   assert.doesNotMatch(dockerfile, /\bnode:latest\b/);
 });

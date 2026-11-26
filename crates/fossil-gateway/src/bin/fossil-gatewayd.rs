@@ -2,10 +2,16 @@ use fossil_gateway::{
     DEFAULT_BIND_ADDRESS, GatewayBroker, GatewayEndpoint, GatewayRequestLedger,
     GatewayRequestLimits, GatewayTokenSigner,
 };
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
+use rustls::pki_types::pem::PemObject;
 use secrecy::SecretString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -21,6 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = required("FOSSIL_GATEWAY_MODEL")?;
     let gateway_auth_token = read_secret_file("FOSSIL_GATEWAY_AUTH_TOKEN_FILE", 32, 4096)?;
     let signing_key = read_secret_file("FOSSIL_GATEWAY_SIGNING_KEY_FILE", 32, 512)?;
+    let tls_certificate_path = PathBuf::from(required("FOSSIL_GATEWAY_TLS_CERT_FILE")?);
+    let tls_key_path = PathBuf::from(required("FOSSIL_GATEWAY_TLS_KEY_FILE")?);
+    let tls_certificate =
+        read_tls_file(&tls_certificate_path, "FOSSIL_GATEWAY_TLS_CERT_FILE", false)?;
+    let tls_key = read_tls_file(&tls_key_path, "FOSSIL_GATEWAY_TLS_KEY_FILE", true)?;
+    let tls_config = tls_server_config(&tls_certificate, &tls_key)?;
     let ledger_path = PathBuf::from(
         std::env::var_os("FOSSIL_GATEWAY_LEDGER_PATH")
             .unwrap_or_else(|| "/var/lib/fossil-gateway/ledger.sqlite3".into()),
@@ -48,11 +60,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
     )?);
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!(address = %bind, "restricted model gateway broker listening");
-    axum::serve(listener, broker.router())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    tracing::info!(address = %bind, "restricted model gateway broker listening with TLS");
+    let tls_acceptor = TlsAcceptor::from(tls_config);
+    let router = broker.router();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let tls_acceptor = tls_acceptor.clone();
+                let router = router.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = tls_acceptor.accept(stream).await else {
+                        tracing::debug!("gateway TLS handshake failed");
+                        return;
+                    };
+                    let service = TowerToHyperService::new(router);
+                    if http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("gateway HTTPS connection ended with an error");
+                    }
+                });
+            }
+        }
+    }
     Ok(())
+}
+
+fn tls_server_config(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error>> {
+    let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(certificate_pem)
+        .collect::<Result<Vec<_>, _>>()?;
+    if certificates.is_empty() {
+        return Err("TLS certificate file contains no certificates".into());
+    }
+    let private_key = rustls::pki_types::PrivateKeyDer::from_pem_slice(private_key_pem)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)?;
+    Ok(Arc::new(config))
+}
+
+fn read_tls_file(
+    path: &std::path::Path,
+    variable: &'static str,
+    private: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::{fs::OpenOptions, io::Read};
+
+    const MAX_TLS_FILE_BYTES: usize = 64 * 1024;
+    if !path.is_absolute() {
+        return Err(format!("{variable} must be an absolute path").into());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_TLS_FILE_BYTES as u64
+        || (private && metadata.permissions().mode() & 0o077 != 0)
+    {
+        return Err(format!(
+            "{variable} must reference a bounded regular file with safe permissions"
+        )
+        .into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_TLS_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > MAX_TLS_FILE_BYTES {
+        return Err(format!("{variable} contains invalid TLS material").into());
+    }
+    Ok(bytes)
 }
 
 fn required(name: &'static str) -> Result<String, Box<dyn std::error::Error>> {
@@ -148,7 +240,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::read_private_secret_file;
+    use super::{read_private_secret_file, tls_server_config};
     use secrecy::ExposeSecret;
     use std::os::unix::fs::PermissionsExt;
 
@@ -177,5 +269,12 @@ mod tests {
         std::fs::write(&oversized, "x".repeat(65)).unwrap();
         std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(read_private_secret_file(&oversized, "TEST_SECRET", 32, 64).is_err());
+    }
+
+    #[test]
+    fn tls_server_config_rejects_non_pem_test_material() {
+        assert!(
+            tls_server_config(b"test certificate placeholder", b"test key placeholder").is_err()
+        );
     }
 }

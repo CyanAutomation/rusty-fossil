@@ -25,6 +25,8 @@ services:
       FOSSIL_GATEWAY_MODEL: ${FOSSIL_GATEWAY_MODEL:?Set the exact approved provider model ID}
       FOSSIL_GATEWAY_AUTH_TOKEN_FILE: /run/secrets/fossil_gateway_auth_token
       FOSSIL_GATEWAY_SIGNING_KEY_FILE: /run/secrets/fossil_gateway_signing_key
+      FOSSIL_GATEWAY_TLS_CERT_FILE: /run/secrets/fossil_gateway_tls_certificate
+      FOSSIL_GATEWAY_TLS_KEY_FILE: /run/secrets/fossil_gateway_tls_private_key
       FOSSIL_GATEWAY_LEDGER_PATH: /var/lib/fossil-gateway/ledger.sqlite3
       FOSSIL_GATEWAY_MAX_REQUESTS_PER_RUN: "64"
       FOSSIL_GATEWAY_MAX_REQUEST_BYTES_PER_RUN: "16777216"
@@ -32,6 +34,8 @@ services:
     secrets:
       - fossil_gateway_auth_token
       - fossil_gateway_signing_key
+      - fossil_gateway_tls_certificate
+      - fossil_gateway_tls_private_key
     volumes:
       - type: bind
         source: ${FOSSIL_GATEWAY_HOST_STATE_DIR:?Create a private state directory owned by the dedicated gateway service account}
@@ -59,6 +63,10 @@ secrets:
     file: ${FOSSIL_GATEWAY_AUTH_TOKEN_HOST_FILE:?Create a private, dedicated non-production gateway credential file}
   fossil_gateway_signing_key:
     file: ${FOSSIL_GATEWAY_SIGNING_KEY_HOST_FILE:?Create a private, dedicated broker signing key file}
+  fossil_gateway_tls_certificate:
+    file: ${FOSSIL_GATEWAY_TLS_CERT_HOST_FILE:?Create a TLS certificate for fossil-gateway}
+  fossil_gateway_tls_private_key:
+    file: ${FOSSIL_GATEWAY_TLS_KEY_HOST_FILE:?Create a private TLS key for fossil-gateway}
 
 networks:
   # Pi workers may join this internal network and reach only the broker

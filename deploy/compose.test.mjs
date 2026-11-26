@@ -15,6 +15,8 @@ test("Compose keeps Docker Engine access inside fossil-supervisord", () => {
   const senkuToken = join(temporaryDirectory, "senku-token");
   const gatewayToken = join(temporaryDirectory, "gateway-token");
   const gatewaySigningKey = join(temporaryDirectory, "gateway-signing-key");
+  const gatewayTlsCertificate = join(temporaryDirectory, "gateway-tls-certificate");
+  const gatewayTlsKey = join(temporaryDirectory, "gateway-tls-key");
   const envFile = join(temporaryDirectory, "compose.env");
   const dockerSocket = join(temporaryDirectory, "docker-engine.sock");
 
@@ -28,7 +30,17 @@ test("Compose keeps Docker Engine access inside fossil-supervisord", () => {
     writeFileSync(gatewaySigningKey, "synthetic-gateway-signing-key-abcdefghijklmnopqrstuvwxyz\n", {
       mode: 0o400,
     });
-    for (const path of [soyuzToken, ipcToken, senkuToken, gatewayToken, gatewaySigningKey]) {
+    writeFileSync(gatewayTlsCertificate, "synthetic-tls-certificate\n", { mode: 0o400 });
+    writeFileSync(gatewayTlsKey, "synthetic-tls-private-key\n", { mode: 0o400 });
+    for (const path of [
+      soyuzToken,
+      ipcToken,
+      senkuToken,
+      gatewayToken,
+      gatewaySigningKey,
+      gatewayTlsCertificate,
+      gatewayTlsKey,
+    ]) {
       chmodSync(path, 0o400);
     }
     writeFileSync(
@@ -52,6 +64,8 @@ test("Compose keeps Docker Engine access inside fossil-supervisord", () => {
         `FOSSIL_SUPERVISOR_IPC_TOKEN_HOST_FILE=${ipcToken}`,
         `FOSSIL_GATEWAY_AUTH_TOKEN_HOST_FILE=${gatewayToken}`,
         `FOSSIL_GATEWAY_SIGNING_KEY_HOST_FILE=${gatewaySigningKey}`,
+        `FOSSIL_GATEWAY_TLS_CERT_HOST_FILE=${gatewayTlsCertificate}`,
+        `FOSSIL_GATEWAY_TLS_KEY_HOST_FILE=${gatewayTlsKey}`,
         "FOSSIL_GATEWAY_ENDPOINT=https://gateway.example.invalid/v1",
         "FOSSIL_GATEWAY_MODEL=compose-test-model",
         `SENKU_API_TOKEN_HOST_FILE=${senkuToken}`,
@@ -178,6 +192,14 @@ test("Compose keeps Docker Engine access inside fossil-supervisord", () => {
     const broker = piOverlay.services["fossil-gateway-broker"];
     assert.deepEqual(broker.profiles, ["pi-pilot"]);
     assert.equal(broker.user, "64002:64002", "broker uses a separate synthetic test identity");
+    assert.equal(
+      broker.environment.FOSSIL_GATEWAY_TLS_CERT_FILE,
+      "/run/secrets/fossil_gateway_tls_certificate",
+    );
+    assert.equal(
+      broker.environment.FOSSIL_GATEWAY_TLS_KEY_FILE,
+      "/run/secrets/fossil_gateway_tls_private_key",
+    );
     assert.equal(broker.ports, undefined, "broker must not publish a host port");
     assert.equal(
       broker.volumes.some((volume) => volume.source === dockerSocket),
@@ -186,8 +208,13 @@ test("Compose keeps Docker Engine access inside fossil-supervisord", () => {
     );
     assert.deepEqual(
       broker.secrets.map((secret) => secret.source).sort(),
-      ["fossil_gateway_auth_token", "fossil_gateway_signing_key"],
-      "broker receives only its dedicated upstream and signing credentials",
+      [
+        "fossil_gateway_auth_token",
+        "fossil_gateway_signing_key",
+        "fossil_gateway_tls_certificate",
+        "fossil_gateway_tls_private_key",
+      ],
+      "broker receives only its dedicated upstream, signing, and TLS credentials",
     );
     assert.ok(Object.hasOwn(broker.networks, "pi_worker_internal"));
     assert.ok(Object.hasOwn(broker.networks, "supervisor_egress"));

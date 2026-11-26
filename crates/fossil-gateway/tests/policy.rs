@@ -90,7 +90,7 @@ fn model_requests_are_bounded_and_cannot_select_another_model() {
         validate_completion_request(other_model, "workers-ai/@cf/meta/test-model", 128),
         Err(BrokerError::InvalidRequest)
     );
-    let too_many = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[],"max_tokens":129}"#;
+    let too_many = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"max_tokens":129}"#;
     assert_eq!(
         validate_completion_request(too_many, "workers-ai/@cf/meta/test-model", 128),
         Err(BrokerError::InvalidRequest)
