@@ -122,5 +122,6 @@ test("pins a multiarch Node image and runs the worker without root", async () =>
   assert.match(dockerfile, /ca-certificates git/);
   assert.match(dockerfile, /mkdir -p [^\n]*\/run\/fossil/);
   assert.match(dockerfile, /touch \/run\/fossil\/task-prompt\.txt/);
+  assert.match(dockerfile, /chown -R 65532:65532 [^\n]*\/run\/fossil/);
   assert.doesNotMatch(dockerfile, /\bnode:latest\b/);
 });
