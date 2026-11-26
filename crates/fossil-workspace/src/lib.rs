@@ -18,7 +18,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use url::Url;
@@ -27,6 +27,7 @@ use uuid::Uuid;
 pub const PILOT_REPOSITORY_URL: &str = "https://github.com/CyanAutomation/somatic";
 
 const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(180);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROXY_HEADER_BYTES: usize = 8 * 1024;
@@ -631,25 +632,9 @@ impl RepositoryPolicy {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|_| WorkspaceError::GitFailed)?;
-        let output = timeout(GIT_OPERATION_TIMEOUT, async {
-            let mut stdout = child.stdout.take().ok_or(WorkspaceError::GitFailed)?;
-            let mut bytes = Vec::with_capacity(max_stdout_bytes.min(8192));
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let count = stdout
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|_| WorkspaceError::GitFailed)?;
-                if count == 0 {
-                    break;
-                }
-                if bytes.len().saturating_add(count) > max_stdout_bytes {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    return Err(WorkspaceError::GitOutputTooLarge);
-                }
-                bytes.extend_from_slice(&chunk[..count]);
-            }
+        let mut stdout = child.stdout.take().ok_or(WorkspaceError::GitFailed)?;
+        match timeout(GIT_OPERATION_TIMEOUT, async {
+            let bytes = read_bounded_output(&mut stdout, max_stdout_bytes).await?;
             let status = child.wait().await.map_err(|_| WorkspaceError::GitFailed)?;
             if !status.success() {
                 return Err(WorkspaceError::GitFailed);
@@ -657,8 +642,17 @@ impl RepositoryPolicy {
             Ok(bytes)
         })
         .await
-        .map_err(|_| WorkspaceError::GitTimedOut)??;
-        Ok(output)
+        {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => {
+                terminate_git_child(child).await;
+                Err(error)
+            }
+            Err(_) => {
+                terminate_git_child(child).await;
+                Err(WorkspaceError::GitTimedOut)
+            }
+        }
     }
 
     fn git_command(&self, cwd: &Path, proxy: Option<SocketAddr>) -> Command {
@@ -699,6 +693,39 @@ impl RepositoryPolicy {
             command.arg("-c").arg(format!("http.proxy=http://{proxy}"));
         }
         command
+    }
+}
+
+async fn read_bounded_output<R>(
+    stdout: &mut R,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>, WorkspaceError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_stdout_bytes.min(8192));
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = stdout
+            .read(&mut chunk)
+            .await
+            .map_err(|_| WorkspaceError::GitFailed)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(count) > max_stdout_bytes {
+            return Err(WorkspaceError::GitOutputTooLarge);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+
+async fn terminate_git_child(mut child: Child) {
+    let _ = child.start_kill();
+    if !matches!(timeout(CHILD_REAP_TIMEOUT, child.wait()).await, Ok(Ok(_))) {
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
     }
 }
 
@@ -1103,6 +1130,9 @@ fn parse_proxy_connect_request(headers: &[u8]) -> io::Result<String> {
 }
 
 fn allowed_connect_authority(authority: &str, allowed_host: &str) -> bool {
+    if allowed_host.contains(':') || authority.bytes().filter(|byte| *byte == b':').count() != 1 {
+        return false;
+    }
     let expected = format!("{allowed_host}:443");
     authority.eq_ignore_ascii_case(&expected)
 }
@@ -1116,12 +1146,16 @@ fn public_git_destinations(addresses: impl IntoIterator<Item = SocketAddr>) -> V
 }
 
 async fn respond_proxy_error(stream: &mut TcpStream, status: u16, reason: &str) -> io::Result<()> {
-    stream
-        .write_all(
-            format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
+    let response = proxy_error_response(status, reason);
+    stream.write_all(response.as_bytes()).await
+}
+
+fn proxy_error_response(status: u16, reason: &str) -> String {
+    let safe_reason: String = reason
+        .chars()
+        .filter(|&character| character != '\r' && character != '\n')
+        .collect();
+    format!("HTTP/1.1 {status} {safe_reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
 }
 
 async fn copy_with_limit<R, W>(reader: &mut R, writer: &mut W) -> io::Result<()>
@@ -1153,7 +1187,8 @@ mod tests {
     use super::{
         GitConnectProxy, PILOT_REPOSITORY_URL, RepositoryPolicy, WorkspaceError, WorkspaceIdentity,
         allowed_connect_authority, is_public_destination, parse_ls_remote_result,
-        parse_proxy_connect_request, public_git_destinations, validate_repository_tree,
+        parse_proxy_connect_request, proxy_error_response, public_git_destinations,
+        read_bounded_output, validate_repository_tree,
     };
     use fossil_core::queue::SoyuzRunRequest;
     use serde_json::json;
@@ -1407,7 +1442,9 @@ mod tests {
             "fc00::1".parse().unwrap(),
             "fe80::1".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
+            "2001:0001:0001::1".parse().unwrap(),
             "3fff::1".parse().unwrap(),
+            "3fff:0100::1".parse().unwrap(),
         ] {
             assert!(!is_public_destination(address), "accepted {address}");
         }
@@ -1417,6 +1454,7 @@ mod tests {
         assert!(is_public_destination(
             "2606:50c0:8000::153".parse().unwrap()
         ));
+        assert!(is_public_destination("2001:0200::1".parse().unwrap()));
     }
 
     #[test]
@@ -1432,6 +1470,29 @@ mod tests {
         ] {
             assert!(!allowed_connect_authority(denied, "github.com"));
         }
+        assert!(!allowed_connect_authority(
+            "github.com:8080:443",
+            "github.com:8080"
+        ));
+    }
+
+    #[test]
+    fn proxy_error_reason_cannot_inject_response_headers() {
+        let response = proxy_error_response(403, "Forbidden\r\nX-Injected: yes");
+        assert_eq!(
+            response,
+            "HTTP/1.1 403 ForbiddenX-Injected: yes\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_git_stdout_over_its_bound() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"four").await.unwrap();
+        assert!(matches!(
+            read_bounded_output(&mut reader, 3).await,
+            Err(WorkspaceError::GitOutputTooLarge)
+        ));
     }
 
     #[test]
