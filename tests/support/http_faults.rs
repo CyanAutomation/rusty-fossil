@@ -25,7 +25,7 @@ pub async fn mount_http_fault(
             .set_body_string("{"),
         HttpFaultScenario::Oversized { bytes } => ResponseTemplate::new(200)
             .insert_header("content-type", "application/json")
-            .set_body_string("x".repeat(bytes)),
+            .set_body_string(oversized_json_body(bytes)),
         HttpFaultScenario::Delayed { duration } => ResponseTemplate::new(200)
             .set_delay(duration)
             .set_body_string("{}"),
@@ -33,7 +33,29 @@ pub async fn mount_http_fault(
     Mock::given(method(request_method))
         .and(path(request_path))
         .respond_with(response)
+        // Exact request counts also prove fault scenarios do not trigger retries.
         .expect(1)
         .mount(server)
         .await;
+}
+
+fn oversized_json_body(bytes: usize) -> String {
+    const PREFIX: &str = "{\"padding\":\"";
+    const SUFFIX: &str = "\"}";
+    let padding_bytes = bytes.saturating_sub(PREFIX.len() + SUFFIX.len());
+    format!("{PREFIX}{}{SUFFIX}", "x".repeat(padding_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oversized_json_body;
+
+    #[test]
+    fn oversized_body_is_valid_json_at_the_requested_size() {
+        let bytes = 96 * 1024 + 1;
+        let body = oversized_json_body(bytes);
+
+        assert!(body.len() >= bytes);
+        assert!(serde_json::from_str::<serde_json::Value>(&body).is_ok());
+    }
 }
