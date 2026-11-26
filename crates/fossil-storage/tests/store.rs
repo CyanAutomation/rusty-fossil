@@ -23,6 +23,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const RUN_ID: &str = "f8a0c4c5-d628-7b93-a7cf-4b4629a28853";
 const SYNTHETIC_IMAGE: &str = "ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PILOT_REPOSITORY_URL: &str = "https://github.com/CyanAutomation/somatic";
+const PILOT_GIT_REF: &str = "main";
+const PILOT_RESOLVED_COMMIT: &str = "0d02873b71256892b4ec8026a3b0e2a5ab6aaa91";
 
 fn synthetic_launch_profile(runtime_limit_ms: i64) -> ContainerLaunchProfile {
     ContainerLaunchProfile {
@@ -50,9 +53,9 @@ fn pi_launch_profile(runtime_limit_ms: i64) -> ContainerLaunchProfile {
         profile_version: "pi-coding-v1".to_owned(),
         effective_policy_json: r#"{"cpu_millicores":1000,"memory_mib":1024}"#.to_owned(),
         runtime_limit_ms,
-        repository_url: Some("https://github.com/example/service".to_owned()),
-        authorized_git_ref: Some("main".to_owned()),
-        resolved_commit: Some("a".repeat(40)),
+        repository_url: Some(PILOT_REPOSITORY_URL.to_owned()),
+        authorized_git_ref: Some(PILOT_GIT_REF.to_owned()),
+        resolved_commit: Some(PILOT_RESOLVED_COMMIT.to_owned()),
         workspace_identity: Some("wsp_f8a0c4c5-d628-7b93-a7cf-4b4629a28853".to_owned()),
     }
 }
@@ -210,6 +213,14 @@ fn execution_descriptor() -> ExecutionDescriptor {
     ))
     .unwrap();
     ExecutionDescriptor::from(&envelope)
+}
+
+fn pilot_execution_descriptor() -> ExecutionDescriptor {
+    let mut descriptor = execution_descriptor();
+    descriptor.request.publish_mode = PublishMode::None;
+    descriptor.request.repo_url = url::Url::parse(PILOT_REPOSITORY_URL).unwrap();
+    descriptor.request.git_ref = PILOT_GIT_REF.to_owned();
+    descriptor
 }
 
 async fn authorization_for(
@@ -552,14 +563,12 @@ async fn docker_launch_intent_is_proof_gated_stable_and_durable() {
 async fn pi_launch_persists_exact_repository_and_workspace_identity() {
     let directory = tempdir().unwrap();
     let path = state_path(directory.path());
-    let mut descriptor = execution_descriptor();
-    descriptor.request.publish_mode = PublishMode::None;
+    let descriptor = pilot_execution_descriptor();
     let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
 
     let profile = pi_launch_profile(7_200_000);
-    let expected_commit = "a".repeat(40);
     let launch = store
         .begin_container_launch(
             run_id(),
@@ -575,14 +584,11 @@ async fn pi_launch_persists_exact_repository_and_workspace_identity() {
     assert!(launch.container_name.starts_with("rusty-fossil-pi-"));
     assert_eq!(launch.workload_version, 1);
     assert_eq!(launch.profile_version, "pi-coding-v1");
-    assert_eq!(
-        launch.repository_url.as_deref(),
-        Some("https://github.com/example/service")
-    );
-    assert_eq!(launch.authorized_git_ref.as_deref(), Some("main"));
+    assert_eq!(launch.repository_url.as_deref(), Some(PILOT_REPOSITORY_URL));
+    assert_eq!(launch.authorized_git_ref.as_deref(), Some(PILOT_GIT_REF));
     assert_eq!(
         launch.resolved_commit.as_deref(),
-        Some(expected_commit.as_str())
+        Some(PILOT_RESOLVED_COMMIT)
     );
     assert_eq!(
         launch.workspace_identity.as_deref(),
@@ -608,8 +614,7 @@ async fn pi_launch_persists_exact_repository_and_workspace_identity() {
 async fn pi_provider_failure_is_durable_and_keeps_its_terminal_callback_identity() {
     let directory = tempdir().unwrap();
     let path = state_path(directory.path());
-    let mut descriptor = execution_descriptor();
-    descriptor.request.publish_mode = PublishMode::None;
+    let descriptor = pilot_execution_descriptor();
     let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
@@ -694,8 +699,7 @@ async fn pi_provider_failure_is_durable_and_keeps_its_terminal_callback_identity
 async fn pi_completed_result_accepts_only_the_pi_success_class_for_callback_commit() {
     let directory = tempdir().unwrap();
     let path = state_path(directory.path());
-    let mut descriptor = execution_descriptor();
-    descriptor.request.publish_mode = PublishMode::None;
+    let descriptor = pilot_execution_descriptor();
     let (store, started_authorization) = authorized_store_with_descriptor(&path, descriptor).await;
     let gate = execution_gate_authorization_for(&started_authorization).await;
     store.reserve_execution_slot(run_id()).unwrap();
@@ -788,8 +792,7 @@ async fn pi_launch_rejects_nonpilot_descriptor_and_mismatched_git_identity() {
         "unexpected rejection: {error:?}"
     );
 
-    let mut descriptor = execution_descriptor();
-    descriptor.request.publish_mode = PublishMode::None;
+    let descriptor = pilot_execution_descriptor();
     let other_directory = tempdir().unwrap();
     let other_path = state_path(other_directory.path());
     let (other_store, other_authorization) =
@@ -937,6 +940,49 @@ async fn v4_launch_rows_migrate_without_inventing_missing_identity_or_deadline()
     );
     assert_eq!(migrated.runtime_limit_ms, None);
     assert_eq!(migrated.effective_deadline_at_ms, None);
+}
+
+#[tokio::test]
+async fn pi_launch_rejects_repository_ref_or_commit_outside_the_designated_pin() {
+    let cases = [
+        (
+            "https://github.com/another-owner/another-repository",
+            PILOT_GIT_REF,
+            PILOT_RESOLVED_COMMIT,
+        ),
+        (
+            PILOT_REPOSITORY_URL,
+            "refs/heads/release",
+            PILOT_RESOLVED_COMMIT,
+        ),
+        (
+            PILOT_REPOSITORY_URL,
+            PILOT_GIT_REF,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    ];
+
+    for (repository_url, git_ref, commit) in cases {
+        let directory = tempdir().unwrap();
+        let path = state_path(directory.path());
+        let mut descriptor = execution_descriptor();
+        descriptor.request.publish_mode = PublishMode::None;
+        descriptor.request.repo_url = url::Url::parse(repository_url).unwrap();
+        descriptor.request.git_ref = git_ref.to_owned();
+        let (store, started_authorization) =
+            authorized_store_with_descriptor(&path, descriptor).await;
+        let gate = execution_gate_authorization_for(&started_authorization).await;
+        store.reserve_execution_slot(run_id()).unwrap();
+        let mut profile = pi_launch_profile(7_200_000);
+        profile.repository_url = Some(repository_url.to_owned());
+        profile.authorized_git_ref = Some(git_ref.to_owned());
+        profile.resolved_commit = Some(commit.to_owned());
+
+        assert!(matches!(
+            store.begin_container_launch(run_id(), SyntheticScenario::Success, profile, gate),
+            Err(StoreError::InvalidContainerLaunchResult)
+        ));
+    }
 }
 
 #[tokio::test]
