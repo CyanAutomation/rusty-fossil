@@ -21,7 +21,9 @@ ENV HOME=/tmp/pi-home \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /opt/worker /workspace /tmp/pi-home /tmp/pi-agent \
+    && mkdir -p /opt/worker /workspace /tmp/pi-home /tmp/pi-agent /run/fossil \
+    && touch /run/fossil/task-prompt.txt \
+    && chmod 0444 /run/fossil/task-prompt.txt \
     && chown -R 65532:65532 /workspace /tmp/pi-home /tmp/pi-agent
 
 WORKDIR /workspace

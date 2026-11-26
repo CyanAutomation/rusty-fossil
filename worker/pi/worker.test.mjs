@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { MAX_TASK_PROMPT_BYTES, buildPiInvocation, parseTaskPrompt } from "./worker.mjs";
+import {
+  MAX_TASK_PROMPT_BYTES,
+  TASK_PROMPT_PATH,
+  buildPiInvocation,
+  parseTaskPrompt,
+  readTaskPromptFile,
+} from "./worker.mjs";
 
 const workerDirectory = new URL(".", import.meta.url);
 
@@ -17,6 +25,41 @@ test("rejects empty, oversized, and invalid UTF-8 prompts", () => {
     /invalid task prompt/,
   );
   assert.throws(() => parseTaskPrompt(Buffer.from([0xff, 0xfe])), /invalid task prompt/);
+});
+
+test("reads a bounded prompt from an immutable payload file", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "rusty-fossil-pi-prompt-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const promptPath = join(directory, "prompt.txt");
+  const prompt = "Fix one test. Keep this exact line.\nπ";
+  await writeFile(promptPath, Buffer.from(prompt, "utf8"), { mode: 0o400 });
+
+  assert.equal(TASK_PROMPT_PATH, "/run/fossil/task-prompt.txt");
+  assert.equal(await readTaskPromptFile(promptPath), prompt);
+});
+
+test("rejects oversized, empty, invalid UTF-8, and symlink payload files", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "rusty-fossil-pi-prompt-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const promptPath = join(directory, "prompt.txt");
+
+  await writeFile(promptPath, Buffer.alloc(MAX_TASK_PROMPT_BYTES + 1, 0x61));
+  await chmod(promptPath, 0o444);
+  await assert.rejects(readTaskPromptFile(promptPath), /invalid task prompt/);
+  await chmod(promptPath, 0o600);
+  await writeFile(promptPath, Buffer.alloc(0));
+  await chmod(promptPath, 0o444);
+  await assert.rejects(readTaskPromptFile(promptPath), /invalid task prompt/);
+  await chmod(promptPath, 0o600);
+  await writeFile(promptPath, Buffer.from([0xff, 0xfe]));
+  await chmod(promptPath, 0o444);
+  await assert.rejects(readTaskPromptFile(promptPath), /invalid task prompt/);
+
+  const targetPath = join(directory, "target.txt");
+  await writeFile(targetPath, "do not follow links", { mode: 0o444 });
+  await rm(promptPath);
+  await symlink(targetPath, promptPath);
+  await assert.rejects(readTaskPromptFile(promptPath));
 });
 
 test("builds a fixed Pi JSON-mode invocation without a shell or prompt argument", () => {
@@ -77,5 +120,7 @@ test("pins a multiarch Node image and runs the worker without root", async () =>
   assert.match(dockerfile, /^USER 65532:65532$/m);
   assert.match(dockerfile, /npm ci --omit=dev/);
   assert.match(dockerfile, /ca-certificates git/);
+  assert.match(dockerfile, /mkdir -p [^\n]*\/run\/fossil/);
+  assert.match(dockerfile, /touch \/run\/fossil\/task-prompt\.txt/);
   assert.doesNotMatch(dockerfile, /\bnode:latest\b/);
 });

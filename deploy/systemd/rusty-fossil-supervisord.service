@@ -1,0 +1,42 @@
+[Unit]
+Description=Rusty-Fossil Docker supervisor
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=docker
+EnvironmentFile=/etc/rusty-fossil/fossil-supervisord.env
+StateDirectory=rusty-fossil
+StateDirectoryMode=0750
+RuntimeDirectory=rusty-fossil-supervisor
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/rusty-fossil
+ExecStartPre=/usr/bin/test -S /run/docker.sock
+ExecStart=/usr/local/bin/fossil-supervisord
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/rusty-fossil /run/rusty-fossil-supervisor
+
+[Install]
+WantedBy=multi-user.target

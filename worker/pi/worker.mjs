@@ -1,7 +1,10 @@
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const MAX_TASK_PROMPT_BYTES = 32 * 1024;
+export const TASK_PROMPT_PATH = "/run/fossil/task-prompt.txt";
 const PI_EXECUTABLE = "/opt/pi/node_modules/.bin/pi";
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
@@ -47,17 +50,41 @@ export function buildPiInvocation(model) {
   };
 }
 
-async function readPromptFromStdin() {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of process.stdin) {
-    size += chunk.length;
-    if (size > MAX_TASK_PROMPT_BYTES) {
+export async function readTaskPromptFile(filePath = TASK_PROMPT_PATH) {
+  let file;
+  try {
+    file = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await file.stat();
+    if (
+      !metadata.isFile() ||
+      metadata.size > MAX_TASK_PROMPT_BYTES ||
+      (metadata.mode & 0o222) !== 0 ||
+      (metadata.mode & 0o444) === 0
+    ) {
       throw new Error("invalid task prompt");
     }
-    chunks.push(chunk);
+
+    const chunks = [];
+    const buffer = Buffer.alloc(4096);
+    let size = 0;
+    while (true) {
+      const { bytesRead } = await file.read(
+        buffer,
+        0,
+        Math.min(buffer.length, MAX_TASK_PROMPT_BYTES + 1 - size),
+        null,
+      );
+      if (bytesRead === 0) break;
+      size += bytesRead;
+      if (size > MAX_TASK_PROMPT_BYTES) {
+        throw new Error("invalid task prompt");
+      }
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    }
+    return parseTaskPrompt(Buffer.concat(chunks, size));
+  } finally {
+    await file?.close();
   }
-  return parseTaskPrompt(Buffer.concat(chunks, size));
 }
 
 function runPi(prompt, model) {
@@ -109,7 +136,7 @@ function runPi(prompt, model) {
 async function main() {
   let prompt;
   try {
-    prompt = await readPromptFromStdin();
+    prompt = await readTaskPromptFile();
   } catch {
     process.stderr.write("invalid task prompt\n");
     return 2;

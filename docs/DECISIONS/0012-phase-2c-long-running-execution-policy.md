@@ -21,6 +21,10 @@ Keep independently configured deadlines with supervisor-owned bounds:
 
 The profile, cancellation, outage, shutdown and recovery bounds remain trusted supervisor configuration, not arbitrary task options. The current canonical request timeout is validated by Soyuz and preserved in the durable descriptor; the effective coding deadline must be the minimum of that validated timeout, the trusted coding profile and the local supervisor ceiling. Schema v5 now persists the synthetic workload kind/version, image identity, profile version, effective resource/runtime policy, and absolute synthetic deadline. The Pi-specific values and request-derived coding deadline remain unimplemented. Deadline calculations continue to rely on synchronized wall-clock time until a restart-stable host clock source is designed.
 
+## Host service identity
+
+The Agentlab owner expects Rusty-Fossil's controller and supervisor to run as the existing `pi` user. Do not create a separate account as part of this phase. The proposed systemd split gives the supervisor access to `/run/docker.sock` and masks that path inside the controller's mount namespace. Because `pi` is itself in the rootful Docker group, an interactive shell and the supervisor retain Docker authority; this arrangement isolates the controller process but does not reduce the host account's overall privilege. The unit examples are not installed or verified on Agentlab. Before enabling them, verify the effective sandbox, block or rule out a Docker TCP endpoint, and confirm the controller cannot see or connect to the Unix socket.
+
 ## Proposed maintenance and shutdown behavior
 
 Phase 2C-A should add a conservative drain state before allowing long-running jobs: reject new launches, preserve durable worker state, and stop active work by an explicit bounded deadline. Do not implement a seamless supervisor handoff unless exclusive supervisor ownership and exact-container reattachment can be proven. Until then, planned shutdown must not create a second supervisor or speculate about prompt redelivery. Host shutdown, Docker loss or ambiguous identity must retain the current fail-closed stop/uncertain behavior.
