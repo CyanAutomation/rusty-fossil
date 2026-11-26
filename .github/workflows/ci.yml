@@ -77,6 +77,17 @@ jobs:
       - name: Test the worker wrapper
         run: node --test worker/pi/worker.test.mjs
 
+  compose-config-tests:
+    name: Validate Docker Compose service boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - name: Check Compose configuration and socket isolation
+        run: node --test deploy/compose.test.mjs
+
   api-docs:
     name: Type-check the API docs renderer and verify its bundle
     runs-on: ubuntu-latest

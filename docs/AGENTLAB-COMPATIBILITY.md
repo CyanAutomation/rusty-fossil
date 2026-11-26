@@ -1,0 +1,5 @@
+# Agentlab compatibility
+
+The current Agentlab inventory and deployment disposition are recorded in [ARM64 host compatibility](ARM64-HOST-COMPATIBILITY.md). The host owner expects Rusty-Fossil to run as `pi`; read-only checks on 2026-11-26 verified UID/GID 1000:1000, Docker GID 985 and Docker Compose v5.6.1. The root Compose configuration maps both containers to those IDs and grants Docker socket access only to `fossil-supervisord`. The Compose configuration has not been deployed or verified on Agentlab.
+
+The `pi` account remains a member of the rootful Docker group, so an interactive shell as `pi` retains host-root-equivalent Docker authority; the container split is process confinement under a shared Unix identity, not account separation. SSH authentication policy is unverified. A read-only Cloudflare check found the existing default AI Gateway logs requests and has no spend limit; it was not used for inference. The Compose supervisor network provides outbound access and no destination allowlist; no model broker or worker egress policy has been validated. The coding-worker deployment gate remains closed.
