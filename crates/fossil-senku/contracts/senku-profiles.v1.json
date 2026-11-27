@@ -1,8 +1,20 @@
 {
   "schemaVersion": "1",
-  "contracts": [
+  "compatibilityPolicy": "Response envelope fields may be added. Required fields, meanings, and answer contracts may change only under a new schemaVersion.",
+  "profiles": [
     {
-      "key": "contract_02",
+      "schemaVersion": "1",
+      "id": "kaseki_context_routing_v1",
+      "version": "1",
+      "name": "Kaseki context routing",
+      "description": "Choose advisory context-preservation or local-output reduction routes from bounded evidence; Kaseki deterministic transformations remain authoritative.",
+      "owner": "kaseki",
+      "questionCount": 32,
+      "dynamicQuestions": true,
+      "maxEvidenceBytes": 32768,
+      "operations": [
+        "evaluate"
+      ],
       "outputSchema": {
         "type": "object",
         "minProperties": 1,
@@ -163,6 +175,16 @@
           ]
         }
       },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 32768,
+        "questionCount": 32
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "kaseki",
+        "rusty_fossil"
+      ],
       "outputVariants": {
         "tool_output": {
           "type": "object",
@@ -557,7 +579,18 @@
       }
     },
     {
-      "key": "contract_04",
+      "schemaVersion": "1",
+      "id": "kaseki_goal_check_v1",
+      "version": "1",
+      "name": "Kaseki goal check",
+      "description": "Assess bounded run evidence against caller-provided goal criteria; the criteria are data and local outcome policy remains authoritative.",
+      "owner": "kaseki",
+      "questionCount": 64,
+      "dynamicQuestions": true,
+      "maxEvidenceBytes": 49152,
+      "operations": [
+        "evaluate"
+      ],
       "outputSchema": {
         "type": "object",
         "minProperties": 1,
@@ -718,6 +751,16 @@
           ]
         }
       },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 49152,
+        "questionCount": 64
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "kaseki",
+        "rusty_fossil"
+      ],
       "outputVariants": {
         "with_applicability": {
           "type": "object",
@@ -839,7 +882,562 @@
       }
     },
     {
-      "key": "contract_05",
+      "schemaVersion": "1",
+      "id": "kaseki_output_review_v1",
+      "version": "1",
+      "name": "Kaseki output review",
+      "description": "Assess the recorded Kaseki result summary against its canonical run status.",
+      "owner": "soyuz",
+      "questionCount": 3,
+      "dynamicQuestions": false,
+      "maxEvidenceBytes": 8192,
+      "operations": [
+        "evaluate"
+      ],
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "summary_specificity",
+          "outcome_alignment",
+          "evidence_strength"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "summary_specificity": {
+            "type": "object",
+            "required": [
+              "type",
+              "noul",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "noul"
+              },
+              "noul": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "false",
+                  "true"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "false": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "true": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": "null",
+                "const": null
+              }
+            }
+          },
+          "outcome_alignment": {
+            "type": "object",
+            "required": [
+              "type",
+              "choice",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "choice"
+              },
+              "choice": {
+                "type": "string",
+                "enum": [
+                  "consistent",
+                  "unclear",
+                  "inconsistent"
+                ]
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "consistent",
+                  "unclear",
+                  "inconsistent"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "consistent": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "unclear": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "inconsistent": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          },
+          "evidence_strength": {
+            "type": "object",
+            "required": [
+              "type",
+              "score",
+              "legend",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "score"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "legend": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "0": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Insufficient"
+                  },
+                  "1": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Some concrete detail"
+                  },
+                  "2": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Clear and specific"
+                  }
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "0": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "1": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "2": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        }
+      },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 8192,
+        "questionCount": 3
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "soyuz"
+      ]
+    },
+    {
+      "schemaVersion": "1",
+      "id": "kaseki_output_review_v2",
+      "version": "2",
+      "name": "Kaseki output and outcome review",
+      "description": "Score the recorded Kaseki result and how well it supports the canonical run outcome.",
+      "owner": "soyuz",
+      "questionCount": 4,
+      "dynamicQuestions": false,
+      "maxEvidenceBytes": 8192,
+      "operations": [
+        "evaluate"
+      ],
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "summary_specificity",
+          "outcome_alignment",
+          "evidence_strength",
+          "recorded_outcome"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "summary_specificity": {
+            "type": "object",
+            "required": [
+              "type",
+              "noul",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "noul"
+              },
+              "noul": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "false",
+                  "true"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "false": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "true": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": "null",
+                "const": null
+              }
+            }
+          },
+          "outcome_alignment": {
+            "type": "object",
+            "required": [
+              "type",
+              "choice",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "choice"
+              },
+              "choice": {
+                "type": "string",
+                "enum": [
+                  "consistent",
+                  "unclear",
+                  "inconsistent"
+                ]
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "consistent",
+                  "unclear",
+                  "inconsistent"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "consistent": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "unclear": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "inconsistent": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          },
+          "evidence_strength": {
+            "type": "object",
+            "required": [
+              "type",
+              "score",
+              "legend",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "score"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "legend": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "0": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Insufficient"
+                  },
+                  "1": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Some concrete detail"
+                  },
+                  "2": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Clear and specific"
+                  }
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "0": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "1": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "2": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          },
+          "recorded_outcome": {
+            "type": "object",
+            "required": [
+              "type",
+              "score",
+              "legend",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "score"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "legend": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "0": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Outcome unclear or unsuccessful"
+                  },
+                  "1": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Partial or limited outcome evidence"
+                  },
+                  "2": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Successful and clearly reported outcome"
+                  }
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "0": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "1": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "2": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        }
+      },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 8192,
+        "questionCount": 4
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "soyuz"
+      ]
+    },
+    {
+      "schemaVersion": "1",
+      "id": "kaseki_run_evaluation_v1",
+      "version": "1",
+      "name": "Kaseki run evaluation",
+      "description": "Score bounded coding-run evidence and provide an advisory failure diagnosis when requested.",
+      "owner": "kaseki",
+      "questionCount": 5,
+      "dynamicQuestions": true,
+      "maxEvidenceBytes": 98304,
+      "operations": [
+        "evaluate"
+      ],
       "outputSchema": {
         "type": "object",
         "minProperties": 1,
@@ -1000,6 +1598,16 @@
           ]
         }
       },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 98304,
+        "questionCount": 5
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "kaseki",
+        "rusty_fossil"
+      ],
       "outputVariants": {
         "with_failure_diagnosis": {
           "type": "object",
@@ -1412,7 +2020,481 @@
       }
     },
     {
-      "key": "contract_01",
+      "schemaVersion": "1",
+      "id": "run_operations_triage_v1",
+      "version": "1",
+      "name": "Run operations triage",
+      "description": "Assess retained Kaseki run operational metadata using Soyuz's approved projection.",
+      "owner": "soyuz",
+      "questionCount": 3,
+      "dynamicQuestions": false,
+      "maxEvidenceBytes": 12288,
+      "operations": [
+        "evaluate"
+      ],
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "needs_followup",
+          "likely_area",
+          "severity"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "needs_followup": {
+            "type": "object",
+            "required": [
+              "type",
+              "noul",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "noul"
+              },
+              "noul": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "false",
+                  "true"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "false": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "true": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": "null",
+                "const": null
+              }
+            }
+          },
+          "likely_area": {
+            "type": "object",
+            "required": [
+              "type",
+              "choice",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "choice"
+              },
+              "choice": {
+                "type": "string",
+                "enum": [
+                  "execution",
+                  "control_plane",
+                  "unknown"
+                ]
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "execution",
+                  "control_plane",
+                  "unknown"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "execution": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "control_plane": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "unknown": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          },
+          "severity": {
+            "type": "object",
+            "required": [
+              "type",
+              "score",
+              "legend",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "score"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "legend": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "0": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Routine"
+                  },
+                  "1": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Needs review"
+                  },
+                  "2": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Urgent"
+                  }
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "0": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "1": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "2": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        }
+      },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 12288,
+        "questionCount": 3
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "soyuz"
+      ]
+    },
+    {
+      "schemaVersion": "1",
+      "id": "run_retry_review_v1",
+      "version": "1",
+      "name": "Soyuz run retry review",
+      "description": "Compare bounded canonical records for a retry and its source run.",
+      "owner": "soyuz",
+      "questionCount": 3,
+      "dynamicQuestions": false,
+      "maxEvidenceBytes": 20480,
+      "operations": [
+        "evaluate"
+      ],
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "recovery",
+          "evidence_strength",
+          "needs_followup"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "recovery": {
+            "type": "object",
+            "required": [
+              "type",
+              "choice",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "choice"
+              },
+              "choice": {
+                "type": "string",
+                "enum": [
+                  "recovered",
+                  "partial",
+                  "not_recovered",
+                  "unclear"
+                ]
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "recovered",
+                  "partial",
+                  "not_recovered",
+                  "unclear"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "recovered": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "partial": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "not_recovered": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "unclear": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          },
+          "evidence_strength": {
+            "type": "object",
+            "required": [
+              "type",
+              "score",
+              "legend",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "score"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "legend": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "0": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Insufficient"
+                  },
+                  "1": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Some concrete detail"
+                  },
+                  "2": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "const": "Clear and specific"
+                  }
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "0",
+                  "1",
+                  "2"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "0": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "1": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "2": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          },
+          "needs_followup": {
+            "type": "object",
+            "required": [
+              "type",
+              "noul",
+              "probabilities",
+              "confidence"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "noul"
+              },
+              "noul": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "probabilities": {
+                "type": "object",
+                "required": [
+                  "false",
+                  "true"
+                ],
+                "additionalProperties": false,
+                "x-probabilitySum": 1,
+                "x-probabilityTolerance": 0.03,
+                "properties": {
+                  "false": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "true": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                }
+              },
+              "confidence": {
+                "type": "null",
+                "const": null
+              }
+            }
+          }
+        }
+      },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 20480,
+        "questionCount": 3
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "soyuz"
+      ]
+    },
+    {
+      "schemaVersion": "1",
+      "id": "task_admission_v1",
+      "version": "1",
+      "name": "Task admission classification",
+      "description": "Provide advisory risk and routing classifications; Kaseki's deterministic admission policy remains authoritative.",
+      "owner": "kaseki",
+      "questionCount": 6,
+      "dynamicQuestions": false,
+      "maxEvidenceBytes": 32768,
+      "operations": [
+        "evaluate"
+      ],
       "outputSchema": {
         "type": "object",
         "required": [
@@ -1789,10 +2871,31 @@
             }
           }
         }
-      }
+      },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 32768,
+        "questionCount": 6
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "kaseki",
+        "rusty_fossil"
+      ]
     },
     {
-      "key": "contract_03",
+      "schemaVersion": "1",
+      "id": "validation_recovery_v1",
+      "version": "1",
+      "name": "Validation recovery classification",
+      "description": "Classify bounded validation failure evidence and recommend an advisory next step.",
+      "owner": "kaseki",
+      "questionCount": 2,
+      "dynamicQuestions": false,
+      "maxEvidenceBytes": 8192,
+      "operations": [
+        "evaluate"
+      ],
       "outputSchema": {
         "type": "object",
         "required": [
@@ -1957,7 +3060,17 @@
             }
           }
         }
-      }
+      },
+      "limits": {
+        "requestBytes": 131072,
+        "maxEvidenceBytes": 8192,
+        "questionCount": 2
+      },
+      "evaluationEndpoint": "/v1/profiles/{profileId}/evaluate",
+      "allowedClients": [
+        "kaseki",
+        "rusty_fossil"
+      ]
     }
   ]
 }

@@ -112,36 +112,35 @@ fn supports_the_five_published_profile_ids() {
 }
 
 #[test]
-fn pinned_contract_artifact_contains_only_generic_contract_keys() {
+fn pinned_contract_artifact_uses_the_shared_schema_and_limits_rusty_profiles() {
     let artifact: Value =
         serde_json::from_str(include_str!("../contracts/senku-profiles.v1.json")).unwrap();
-    let contracts = artifact["contracts"].as_array().unwrap();
-    let artifact_keys = contracts
+    assert_eq!(artifact["schemaVersion"], "1");
+    assert_eq!(
+        artifact["compatibilityPolicy"],
+        "Response envelope fields may be added. Required fields, meanings, and answer contracts may change only under a new schemaVersion."
+    );
+    let profiles = artifact["profiles"].as_array().unwrap();
+    let artifact_ids = profiles
         .iter()
-        .map(|contract| contract["key"].as_str().unwrap())
+        .filter(|profile| {
+            profile["allowedClients"]
+                .as_array()
+                .is_some_and(|clients| clients.contains(&json!("rusty_fossil")))
+        })
+        .map(|profile| profile["id"].as_str().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
-    let rust_keys = ProfileId::ALL
-        .map(ProfileId::contract_key)
+    let rust_ids = ProfileId::ALL
+        .map(ProfileId::as_str)
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(artifact_keys, rust_keys);
-
-    for contract in contracts {
-        for private_field in [
-            "id",
-            "owner",
-            "allowedClients",
-            "evaluationEndpoint",
-            "limits",
-            "operations",
-        ] {
-            assert!(
-                contract.get(private_field).is_none(),
-                "unexpected field: {private_field}"
-            );
-        }
-        assert!(contract.get("outputSchema").is_some());
-    }
+    assert_eq!(artifact_ids, rust_ids);
+    assert_eq!(profiles.len(), 9);
+    assert!(
+        profiles
+            .iter()
+            .all(|profile| profile.get("outputSchema").is_some())
+    );
 }
 
 #[test]
@@ -177,17 +176,17 @@ fn rejects_wrong_answer_ids_and_inconsistent_result_mirrors() {
 }
 
 #[test]
-fn rejects_unrecognized_response_envelope_fields() {
+fn accepts_unknown_response_envelope_fields_and_optional_usage() {
     let evaluation = task_admission();
     let mut response = valid_task_response();
     response.as_object_mut().unwrap().remove("usage");
     response["unexpectedEnvelopeField"] = json!("synthetic extra metadata");
 
-    assert!(
-        evaluation
-            .validate_response(&serde_json::to_vec(&response).unwrap())
-            .is_err()
-    );
+    let validated = evaluation
+        .validate_response(&serde_json::to_vec(&response).unwrap())
+        .unwrap();
+    assert_eq!(validated.attempt_count, 1);
+    assert!(validated.usage.is_none());
 }
 
 #[test]
@@ -272,10 +271,11 @@ fn validates_dynamic_profile_answer_ids_and_all_remaining_profile_contracts() {
 }
 
 #[test]
-fn accepts_multiple_provider_attempts_with_known_envelope_fields() {
+fn accepts_additive_response_envelope_fields_and_multiple_provider_attempts() {
     let evaluation = task_admission();
     let mut response = valid_task_response();
     response["attemptCount"] = json!(2);
+    response["serverTiming"] = json!({"providerAttempts": 2});
     let validated = evaluation
         .validate_response(&serde_json::to_vec(&response).unwrap())
         .unwrap();
@@ -367,6 +367,82 @@ async fn sends_one_authenticated_request_and_validates_the_profile_response() {
 }
 
 #[tokio::test]
+async fn rate_limit_errors_preserve_correlation_request_id_and_retry_after() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/profiles/task_admission_v1/evaluate"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .insert_header("retry-after", "15")
+                .set_body_json(json!({
+                    "error": {
+                        "code": "PROVIDER_RATE_LIMITED",
+                        "message": "safe",
+                        "requestId": "dec-throttled-001"
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = SenkuClient::new(
+        SenkuClientConfig::new(
+            Url::parse(&server.uri()).unwrap(),
+            SecretString::from("synthetic-senku-token-000000000000".to_owned()),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = client.evaluate(task_admission()).await.unwrap_err();
+    assert_eq!(
+        error.classification(),
+        &fossil_senku::DecisionError::RateLimited
+    );
+    let context = error.request_context().unwrap();
+    assert!(uuid::Uuid::parse_str(&context.correlation_id).is_ok());
+    assert_eq!(context.request_id.as_deref(), Some("dec-throttled-001"));
+    assert_eq!(context.retry_after_seconds, Some(15));
+}
+
+#[tokio::test]
+async fn rate_limit_errors_ignore_request_ids_with_only_the_prefix() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/profiles/task_admission_v1/evaluate"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "code": "PROVIDER_RATE_LIMITED",
+                        "message": "safe",
+                        "requestId": "dec-"
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = SenkuClient::new(
+        SenkuClientConfig::new(
+            Url::parse(&server.uri()).unwrap(),
+            SecretString::from("synthetic-senku-token-000000000000".to_owned()),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = client.evaluate(task_admission()).await.unwrap_err();
+    assert_eq!(error.request_context().unwrap().request_id, None);
+}
+
+#[tokio::test]
 async fn upstream_faults_are_bounded_classified_and_never_retried() {
     use fossil_senku::DecisionError;
     use http_faults::{HttpFaultScenario, mount_http_fault};
@@ -428,7 +504,8 @@ async fn upstream_faults_are_bounded_classified_and_never_retried() {
         .unwrap();
 
         let error = client.evaluate(task_admission()).await.unwrap_err();
-        assert_eq!(error, expected);
+        assert_eq!(error.classification(), &expected);
+        assert!(error.request_context().is_some());
         assert_eq!(error.is_retryable(), retryable);
         assert!(!error.to_string().contains("PRIVATE_UPSTREAM_DIAGNOSTIC"));
         let metric = client.metrics().profiles[0];

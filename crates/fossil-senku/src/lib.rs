@@ -332,6 +332,13 @@ pub struct ValidatedDecision {
     pub correlation_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionErrorContext {
+    pub correlation_id: String,
+    pub request_id: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DecisionError {
     #[error("Senku client configuration is invalid")]
@@ -354,14 +361,50 @@ pub enum DecisionError {
     HttpStatus,
     #[error("Senku response is malformed, oversized, or incompatible")]
     InvalidResponse,
+    #[error("{source}")]
+    RequestFailure {
+        #[source]
+        source: Box<DecisionError>,
+        context: DecisionErrorContext,
+    },
 }
 
 impl DecisionError {
-    pub const fn is_retryable(&self) -> bool {
+    pub fn classification(&self) -> &Self {
+        match self {
+            Self::RequestFailure { source, .. } => source.classification(),
+            error => error,
+        }
+    }
+
+    pub fn request_context(&self) -> Option<&DecisionErrorContext> {
+        match self {
+            Self::RequestFailure { context, .. } => Some(context),
+            _ => None,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
         matches!(
-            self,
+            self.classification(),
             Self::Timeout | Self::Network | Self::RateLimited | Self::Unavailable
         )
+    }
+
+    fn with_request_context(
+        self,
+        correlation_id: &str,
+        request_id: Option<String>,
+        retry_after_seconds: Option<u64>,
+    ) -> Self {
+        Self::RequestFailure {
+            source: Box::new(self),
+            context: DecisionErrorContext {
+                correlation_id: correlation_id.to_owned(),
+                request_id,
+                retry_after_seconds,
+            },
+        }
     }
 }
 
@@ -525,24 +568,38 @@ impl DecisionService for SenkuClient {
             .header("x-senku-deadline-ms", deadline_at_ms.to_string())
             .body(body)
             .send()
-            .await
-            .map_err(classify_transport);
+            .await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
                 self.metrics.transport_failures[index].fetch_add(1, Ordering::Relaxed);
-                return Err(error);
+                return Err(classify_transport(error).with_request_context(
+                    &correlation_id,
+                    None,
+                    None,
+                ));
             }
         };
         if !response.status().is_success() {
             self.metrics.transport_failures[index].fetch_add(1, Ordering::Relaxed);
-            return Err(classify_status(response.status()));
+            let status = response.status();
+            let retry_after_seconds =
+                parse_retry_after_seconds(response.headers().get("retry-after"));
+            let request_id = read_limited_body(response)
+                .await
+                .ok()
+                .and_then(|body| error_request_id(&body));
+            return Err(classify_status(status).with_request_context(
+                &correlation_id,
+                request_id,
+                retry_after_seconds,
+            ));
         }
         let body = match read_limited_body(response).await {
             Ok(body) => body,
             Err(error) => {
                 self.metrics.invalid_responses[index].fetch_add(1, Ordering::Relaxed);
-                return Err(error);
+                return Err(error.with_request_context(&correlation_id, None, None));
             }
         };
         match validate_response(&request, &body, &correlation_id) {
@@ -554,7 +611,7 @@ impl DecisionService for SenkuClient {
             }
             Err(error) => {
                 self.metrics.invalid_responses[index].fetch_add(1, Ordering::Relaxed);
-                Err(error)
+                Err(error.with_request_context(&correlation_id, None, None))
             }
         }
     }
@@ -597,6 +654,28 @@ fn classify_status(status: StatusCode) -> DecisionError {
         _ if status.is_server_error() => DecisionError::Unavailable,
         _ => DecisionError::HttpStatus,
     }
+}
+
+fn parse_retry_after_seconds(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    let value = value?.to_str().ok()?;
+    if value.is_empty() || value.len() > 5 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= 86_400)
+}
+
+fn error_request_id(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let request_id = value.get("error")?.get("requestId")?.as_str()?;
+    let valid = request_id.starts_with("dec-")
+        && (5..=200).contains(&request_id.len())
+        && request_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        });
+    valid.then(|| request_id.to_owned())
 }
 
 async fn read_limited_body(mut response: Response) -> Result<Vec<u8>, DecisionError> {
@@ -1143,12 +1222,24 @@ fn profile_contract_artifact() -> &'static Value {
 }
 
 fn contract_profile(profile_id: ProfileId) -> Result<&'static Value, DecisionError> {
-    profile_contract_artifact()
-        .get("contracts")
+    let artifact = profile_contract_artifact();
+    if artifact.get("schemaVersion").and_then(Value::as_str) != Some("1") {
+        return Err(DecisionError::InvalidResponse);
+    }
+    artifact
+        .get("profiles")
         .and_then(Value::as_array)
-        .and_then(|contracts| {
-            contracts.iter().find(|contract| {
-                contract.get("key").and_then(Value::as_str) == Some(profile_id.contract_key())
+        .and_then(|profiles| {
+            profiles.iter().find(|profile| {
+                profile.get("id").and_then(Value::as_str) == Some(profile_id.as_str())
+                    && profile
+                        .get("allowedClients")
+                        .and_then(Value::as_array)
+                        .is_some_and(|clients| {
+                            clients
+                                .iter()
+                                .any(|client| client.as_str() == Some("rusty_fossil"))
+                        })
             })
         })
         .ok_or(DecisionError::InvalidResponse)
@@ -1328,27 +1419,6 @@ fn validate_response(
     let response: Value =
         serde_json::from_slice(body).map_err(|_| DecisionError::InvalidResponse)?;
     let object = response.as_object().ok_or(DecisionError::InvalidResponse)?;
-    const RESPONSE_ENVELOPE_FIELDS: [&str; 12] = [
-        "schemaVersion",
-        "requestId",
-        "status",
-        "profileId",
-        "profileVersion",
-        "provider",
-        "model",
-        "answers",
-        "result",
-        "durationMs",
-        "attemptCount",
-        "usage",
-    ];
-    if !matches!(object.len(), 11 | 12)
-        || object
-            .keys()
-            .any(|key| !RESPONSE_ENVELOPE_FIELDS.contains(&key.as_str()))
-    {
-        return Err(DecisionError::InvalidResponse);
-    }
     let attempt_count = object
         .get("attemptCount")
         .and_then(Value::as_u64)

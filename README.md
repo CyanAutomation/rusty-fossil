@@ -14,7 +14,7 @@ The Compose stack runs the controller and supervisor with operator-configured nu
 - `crates/fossil-queue` — Cloudflare HTTP pull, ack/retry, response bounds, backoff, shutdown handling, and transport counters.
 - `crates/fossil-soyuz` — worker API client, claim/start/canonical proofs, callback requests, and bounded error classification.
 - `crates/fossil-storage` — SQLite migrations, private local state, durable descriptors and intents, one-slot reservation, recovery, and callback outbox.
-- `crates/fossil-senku` — versioned profile inputs, bounded authenticated transport, strict response validation, evidence redaction, and advisory metrics.
+- `crates/fossil-senku` — versioned profile inputs, bounded authenticated transport, additive response-envelope parsing with strict profile-answer validation, evidence redaction, request-failure context, and advisory metrics.
 - `crates/fossil-supervisor` — proof-gated Docker supervisor, restricted Unix IPC, crash recovery, and the `fossil-supervisord` service binary.
 - `crates/fossil-workspace` — isolated, allowlisted Git repository preparation policy and bounded HTTPS fetch/checkout (library only; not supervisor-integrated).
 - `crates/fossil-gateway` — bounded Cloudflare AI Gateway broker with run-fenced tokens (prototype; not supervisor-integrated).
