@@ -1328,6 +1328,27 @@ fn validate_response(
     let response: Value =
         serde_json::from_slice(body).map_err(|_| DecisionError::InvalidResponse)?;
     let object = response.as_object().ok_or(DecisionError::InvalidResponse)?;
+    const RESPONSE_ENVELOPE_FIELDS: [&str; 12] = [
+        "schemaVersion",
+        "requestId",
+        "status",
+        "profileId",
+        "profileVersion",
+        "provider",
+        "model",
+        "answers",
+        "result",
+        "durationMs",
+        "attemptCount",
+        "usage",
+    ];
+    if !matches!(object.len(), 11 | 12)
+        || object
+            .keys()
+            .any(|key| !RESPONSE_ENVELOPE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(DecisionError::InvalidResponse);
+    }
     let attempt_count = object
         .get("attemptCount")
         .and_then(Value::as_u64)

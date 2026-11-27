@@ -177,6 +177,20 @@ fn rejects_wrong_answer_ids_and_inconsistent_result_mirrors() {
 }
 
 #[test]
+fn rejects_unrecognized_response_envelope_fields() {
+    let evaluation = task_admission();
+    let mut response = valid_task_response();
+    response.as_object_mut().unwrap().remove("usage");
+    response["unexpectedEnvelopeField"] = json!("synthetic extra metadata");
+
+    assert!(
+        evaluation
+            .validate_response(&serde_json::to_vec(&response).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
 fn validates_dynamic_profile_answer_ids_and_all_remaining_profile_contracts() {
     let context = ProfileEvaluation::context_routing(ContextRoutingInput {
         mode: ContextRoutingMode::PhaseTransfer,
