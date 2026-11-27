@@ -214,13 +214,14 @@ impl AppConfig {
         let senku_api_origin = get("SENKU_API_ORIGIN")
             .map(|value| parse_senku_api_origin(value, mode))
             .transpose()?;
-        let senku_api_token = read_secret(&values, "SENKU_API_TOKEN_FILE", "SENKU_API_TOKEN")?;
+        let senku_api_token =
+            read_secret(&values, "SENKU_CLIENT_TOKEN_FILE", "SENKU_CLIENT_TOKEN")?;
         if senku_api_token.as_ref().is_some_and(|token| {
             let token = token.expose_secret();
             !(32..=1_024).contains(&token.len())
                 || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
         }) {
-            return Err(ConfigError::InvalidValue("SENKU_API_TOKEN"));
+            return Err(ConfigError::InvalidValue("SENKU_CLIENT_TOKEN"));
         }
         let cloudflare_queue_visibility_timeout_ms = parse_bounded_u32(
             get("CLOUDFLARE_QUEUE_VISIBILITY_TIMEOUT_MS"),
@@ -630,7 +631,7 @@ mod tests {
                 "https://senku.example.test".to_owned(),
             ),
             (
-                "SENKU_API_TOKEN".to_owned(),
+                "SENKU_CLIENT_TOKEN".to_owned(),
                 "synthetic-senku-token-000000000000".to_owned(),
             ),
         ])
@@ -656,8 +657,8 @@ mod tests {
             Err(ConfigError::InvalidValue("SENKU_API_ORIGIN"))
         ));
         assert!(matches!(
-            AppConfig::from_pairs([("SENKU_API_TOKEN".to_owned(), "too-short".to_owned(),)]),
-            Err(ConfigError::InvalidValue("SENKU_API_TOKEN"))
+            AppConfig::from_pairs([("SENKU_CLIENT_TOKEN".to_owned(), "too-short".to_owned(),)]),
+            Err(ConfigError::InvalidValue("SENKU_CLIENT_TOKEN"))
         ));
         assert!(
             AppConfig::from_pairs([

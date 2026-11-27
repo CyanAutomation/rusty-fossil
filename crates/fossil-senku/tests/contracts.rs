@@ -8,7 +8,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use std::time::Duration;
 use url::Url;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "../../../tests/support/http_faults.rs"]
@@ -71,14 +71,14 @@ fn noul_answer(value: f64) -> Value {
 
 fn score_answer() -> Value {
     json!({
-        "type":"score", "score":4, "legend":{
-            "1":"Largely unrealized",
-            "2":"Major requirements unmet",
-            "3":"Partially complete",
-            "4":"Nearly complete",
-            "5":"All requirements verified"
+        "type":"score", "score":3, "legend":{
+            "0":"Largely unrealized",
+            "1":"Major requirements unmet",
+            "2":"Partially complete",
+            "3":"Nearly complete",
+            "4":"All requirements verified"
         },
-        "probabilities":{"1":0.1,"2":0.1,"3":0.1,"4":0.6,"5":0.1}, "confidence":null
+        "probabilities":{"0":0.1,"1":0.1,"2":0.1,"3":0.6,"4":0.1}, "confidence":null
     })
 }
 
@@ -112,6 +112,39 @@ fn supports_the_five_published_profile_ids() {
 }
 
 #[test]
+fn pinned_contract_artifact_contains_only_generic_contract_keys() {
+    let artifact: Value =
+        serde_json::from_str(include_str!("../contracts/senku-profiles.v1.json")).unwrap();
+    let contracts = artifact["contracts"].as_array().unwrap();
+    let artifact_keys = contracts
+        .iter()
+        .map(|contract| contract["key"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    let rust_keys = ProfileId::ALL
+        .map(ProfileId::contract_key)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(artifact_keys, rust_keys);
+
+    for contract in contracts {
+        for private_field in [
+            "id",
+            "owner",
+            "allowedClients",
+            "evaluationEndpoint",
+            "limits",
+            "operations",
+        ] {
+            assert!(
+                contract.get(private_field).is_none(),
+                "unexpected field: {private_field}"
+            );
+        }
+        assert!(contract.get("outputSchema").is_some());
+    }
+}
+
+#[test]
 fn task_admission_uses_the_versioned_senku_envelope() {
     let request: Value = serde_json::from_slice(&task_admission().request_body().unwrap()).unwrap();
     assert_eq!(request["schemaVersion"], "1");
@@ -136,6 +169,20 @@ fn rejects_wrong_answer_ids_and_inconsistent_result_mirrors() {
 
     let mut response = valid_task_response();
     response["result"]["risk_level"] = json!(null);
+    assert!(
+        evaluation
+            .validate_response(&serde_json::to_vec(&response).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn rejects_unrecognized_response_envelope_fields() {
+    let evaluation = task_admission();
+    let mut response = valid_task_response();
+    response.as_object_mut().unwrap().remove("usage");
+    response["unexpectedEnvelopeField"] = json!("synthetic extra metadata");
+
     assert!(
         evaluation
             .validate_response(&serde_json::to_vec(&response).unwrap())
@@ -225,6 +272,17 @@ fn validates_dynamic_profile_answer_ids_and_all_remaining_profile_contracts() {
 }
 
 #[test]
+fn accepts_multiple_provider_attempts_with_known_envelope_fields() {
+    let evaluation = task_admission();
+    let mut response = valid_task_response();
+    response["attemptCount"] = json!(2);
+    let validated = evaluation
+        .validate_response(&serde_json::to_vec(&response).unwrap())
+        .unwrap();
+    assert_eq!(validated.attempt_count, 2);
+}
+
+#[test]
 fn request_evidence_is_redacted_before_it_is_sent() {
     let evaluation = ProfileEvaluation::task_admission(TaskAdmissionInput {
         repo_url: "https://example.test/acme/project".to_owned(),
@@ -278,6 +336,8 @@ async fn sends_one_authenticated_request_and_validates_the_profile_response() {
             "authorization",
             "Bearer synthetic-senku-token-000000000000",
         ))
+        .and(header_exists("x-correlation-id"))
+        .and(header_exists("x-senku-deadline-ms"))
         .and(body_json(json!({
             "schemaVersion":"1",
             "input": {
@@ -301,6 +361,8 @@ async fn sends_one_authenticated_request_and_validates_the_profile_response() {
     let decision = client.evaluate(task_admission()).await.unwrap();
     assert_eq!(decision.profile_id, ProfileId::TaskAdmission);
     assert_eq!(decision.request_id, "dec-test-001");
+    assert_eq!(decision.attempt_count, 1);
+    assert!(!decision.correlation_id.is_empty());
     assert!(decision.answers.contains_key("risk_level"));
 }
 
