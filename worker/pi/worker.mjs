@@ -1,4 +1,6 @@
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { mkdir, open } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -12,6 +14,7 @@ export const GATEWAY_CA_CERT_PATH = "/run/fossil/gateway-ca.pem";
 export const PI_AGENT_DIRECTORY = "/tmp/pi-agent";
 export const PI_GATEWAY_PROVIDER = "fossil-gateway";
 export const PI_GATEWAY_BASE_URL = "https://fossil-gateway:8787/v1";
+export const PI_STREAM_SEAL_PREFIX = "RUSTY_FOSSIL_PI_STREAM_V1";
 const PI_EXECUTABLE = "/opt/pi/node_modules/.bin/pi";
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$/;
 const GATEWAY_TOKEN_PATTERN = /^[A-Za-z0-9._-]{32,512}$/;
@@ -58,6 +61,18 @@ export function buildPiInvocation(model) {
     ],
     shell: false,
   };
+}
+
+export function formatPiStreamSeal(byteCount, sha256) {
+  if (
+    !Number.isSafeInteger(byteCount) ||
+    byteCount <= 0 ||
+    typeof sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(sha256)
+  ) {
+    throw new Error("invalid Pi stream seal");
+  }
+  return `${PI_STREAM_SEAL_PREFIX} ${byteCount} ${sha256}`;
 }
 
 export async function readTaskPromptFile(filePath = TASK_PROMPT_PATH) {
@@ -220,6 +235,34 @@ async function writePiModelsConfig(model, gatewayToken, cost) {
   }
 }
 
+export async function forwardPiStdout(stdout, output = process.stdout) {
+  if (!stdout || typeof stdout[Symbol.asyncIterator] !== "function") {
+    throw new Error("Pi stdout is unavailable");
+  }
+  const digest = createHash("sha256");
+  let byteCount = 0;
+  for await (const chunk of stdout) {
+    byteCount += chunk.length;
+    digest.update(chunk);
+    await new Promise((resolve, reject) => {
+      output.write(chunk, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+  return { byteCount, sha256: digest.digest("hex") };
+}
+
+async function writePiStreamSeal(seal) {
+  await new Promise((resolve, reject) => {
+    process.stderr.write(`${formatPiStreamSeal(seal.byteCount, seal.sha256)}\n`, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
 async function runPi(prompt, model) {
   const gatewayToken = await readGatewayTokenFile();
   const cost = readModelCostFromEnvironment();
@@ -239,11 +282,11 @@ async function runPi(prompt, model) {
       FOSSIL_PI_MODEL: model,
     },
     shell: false,
-    // Pi's JSONL stays on container stdout, which the supervisor reads via bounded Docker logs.
-    stdio: ["pipe", "inherit", "inherit"],
+    // Keep the structured stream on stdout and suppress child stderr. The
+    // trusted wrapper writes a final seal to stderr after forwarding closes.
+    stdio: ["pipe", "pipe", "ignore"],
   });
 
-  let settled = false;
   const removeSignalHandlers = [];
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     const relaySignal = () => child.kill(signal);
@@ -252,22 +295,20 @@ async function runPi(prompt, model) {
   }
 
   child.stdin.end(prompt, "utf8");
-
-  return new Promise((resolve, reject) => {
-    child.once("error", (error) => {
-      if (!settled) {
-        settled = true;
-        removeSignalHandlers.forEach((remove) => remove());
-        reject(new Error(`Pi process failed to start: ${error.code ?? "unknown"}`));
-      }
-    });
-    child.once("exit", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      removeSignalHandlers.forEach((remove) => remove());
-      resolve(signal ? 128 : (code ?? 1));
-    });
-  });
+  try {
+    const [[code, signal], seal] = await Promise.all([
+      once(child, "close"),
+      forwardPiStdout(child.stdout),
+    ]);
+    await writePiStreamSeal(seal);
+    return signal ? 128 : (code ?? 1);
+  } catch (error) {
+    child.kill("SIGTERM");
+    const code = error instanceof Error ? error.code ?? "output" : "unknown";
+    throw new Error(`Pi process failed: ${code}`);
+  } finally {
+    removeSignalHandlers.forEach((remove) => remove());
+  }
 }
 
 async function main() {

@@ -1,5 +1,5 @@
 use crate::docker::{DockerRuntimeConfig, classify_status};
-use crate::pi_events::{PiEventParser, PiStreamError, classify_pi_execution};
+use crate::pi_events::{PiEventParser, PiStreamError, PiStreamSealParser, classify_pi_execution};
 use crate::{
     CancellationOutcome, ExecutionOutcome, ExecutionSupervisor, PreparedExecution,
     ReconciliationOutcome, SupervisorError, SyntheticScenario, TerminalReason,
@@ -1191,6 +1191,9 @@ impl DockerSupervisor {
             .build();
         let mut stream = self.docker.logs(&launch.container_name, Some(options));
         let mut parser = PiEventParser::default();
+        let mut seal_parser = PiStreamSealParser::default();
+        let mut stdout_digest = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut stdout_bytes = 0_usize;
         let mut observed_bytes = 0_usize;
         while let Some(item) = stream.next().await {
             let message = match item {
@@ -1202,6 +1205,11 @@ impl DockerSupervisor {
                         return Ok(Err(PiStreamError::StreamTooLarge));
                     };
                     observed_bytes = total;
+                    let Some(total_stdout) = stdout_bytes.checked_add(message.len()) else {
+                        return Ok(Err(PiStreamError::StreamTooLarge));
+                    };
+                    stdout_bytes = total_stdout;
+                    stdout_digest.update(&message);
                     parser.push(&message)
                 }
                 Ok(LogOutput::StdErr { message }) => {
@@ -1212,6 +1220,9 @@ impl DockerSupervisor {
                         return Ok(Err(PiStreamError::StreamTooLarge));
                     };
                     observed_bytes = total;
+                    if let Err(error) = seal_parser.push(&message) {
+                        return Ok(Err(error));
+                    }
                     continue;
                 }
                 Ok(_) => continue,
@@ -1220,6 +1231,13 @@ impl DockerSupervisor {
             if let Err(error) = message {
                 return Ok(Err(error));
             }
+        }
+        let seal = match seal_parser.finish() {
+            Ok(seal) => seal,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !seal.matches(stdout_bytes, stdout_digest.finish().as_ref()) {
+            return Ok(Err(PiStreamError::StreamSealMismatch));
         }
         Ok(parser.finish(false))
     }
@@ -1564,7 +1582,7 @@ fn terminal_callback(
             WorkloadKind::PiCodingV1 => "Pi execution finalized",
         });
     let payload = match launch.outcome_class.as_deref() {
-        Some("success" | "pi_completed") => CallbackPayload::Completed {
+        Some(class) if is_success_class(launch, class) => CallbackPayload::Completed {
             worker_id: launch.worker_id.clone(),
             claim_callback_id: launch.claim_callback_id,
             completed_at_ms,
@@ -1574,6 +1592,7 @@ fn terminal_callback(
             changed_file_count: None,
             outcome_summary: None,
         },
+        Some("success" | "pi_completed") => return Err(SupervisorError::StateUnavailable),
         Some("cancelled") => CallbackPayload::Cancelled {
             worker_id: launch.worker_id.clone(),
             claim_callback_id: launch.claim_callback_id,
@@ -1600,7 +1619,8 @@ fn outcome_from_launch(
     launch: &ContainerLaunchRecord,
 ) -> Result<ExecutionOutcome, SupervisorError> {
     let reason = match launch.outcome_class.as_deref() {
-        Some("success" | "pi_completed") => TerminalReason::Completed,
+        Some(class) if is_success_class(launch, class) => TerminalReason::Completed,
+        Some("success" | "pi_completed") => return Err(SupervisorError::StateUnavailable),
         Some("nonzero_exit") => TerminalReason::NonzeroExit,
         Some("timeout") => TerminalReason::TimedOut,
         Some("cancelled") => TerminalReason::Cancelled,
@@ -1636,6 +1656,35 @@ fn outcome_from_launch(
             .zip(launch.completed_at_ms)
             .map(|(started, completed)| completed.saturating_sub(started) as u64),
     })
+}
+
+fn is_success_class(launch: &ContainerLaunchRecord, outcome_class: &str) -> bool {
+    let class_matches_workload = matches!(
+        (launch.workload_kind, outcome_class),
+        (WorkloadKind::Synthetic, "success") | (WorkloadKind::PiCodingV1, "pi_completed")
+    );
+    let stop_intent_conflicts = launch
+        .stop_requested_at_ms
+        .zip(launch.completed_at_ms)
+        .is_some_and(|(requested_at_ms, completed_at_ms)| completed_at_ms >= requested_at_ms);
+
+    let workload_evidence_complete = match launch.workload_kind {
+        WorkloadKind::Synthetic => true,
+        WorkloadKind::PiCodingV1 => {
+            !launch.output_truncated
+                && launch
+                    .container_id
+                    .as_deref()
+                    .is_some_and(|container_id| !container_id.is_empty())
+                && launch.started_at_ms.is_some()
+                && launch.completed_at_ms.is_some()
+        }
+    };
+
+    class_matches_workload
+        && launch.exit_code == Some(0)
+        && workload_evidence_complete
+        && !stop_intent_conflicts
 }
 
 fn safe_worker_environment(env: Option<&[String]>, scenario: SyntheticScenario) -> bool {
@@ -1704,10 +1753,53 @@ fn supports_required_resource_controls(info: &SystemInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        safe_worker_environment, supports_required_resource_controls, unix_nanos_to_millis,
+        outcome_from_launch, safe_worker_environment, supports_required_resource_controls,
+        terminal_callback, unix_nanos_to_millis,
     };
     use bollard::models::SystemInfo;
     use fossil_core::execution::SyntheticScenario;
+    use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
+    use fossil_storage::{ContainerLaunchRecord, ContainerLaunchState, WorkloadKind};
+
+    fn pi_launch_with_outcome(outcome_class: &str) -> ContainerLaunchRecord {
+        ContainerLaunchRecord {
+            run_id: RunId::parse("018f6f7b-3a1c-7cc1-8df2-2f16a7a66d01").unwrap(),
+            worker_id: WorkerId::parse("pilot-worker").unwrap(),
+            claim_callback_id: ClaimCallbackId::parse("cc1c1b68-5f60-4d7e-8f50-5deabc37000a")
+                .unwrap(),
+            start_callback_id: EventId::parse("cc1c1b68-5f60-4d7e-8f50-5deabc37000b").unwrap(),
+            workload_kind: WorkloadKind::PiCodingV1,
+            workload_version: 1,
+            scenario: SyntheticScenario::Success,
+            image_identity: Some(format!(
+                "ghcr.io/cyanautomation/rusty-fossil-pi-worker@sha256:{}",
+                "a".repeat(64)
+            )),
+            profile_version: "pi-coding-v1".to_owned(),
+            effective_policy_json: "{}".to_owned(),
+            repository_url: Some("https://github.com/CyanAutomation/somatic".to_owned()),
+            authorized_git_ref: Some("refs/heads/main".to_owned()),
+            resolved_commit: Some("a".repeat(40)),
+            workspace_identity: Some("wsp_018f6f7b-3a1c-7cc1-8df2-2f16a7a66d01".to_owned()),
+            runtime_limit_ms: Some(300_000),
+            effective_deadline_at_ms: Some(1_800_000_300_000),
+            container_name: "rusty-fossil-pi-test".to_owned(),
+            container_id: Some("container-id".to_owned()),
+            state: ContainerLaunchState::ContainerExited,
+            exit_code: Some(0),
+            outcome_class: Some(outcome_class.to_owned()),
+            diagnostic_summary: Some("test result".to_owned()),
+            output_truncated: false,
+            terminal_callback_id: Some(
+                EventId::parse("cc1c1b68-5f60-4d7e-8f50-5deabc37000c").unwrap(),
+            ),
+            stop_reason: None,
+            stop_requested_at_ms: None,
+            started_at_ms: Some(1_800_000_000_000),
+            completed_at_ms: Some(1_800_000_010_000),
+            updated_at_ms: 1_800_000_010_000,
+        }
+    }
 
     fn docker_info(os_type: &str, memory: bool, cpu: bool, pids: bool) -> SystemInfo {
         serde_json::from_value(serde_json::json!({
@@ -1738,6 +1830,54 @@ mod tests {
         assert!(!supports_required_resource_controls(&docker_info(
             "windows", true, true, true
         )));
+    }
+
+    #[test]
+    fn completion_class_must_match_workload_exit_and_durable_stop_state() {
+        let launch = pi_launch_with_outcome("success");
+        assert!(outcome_from_launch(&launch).is_err());
+        assert!(terminal_callback(&launch).is_err());
+
+        let completed = pi_launch_with_outcome("pi_completed");
+        assert_eq!(
+            outcome_from_launch(&completed).unwrap().reason,
+            super::TerminalReason::Completed
+        );
+        assert!(terminal_callback(&completed).is_ok());
+
+        let mut missing_start = completed.clone();
+        missing_start.started_at_ms = None;
+        assert!(outcome_from_launch(&missing_start).is_err());
+        assert!(terminal_callback(&missing_start).is_err());
+
+        let mut invalid_exit = completed.clone();
+        invalid_exit.exit_code = Some(1);
+        assert!(outcome_from_launch(&invalid_exit).is_err());
+        assert!(terminal_callback(&invalid_exit).is_err());
+
+        let mut truncated = completed.clone();
+        truncated.output_truncated = true;
+        assert!(outcome_from_launch(&truncated).is_err());
+        assert!(terminal_callback(&truncated).is_err());
+
+        let mut stop_raced = completed.clone();
+        stop_raced.stop_requested_at_ms = Some(1_800_000_005_000);
+        assert!(outcome_from_launch(&stop_raced).is_err());
+        assert!(terminal_callback(&stop_raced).is_err());
+
+        let mut stop_timestamp_tied = completed.clone();
+        stop_timestamp_tied.stop_requested_at_ms = stop_timestamp_tied.completed_at_ms;
+        assert!(outcome_from_launch(&stop_timestamp_tied).is_err());
+        assert!(terminal_callback(&stop_timestamp_tied).is_err());
+
+        let mut synthetic = completed;
+        synthetic.workload_kind = WorkloadKind::Synthetic;
+        synthetic.outcome_class = Some("success".to_owned());
+        assert_eq!(
+            outcome_from_launch(&synthetic).unwrap().reason,
+            super::TerminalReason::Completed
+        );
+        assert!(terminal_callback(&synthetic).is_ok());
     }
 
     #[test]
