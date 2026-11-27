@@ -1,6 +1,5 @@
 use fossil_gateway::{
-    DEFAULT_BIND_ADDRESS, GatewayBroker, GatewayEndpoint, GatewayRequestLedger,
-    GatewayRequestLimits, GatewayTokenSigner,
+    DEFAULT_BIND_ADDRESS, GatewayBroker, GatewayEndpoint, GatewayRequestLedger, GatewayTokenSigner,
 };
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -40,11 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !ledger_path.is_absolute() {
         return Err("FOSSIL_GATEWAY_LEDGER_PATH must be absolute".into());
     }
-    let limits = GatewayRequestLimits::new(
-        optional_u32("FOSSIL_GATEWAY_MAX_REQUESTS_PER_RUN", 64)?,
-        optional_u64("FOSSIL_GATEWAY_MAX_REQUEST_BYTES_PER_RUN", 16 * 1024 * 1024)?,
-        optional_u32("FOSSIL_GATEWAY_MAX_OUTPUT_TOKENS", 4096)?,
-    )?;
     let bind: SocketAddr = std::env::var("FOSSIL_GATEWAY_BIND")
         .unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned())
         .parse()?;
@@ -57,7 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway_auth_token,
         signer,
         ledger,
-        limits,
     )?);
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(address = %bind, "restricted model gateway broker listening with TLS");
@@ -152,23 +145,6 @@ fn required(name: &'static str) -> Result<String, Box<dyn std::error::Error>> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("missing required configuration {name}").into())
-}
-
-fn optional_u64(name: &'static str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse::<u64>()
-            .map_err(|_| format!("{name} must be an integer").into()),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(format!("{name} must be valid Unicode").into())
-        }
-    }
-}
-
-fn optional_u32(name: &'static str, default: u32) -> Result<u32, Box<dyn std::error::Error>> {
-    let value = optional_u64(name, u64::from(default))?;
-    u32::try_from(value).map_err(|_| format!("{name} is too large").into())
 }
 
 fn read_secret_file(

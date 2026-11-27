@@ -9,6 +9,8 @@ Pi execution needs a repository checkout, but the current supervisor supports on
 
 The durable launch identity already records the run's repository URL, authorized Git ref, resolved commit and opaque workspace identity. It does not implement the trusted checkout or permit Pi launch.
 
+The 2026-11-27 Agentlab preflight observed a Docker Engine TCP listener bound beyond loopback. The operator confirmed that listener is expected. No connection or reachability test was made, so this confirmation does not establish its effective security boundary.
+
 ## Decision
 
 Implement repository preparation as a separate Rust library with no Docker dependency. Its trusted caller supplies an exact operator-owned HTTPS URL allowlist and a private workspace root. The initial pilot policy permits only `https://github.com/CyanAutomation/somatic`.

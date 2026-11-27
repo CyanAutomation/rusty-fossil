@@ -52,6 +52,7 @@ pub struct SoyuzSimulatorSnapshot {
     pub operational_health: String,
     callbacks: Vec<String>,
     requests: HashMap<String, usize>,
+    pub event_payloads: Vec<Value>,
 }
 
 impl SoyuzSimulatorSnapshot {
@@ -197,6 +198,12 @@ impl SoyuzSimulator {
                 .map(|event| event.operation.clone())
                 .collect(),
             requests: run.request_counts.clone(),
+            event_payloads: run
+                .callbacks
+                .values()
+                .filter(|event| event.operation == "events")
+                .map(|event| event.payload.clone())
+                .collect(),
         })
     }
 }

@@ -4,6 +4,7 @@ use fossil_core::contract::SoyuzRunStatus;
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::LocalLifecycleState;
 use fossil_core::queue::CloudflarePullResponse;
+use fossil_gateway::GatewayCostReport;
 use fossil_queue::QueueDisposition;
 use fossil_soyuz::{
     FailedCallback, OperationalEvent, SoyuzApi, SoyuzClient, SoyuzClientConfig, SoyuzClientError,
@@ -161,6 +162,74 @@ async fn cancellation_after_started_commit_prevents_execution_and_replays_termin
         }
     );
     assert_eq!(harness.canonical().await.status, SoyuzRunStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn gateway_cost_report_is_durably_forwarded_as_an_idempotent_soyuz_progress_event() {
+    let harness = Harness::new().await;
+    assert_eq!(harness.deliver().await, QueueDisposition::Acknowledge);
+
+    let report = GatewayCostReport {
+        estimated_cost_usd: 0.0125,
+        currency: "USD",
+        source: "cloudflare_ai_gateway",
+        complete: true,
+        request_count: 3,
+        priced_request_count: 3,
+        pending_request_count: 0,
+    };
+    let mut incomplete = report.clone();
+    incomplete.complete = false;
+    incomplete.pending_request_count = 1;
+    assert!(matches!(
+        harness
+            .coordinator
+            .enqueue_gateway_cost_report(harness.run_id, incomplete)
+            .await,
+        Err(rusty_fossil::coordinator::GatewayCostReportError::InvalidReport)
+    ));
+    assert_eq!(
+        harness
+            .coordinator
+            .enqueue_gateway_cost_report(harness.run_id, report.clone())
+            .await
+            .unwrap(),
+        fossil_storage::CallbackEnqueueResult::Enqueued
+    );
+    assert_eq!(
+        harness
+            .coordinator
+            .enqueue_gateway_cost_report(harness.run_id, report)
+            .await
+            .unwrap(),
+        fossil_storage::CallbackEnqueueResult::AlreadyPresent
+    );
+
+    assert_eq!(
+        harness.coordinator.replay_pending_callbacks(1).await,
+        CallbackReplaySummary {
+            attempted: 1,
+            delivered: 1,
+            retried: 0,
+            blocked: 0,
+        }
+    );
+    let snapshot = harness.canonical().await;
+    assert_eq!(snapshot.status, SoyuzRunStatus::Running);
+    assert_eq!(snapshot.callback_count("events"), 1);
+    assert_eq!(
+        snapshot.event_payloads,
+        vec![serde_json::json!({
+            "kind": "ai_gateway_cost",
+            "estimatedCostUsd": 0.0125,
+            "currency": "USD",
+            "source": "cloudflare_ai_gateway",
+            "complete": true,
+            "requestCount": 3,
+            "pricedRequestCount": 3,
+            "pendingRequestCount": 0,
+        })]
+    );
 }
 
 #[tokio::test]

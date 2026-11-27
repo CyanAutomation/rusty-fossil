@@ -192,6 +192,8 @@ test("Compose keeps Docker Engine access inside fossil-supervisord", () => {
     const broker = piOverlay.services["fossil-gateway-broker"];
     assert.deepEqual(broker.profiles, ["pi-pilot"]);
     assert.equal(broker.user, "64002:64002", "broker uses a separate synthetic test identity");
+    assert.equal(broker.environment.FOSSIL_GATEWAY_MAX_OUTPUT_TOKENS, undefined);
+    assert.equal(broker.environment.FOSSIL_GATEWAY_MAX_COST_MICRO_USD, undefined);
     assert.equal(
       broker.environment.FOSSIL_GATEWAY_TLS_CERT_FILE,
       "/run/secrets/fossil_gateway_tls_certificate",
