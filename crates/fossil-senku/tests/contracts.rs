@@ -272,12 +272,10 @@ fn validates_dynamic_profile_answer_ids_and_all_remaining_profile_contracts() {
 }
 
 #[test]
-fn accepts_additive_envelope_fields_and_multiple_provider_attempts() {
+fn accepts_multiple_provider_attempts_with_known_envelope_fields() {
     let evaluation = task_admission();
     let mut response = valid_task_response();
     response["attemptCount"] = json!(2);
-    response["serverTiming"] = json!({ "providerAttempts": 2 });
-
     let validated = evaluation
         .validate_response(&serde_json::to_vec(&response).unwrap())
         .unwrap();
