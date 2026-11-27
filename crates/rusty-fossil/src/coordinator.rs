@@ -41,6 +41,8 @@ fn gateway_cost_event_id(run_id: RunId) -> EventId {
 pub enum GatewayCostReportError {
     #[error("gateway cost report is incomplete or invalid")]
     InvalidReport,
+    #[error("system clock is unavailable for the gateway cost report")]
+    ClockUnavailable,
     #[error("run is not authorized for a gateway cost event")]
     Unauthorized,
     #[error(transparent)]
@@ -254,7 +256,7 @@ impl AuthorizationCoordinator {
                     claim_callback_id,
                     stage: Some("inference".to_owned()),
                     step: Some("cost_report".to_owned()),
-                    timestamp_ms: now_ms(),
+                    timestamp_ms: gateway_cost_report_timestamp_ms(std::time::SystemTime::now())?,
                     payload,
                 },
             ))
@@ -1371,6 +1373,15 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+fn gateway_cost_report_timestamp_ms(
+    now: std::time::SystemTime,
+) -> Result<i64, GatewayCostReportError> {
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| GatewayCostReportError::ClockUnavailable)?;
+    i64::try_from(duration.as_millis()).map_err(|_| GatewayCostReportError::ClockUnavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,6 +1398,23 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     const RUN_ID_TEXT: &str = "f8a0c4c5-d628-7b93-a7cf-4b4629a28853";
+
+    #[test]
+    fn gateway_cost_report_timestamp_rejects_clock_errors() {
+        assert!(matches!(
+            gateway_cost_report_timestamp_ms(
+                std::time::UNIX_EPOCH - std::time::Duration::from_millis(1)
+            ),
+            Err(GatewayCostReportError::ClockUnavailable)
+        ));
+        assert_eq!(
+            gateway_cost_report_timestamp_ms(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1)
+            )
+            .unwrap(),
+            1
+        );
+    }
 
     struct FixedDecisionService {
         response: Result<ValidatedDecision, DecisionError>,
