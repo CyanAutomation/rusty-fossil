@@ -7,6 +7,7 @@ members = [
     "crates/fossil-queue",
     "crates/fossil-supervisor",
     "crates/fossil-workspace",
+    "crates/fossil-gateway",
     "crates/fossil-synthetic-worker",
     "crates/rusty-fossil",
 ]
@@ -30,7 +31,12 @@ fossil-storage = { path = "crates/fossil-storage" }
 fossil-supervisor = { path = "crates/fossil-supervisor" }
 bollard = { version = "=0.21.1", default-features = false, features = ["http", "pipe"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server", "service", "tokio"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +44,7 @@ serde_json = "1"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2", features = ["serde"] }

@@ -22,8 +22,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/worker /workspace /tmp/pi-home /tmp/pi-agent /run/fossil \
-    && touch /run/fossil/task-prompt.txt \
-    && chmod 0444 /run/fossil/task-prompt.txt \
+    && touch /run/fossil/task-prompt.txt /run/fossil/gateway-token /run/fossil/gateway-ca.pem \
+    && chmod 0444 /run/fossil/task-prompt.txt /run/fossil/gateway-token /run/fossil/gateway-ca.pem \
     && chown -R 65532:65532 /workspace /tmp/pi-home /tmp/pi-agent /run/fossil
 
 WORKDIR /workspace

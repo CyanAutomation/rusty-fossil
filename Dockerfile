@@ -5,14 +5,17 @@ COPY crates ./crates
 RUN cargo build --locked --release --workspace
 
 FROM debian:bookworm-slim AS runtime-directory
-RUN mkdir -p /var/lib/rusty-fossil \
-    && chown 65532:65532 /var/lib/rusty-fossil
+RUN mkdir -p /var/lib/rusty-fossil /var/lib/fossil-gateway \
+    && chown 65532:65532 /var/lib/rusty-fossil /var/lib/fossil-gateway
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=runtime-directory --chown=65532:65532 \
     /var/lib/rusty-fossil /var/lib/rusty-fossil
+COPY --from=runtime-directory --chown=65532:65532 \
+    /var/lib/fossil-gateway /var/lib/fossil-gateway
 COPY --from=build /workspace/target/release/rusty-fossil /usr/local/bin/rusty-fossil
 COPY --from=build /workspace/target/release/fossil-supervisord /usr/local/bin/fossil-supervisord
+COPY --from=build /workspace/target/release/fossil-gatewayd /usr/local/bin/fossil-gatewayd
 ENV RUSTY_FOSSIL_STATE_DIR=/var/lib/rusty-fossil
 EXPOSE 8080
 USER nonroot:nonroot

@@ -4,9 +4,9 @@ Rusty-Fossil is the host-side controller foundation for disposable repository wo
 
 Phase 2A.1 and 2A-S provide independent durable reconciliation, callback-outbox headroom, observable Queue failures, and an optional contract-validated Senku advisory client. Phase 2B adds an authenticated supervisor process, durable single-container Docker lifecycle, bounded security profile, and a fixed synthetic worker. Phase 2B.1 hardens outbox capacity, adds coordinator-to-supervisor process integration and restart coverage, and builds both controller and supervisor for Linux AMD64 and ARM64. Senku remains advisory and Soyuz remains the sole run authority. Production `main` still does not construct a Queue poller, callback replay loop, Senku client, or supervisor IPC client; `/ready` remains false until a controlled runtime is wired.
 
-Phase 2C-A adds a pinned Pi 1.6.0 worker image and bounded prompt wrapper. The wrapper now reads a fixed-path, read-only payload file (maximum 32 KiB) and rejects symlinks and writable files; the supervisor does not yet stage or mount that file. The Rust Pi event parser processes JSONL incrementally with strict stream, record and event-count bounds, and classifies completion together with the actual process exit. The supervisor terminal path can parse bounded Pi Docker output, and SQLite/outbox supports distinct Pi terminal classes with stable callback identity. Schema v7 persists the synthetic profile and deadline and can record a versioned `PiCodingV1` identity for any per-run repository URL, authorized ref and resolved commit that pass validation. The new `fossil-workspace` library adds a private checkout root, exact operator allowlist, branch/commit checks, bounded tree validation, and hostname-restricted Git HTTPS transport for the disposable `CyanAutomation/somatic` pilot. It is not wired into the supervisor, and no remote checkout was performed. The supervisor still rejects Pi launches before Docker create, so the result path is not reachable from a live worker; gateway isolation is not enabled.
+Phase 2C-A adds a pinned Pi 1.6.0 worker image and bounded prompt wrapper. The wrapper now reads a fixed-path, read-only payload file (maximum 32 KiB) and rejects symlinks and writable files; the supervisor does not yet stage or mount that file. The Rust Pi event parser processes JSONL incrementally with strict stream, record and event-count bounds, and classifies completion together with the actual process exit. The supervisor terminal path can parse bounded Pi Docker output, and SQLite/outbox supports distinct Pi terminal classes with stable callback identity. Schema v7 persists the synthetic profile and deadline and can record a versioned `PiCodingV1` identity for any per-run repository URL, authorized ref and resolved commit that pass validation. The `fossil-workspace` library adds a private checkout root, exact operator allowlist, branch/commit checks, bounded tree validation, and hostname-restricted Git HTTPS transport for the disposable `CyanAutomation/somatic` pilot; it is not wired into the supervisor, and no remote checkout was performed. A new `fossil-gateway` broker prototype verifies short-lived run-fenced tokens and forwards bounded OpenAI-compatible requests to one configured Cloudflare AI Gateway endpoint. A separate `docker-compose.pi.yml` profile keeps the broker off the host ports and places it on an internal worker network plus the supervisor egress network. Neither the supervisor token issuer nor the Pi worker network attachment is implemented, and the broker has no dollar-spend ceiling. The profile is dormant and has not contacted a provider. The supervisor still rejects Pi launches before Docker create; no coding runtime is enabled.
 
-The host owner expects Rusty-Fossil to run as `pi`. The Compose stack runs the controller and supervisor as the host `pi` UID/GID; only `fossil-supervisord` receives the Docker socket and Docker supplementary group. The controller is on an internal network and publishes diagnostics only on host loopback. Agentlab remains a read-only preflight: no Rusty-Fossil image or container was deployed, and no coding workload was started. See the [Agentlab validation record](docs/AGENTLAB-VALIDATION.md).
+The Compose stack runs the controller and supervisor with operator-configured numeric service IDs; only `fossil-supervisord` receives Docker Engine access. The controller is on an internal network and publishes diagnostics only on host loopback. This is a proposed process boundary, not proof of host-level account separation or Engine isolation. A generalized Raspberry Pi host profile and read-only preflight are recorded in [ARM64 host compatibility](docs/ARM64-HOST-COMPATIBILITY.md) and [ARM64 host validation](docs/ARM64-HOST-VALIDATION.md); they do not establish a successful coding workload.
 
 ## Workspace
 
@@ -17,6 +17,7 @@ The host owner expects Rusty-Fossil to run as `pi`. The Compose stack runs the c
 - `crates/fossil-senku` — versioned profile inputs, bounded authenticated transport, strict response validation, evidence redaction, and advisory metrics.
 - `crates/fossil-supervisor` — proof-gated Docker supervisor, restricted Unix IPC, crash recovery, and the `fossil-supervisord` service binary.
 - `crates/fossil-workspace` — isolated, allowlisted Git repository preparation policy and bounded HTTPS fetch/checkout (library only; not supervisor-integrated).
+- `crates/fossil-gateway` — bounded Cloudflare AI Gateway broker with run-fenced tokens (prototype; not supervisor-integrated).
 - `crates/fossil-synthetic-worker` — six fixed synthetic scenarios for lifecycle tests; no shell or prompt interpretation.
 - `crates/rusty-fossil` — controller configuration, authorization coordinator, opt-in supervisor handoff, read-only diagnostics, and callback replay logic.
 - `docs/` — contracts, architecture, compatibility evidence, decisions, and follow-on plan.
@@ -85,21 +86,25 @@ There are no `POST /runs`, `POST /execute`, retry, claim, or start routes. The s
 
 ## Docker Compose deployment
 
-The root [`docker-compose.yml`](docker-compose.yml) is the supported host process layout. It starts the controller and `fossil-supervisord` as containers managed by Docker Engine restart policies. Both use the configured host UID/GID for `pi`; only the supervisor gets the Docker socket and its numeric group. The controller receives no supervisor credential or Engine socket. The Compose boundary is process-level confinement under the shared `pi` identity, not a separate host security principal. The rootful Docker group remains host-root-equivalent.
+The root [`docker-compose.yml`](docker-compose.yml) is the supported host process layout. It starts the controller and `fossil-supervisord` as containers managed by Docker Engine restart policies. Both use operator-configured host UID/GID values; only the supervisor gets the Docker socket and its required numeric group. The controller receives no supervisor credential or Engine socket. This is process-level confinement and does not create a separate host security principal. Access to a rootful Docker daemon is host-level authority; prefer a dedicated supervisor identity and verify the socket and daemon listeners before deployment.
 
-Prepare the Agentlab values and private host directories before starting Compose:
+Set the service UID/GID and Docker group values for the target host, then prepare private state and secret directories before starting Compose:
 
 ```sh
 cp .env.example .env
-# Verify the IDs in .env with `id -u pi`, `id -g pi`, and
-# `getent group docker | cut -d: -f3`; replace the Soyuz values and image digest.
-sudo install -d -o pi -g pi -m 0700 /var/lib/rusty-fossil /var/lib/rusty-fossil/run
+# Set the operator-approved host account before using these values.
+FOSSIL_SERVICE_USER=replace-with-approved-account
+FOSSIL_UID="$(id -u "$FOSSIL_SERVICE_USER")"
+FOSSIL_GID="$(id -g "$FOSSIL_SERVICE_USER")"
+FOSSIL_DOCKER_GID="$(getent group docker | cut -d: -f3)"
+# Copy those numeric values into .env; replace the Soyuz values and image digest.
+sudo install -d -o "$FOSSIL_UID" -g "$FOSSIL_GID" -m 0700 /var/lib/rusty-fossil /var/lib/rusty-fossil/run
 install -d -m 0700 secrets
 # Copy the authorized Soyuz worker token to secrets/soyuz_worker_api_token.
 umask 077
 openssl rand -hex 32 > secrets/fossil_supervisor_ipc_token
 chmod 0400 secrets/soyuz_worker_api_token secrets/fossil_supervisor_ipc_token
-sudo chown pi:pi secrets/soyuz_worker_api_token secrets/fossil_supervisor_ipc_token
+sudo chown "$FOSSIL_UID:$FOSSIL_GID" secrets/soyuz_worker_api_token secrets/fossil_supervisor_ipc_token
 docker compose config --quiet
 # Replace the placeholder with the digest configured in .env.
 docker pull ghcr.io/cyanautomation/rusty-fossil-synthetic-worker@sha256:REPLACE_WITH_64_HEX_DIGEST
@@ -111,7 +116,7 @@ docker compose logs -f rusty-fossil fossil-supervisord
 
 Set `FOSSIL_SUPERVISOR_IMAGE` to the trusted synthetic worker in the fixed GHCR repository, pinned by its published SHA-256 digest, and pull that exact image before startup. The supervisor does not pull worker images. Do not put token contents in `.env`, environment variables or command arguments. `docker compose down` stops and removes only this Compose project's containers and network; it leaves the state directory and secret files intact. The controller's diagnostics port is bound to `127.0.0.1`; use an SSH tunnel for remote access. The supervisor's Compose bridge has outbound connectivity for its Soyuz API client and does not enforce destination allowlists.
 
-This layout does not make Pi execution ready. The supervisor still accepts only the fixed synthetic workload, production `main` does not construct the supervisor IPC client, and no broker or worker egress enforcement exists. Production Queue polling remains disabled. See the [Phase 2C-A operations guide](docs/PHASE-2C-A-OPERATIONS.md) for startup, recovery, rollback and enablement gates.
+This layout does not make Pi execution ready. The supervisor still accepts only the fixed synthetic workload, production `main` does not construct the supervisor IPC client, and no broker token issuance, worker network attachment, or host egress policy is enabled. The dormant Pi Compose overlay is a deployment scaffold, not verified enforcement. Production Queue polling remains disabled. See the [Phase 2C-A operations guide](docs/PHASE-2C-A-OPERATIONS.md) for startup, recovery, rollback and enablement gates.
 
 To rebuild the TypeScript API docs renderer after editing `docs-ui/src/docs.ts`, run `npm ci --ignore-scripts --no-audit --no-fund && npm run build` from `docs-ui/`. CI checks that the generated static bundle is current.
 
@@ -146,3 +151,4 @@ Default tests use local HTTP mocks and a stateful Soyuz worker API simulator; th
 - [Implementation plan and Phase 2B status](docs/IMPLEMENTATION-PLAN.md)
 - [Phase 2C-A long-running execution policy proposal](docs/DECISIONS/0012-phase-2c-long-running-execution-policy.md)
 - [Repository preparation trust boundary](docs/DECISIONS/0013-repository-preparation-boundary.md)
+- [Pi model broker boundary](docs/DECISIONS/0014-pi-model-broker-boundary.md)

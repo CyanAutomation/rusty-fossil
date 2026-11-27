@@ -1,0 +1,75 @@
+# Dormant Phase 2C-A broker profile. The supervisor does not yet create Pi
+# workers or issue run-scoped broker tokens, so this service is not usable
+# until the matching supervisor integration has been reviewed and enabled.
+services:
+  fossil-gateway-broker:
+    image: ${RUSTY_FOSSIL_IMAGE:-rusty-fossil:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - pi-pilot
+    entrypoint:
+      - /usr/local/bin/fossil-gatewayd
+    user: "${FOSSIL_GATEWAY_UID:?Set the dedicated gateway service UID}:${FOSSIL_GATEWAY_GID:?Set the dedicated gateway service GID}"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      FOSSIL_GATEWAY_ENDPOINT: ${FOSSIL_GATEWAY_ENDPOINT:?Set the dedicated non-production Cloudflare AI Gateway endpoint}
+      FOSSIL_GATEWAY_MODEL: ${FOSSIL_GATEWAY_MODEL:?Set the exact approved provider model ID}
+      FOSSIL_GATEWAY_AUTH_TOKEN_FILE: /run/secrets/fossil_gateway_auth_token
+      FOSSIL_GATEWAY_SIGNING_KEY_FILE: /run/secrets/fossil_gateway_signing_key
+      FOSSIL_GATEWAY_TLS_CERT_FILE: /run/secrets/fossil_gateway_tls_certificate
+      FOSSIL_GATEWAY_TLS_KEY_FILE: /run/secrets/fossil_gateway_tls_private_key
+      FOSSIL_GATEWAY_LEDGER_PATH: /var/lib/fossil-gateway/ledger.sqlite3
+      FOSSIL_GATEWAY_MAX_REQUESTS_PER_RUN: "64"
+      FOSSIL_GATEWAY_MAX_REQUEST_BYTES_PER_RUN: "16777216"
+      FOSSIL_GATEWAY_MAX_OUTPUT_TOKENS: "4096"
+    secrets:
+      - fossil_gateway_auth_token
+      - fossil_gateway_signing_key
+      - fossil_gateway_tls_certificate
+      - fossil_gateway_tls_private_key
+    volumes:
+      - type: bind
+        source: ${FOSSIL_GATEWAY_HOST_STATE_DIR:?Create a private state directory owned by the dedicated gateway service account}
+        target: /var/lib/fossil-gateway
+        bind:
+          create_host_path: false
+    networks:
+      pi_worker_internal:
+        aliases:
+          - fossil-gateway
+      supervisor_egress: {}
+    restart: "no"
+    stop_grace_period: 10s
+    cpus: 0.25
+    mem_limit: 96m
+    pids_limit: 32
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "1"
+
+secrets:
+  fossil_gateway_auth_token:
+    file: ${FOSSIL_GATEWAY_AUTH_TOKEN_HOST_FILE:?Create a private, dedicated non-production gateway credential file}
+  fossil_gateway_signing_key:
+    file: ${FOSSIL_GATEWAY_SIGNING_KEY_HOST_FILE:?Create a private, dedicated broker signing key file}
+  fossil_gateway_tls_certificate:
+    file: ${FOSSIL_GATEWAY_TLS_CERT_HOST_FILE:?Create a TLS certificate for fossil-gateway}
+  fossil_gateway_tls_private_key:
+    file: ${FOSSIL_GATEWAY_TLS_KEY_HOST_FILE:?Create a private TLS key for fossil-gateway}
+
+networks:
+  # Pi workers may join this internal network and reach only the broker
+  # service; the broker also joins supervisor_egress for its fixed upstream.
+  pi_worker_internal:
+    internal: true
