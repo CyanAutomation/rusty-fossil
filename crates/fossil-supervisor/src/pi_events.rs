@@ -5,6 +5,8 @@ use thiserror::Error;
 const MAX_PI_EVENT_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PI_EVENT_COUNT: usize = 4_096;
 const MAX_PI_EVENT_LINE_BYTES: usize = 16 * 1024;
+const MAX_PI_STREAM_SEAL_LINE_BYTES: usize = 128;
+const PI_STREAM_SEAL_PREFIX: &[u8] = b"RUSTY_FOSSIL_PI_STREAM_V1 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiCompletion {
@@ -94,6 +96,113 @@ pub enum PiStreamError {
     MalformedRecord,
     #[error("Pi JSONL stream contains an invalid event sequence")]
     InvalidSequence,
+    #[error("Pi output is missing its trusted stream seal")]
+    MissingStreamSeal,
+    #[error("Pi output stream seal is invalid")]
+    InvalidStreamSeal,
+    #[error("Pi output stream seal does not match captured stdout")]
+    StreamSealMismatch,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PiStreamSeal {
+    byte_count: usize,
+    sha256: [u8; 32],
+}
+
+impl PiStreamSeal {
+    pub fn matches(&self, byte_count: usize, sha256: &[u8]) -> bool {
+        self.byte_count == byte_count && self.sha256.as_slice() == sha256
+    }
+}
+
+/// Bounded parser for the wrapper's final stderr seal. Ordinary stderr lines
+/// before the seal are ignored; the seal must be unique and last.
+#[derive(Default)]
+pub struct PiStreamSealParser {
+    pending_line: Vec<u8>,
+    discarding_line: bool,
+    seal: Option<PiStreamSeal>,
+    trailing_output: bool,
+}
+
+impl PiStreamSealParser {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), PiStreamError> {
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.consume_line()?;
+                self.pending_line.clear();
+                self.discarding_line = false;
+            } else if self.discarding_line {
+                continue;
+            } else if self.pending_line.len() == MAX_PI_STREAM_SEAL_LINE_BYTES {
+                self.pending_line.clear();
+                self.discarding_line = true;
+                if self.seal.is_some() {
+                    self.trailing_output = true;
+                }
+            } else {
+                self.pending_line.push(*byte);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<PiStreamSeal, PiStreamError> {
+        if !self.pending_line.is_empty() {
+            self.consume_line()?;
+        }
+        if self.trailing_output {
+            return Err(PiStreamError::InvalidStreamSeal);
+        }
+        self.seal.ok_or(PiStreamError::MissingStreamSeal)
+    }
+
+    fn consume_line(&mut self) -> Result<(), PiStreamError> {
+        if self.discarding_line {
+            return Ok(());
+        }
+        let line = self
+            .pending_line
+            .strip_suffix(b"\r")
+            .unwrap_or(&self.pending_line);
+        if let Some(value) = line.strip_prefix(PI_STREAM_SEAL_PREFIX) {
+            if self.seal.is_some() {
+                return Err(PiStreamError::InvalidStreamSeal);
+            }
+            self.seal = Some(parse_stream_seal(value)?);
+        } else if self.seal.is_some() && !line.is_empty() {
+            self.trailing_output = true;
+        }
+        Ok(())
+    }
+}
+
+fn parse_stream_seal(value: &[u8]) -> Result<PiStreamSeal, PiStreamError> {
+    let value = std::str::from_utf8(value).map_err(|_| PiStreamError::InvalidStreamSeal)?;
+    let (byte_count, digest) = value
+        .split_once(' ')
+        .ok_or(PiStreamError::InvalidStreamSeal)?;
+    if byte_count.is_empty()
+        || (byte_count.len() > 1 && byte_count.starts_with('0'))
+        || !byte_count.bytes().all(|byte| byte.is_ascii_digit())
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(PiStreamError::InvalidStreamSeal);
+    }
+    let byte_count = byte_count
+        .parse::<usize>()
+        .ok()
+        .filter(|byte_count| *byte_count > 0)
+        .ok_or(PiStreamError::InvalidStreamSeal)?;
+    let mut sha256 = [0_u8; 32];
+    for index in 0..sha256.len() {
+        let pair = &digest[index * 2..index * 2 + 2];
+        sha256[index] =
+            u8::from_str_radix(pair, 16).map_err(|_| PiStreamError::InvalidStreamSeal)?;
+    }
+    Ok(PiStreamSeal { byte_count, sha256 })
 }
 
 /// Bounded incremental parser for the pinned Pi CLI JSON event protocol.
@@ -262,6 +371,9 @@ pub fn classify_pi_execution(
         Err(PiStreamError::StreamTooLarge | PiStreamError::TooManyEvents) => {
             return PiExecutionClass::OutputTruncated;
         }
+        Err(PiStreamError::MissingStreamSeal | PiStreamError::StreamSealMismatch) => {
+            return PiExecutionClass::ExecutionUncertain;
+        }
         Err(_) => return PiExecutionClass::InvalidEventStream,
     };
     if summary.output_truncated {
@@ -295,7 +407,7 @@ pub fn summarize_pi_jsonl(
 mod tests {
     use super::{
         PiCompletion, PiEventParser, PiExecutionClass, PiStopReason, PiStreamError,
-        classify_pi_execution, summarize_pi_jsonl,
+        PiStreamSealParser, classify_pi_execution, summarize_pi_jsonl,
     };
 
     const SUCCESS: &str = concat!(
@@ -507,6 +619,47 @@ mod tests {
             classify_pi_execution(Ok(completed), None, None),
             PiExecutionClass::ExecutionUncertain
         );
+    }
+
+    #[test]
+    fn incomplete_or_mismatched_stream_seals_are_execution_uncertain() {
+        assert_eq!(
+            classify_pi_execution(Err(PiStreamError::MissingStreamSeal), Some(0), None),
+            PiExecutionClass::ExecutionUncertain
+        );
+        assert_eq!(
+            classify_pi_execution(Err(PiStreamError::StreamSealMismatch), Some(0), None),
+            PiExecutionClass::ExecutionUncertain
+        );
+    }
+
+    #[test]
+    fn stream_seal_detects_missing_duplicate_trailing_and_mismatched_logs() {
+        let stdout = b"abc";
+        let digest = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        let record = b"RUSTY_FOSSIL_PI_STREAM_V1 3 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n";
+
+        let mut parser = PiStreamSealParser::default();
+        parser.push(b"worker warning\n").unwrap();
+        parser.push(record).unwrap();
+        let seal = parser.finish().unwrap();
+        assert!(seal.matches(stdout.len(), &digest));
+        assert!(!seal.matches(stdout.len() + 1, &digest));
+
+        assert!(PiStreamSealParser::default().finish().is_err());
+
+        let mut duplicate = PiStreamSealParser::default();
+        duplicate.push(record).unwrap();
+        assert!(duplicate.push(record).is_err());
+
+        let mut trailing = PiStreamSealParser::default();
+        trailing.push(record).unwrap();
+        trailing.push(b"unexpected-after-seal\n").unwrap();
+        assert!(trailing.finish().is_err());
     }
 
     #[test]

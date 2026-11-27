@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { Readable, Writable } from "node:stream";
 import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +12,8 @@ import {
   TASK_PROMPT_PATH,
   buildPiModelsConfig,
   buildPiInvocation,
+  formatPiStreamSeal,
+  forwardPiStdout,
   parseTaskPrompt,
   readGatewayTokenFile,
   readTaskPromptFile,
@@ -152,6 +156,35 @@ test("builds a fixed Pi JSON-mode invocation without a shell or prompt argument"
   ]);
   assert.equal(invocation.shell, false);
   assert.ok(!invocation.args.join(" ").includes("task prompt"));
+});
+
+test("seals the exact bounded Pi stdout bytes with a strict SHA-256 record", () => {
+  const digest = createHash("sha256").update("abc").digest("hex");
+  assert.equal(
+    formatPiStreamSeal(3, digest),
+    "RUSTY_FOSSIL_PI_STREAM_V1 3 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+  assert.throws(() => formatPiStreamSeal(0, digest), /invalid Pi stream seal/);
+  assert.throws(() => formatPiStreamSeal(3, "not-a-digest"), /invalid Pi stream seal/);
+});
+
+test("forwards Pi stdout byte-for-byte and returns a matching stream seal", async () => {
+  const captured = [];
+  const output = new Writable({
+    write(chunk, _encoding, callback) {
+      captured.push(Buffer.from(chunk));
+      callback();
+    },
+  });
+  const seal = await forwardPiStdout(
+    Readable.from([Buffer.from([0x7b, 0x7d]), Buffer.from([0x0a])]),
+    output,
+  );
+
+  const forwarded = Buffer.concat(captured);
+  assert.deepEqual(forwarded, Buffer.from("{}\n"));
+  assert.equal(seal.byteCount, forwarded.length);
+  assert.equal(seal.sha256, createHash("sha256").update(forwarded).digest("hex"));
 });
 
 test("rejects empty and malformed model identifiers", () => {
