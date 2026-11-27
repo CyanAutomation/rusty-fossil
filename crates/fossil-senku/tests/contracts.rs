@@ -409,6 +409,40 @@ async fn rate_limit_errors_preserve_correlation_request_id_and_retry_after() {
 }
 
 #[tokio::test]
+async fn rate_limit_errors_ignore_request_ids_with_only_the_prefix() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/profiles/task_admission_v1/evaluate"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "code": "PROVIDER_RATE_LIMITED",
+                        "message": "safe",
+                        "requestId": "dec-"
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = SenkuClient::new(
+        SenkuClientConfig::new(
+            Url::parse(&server.uri()).unwrap(),
+            SecretString::from("synthetic-senku-token-000000000000".to_owned()),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = client.evaluate(task_admission()).await.unwrap_err();
+    assert_eq!(error.request_context().unwrap().request_id, None);
+}
+
+#[tokio::test]
 async fn upstream_faults_are_bounded_classified_and_never_retried() {
     use fossil_senku::DecisionError;
     use http_faults::{HttpFaultScenario, mount_http_fault};

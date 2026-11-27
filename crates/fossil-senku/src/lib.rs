@@ -671,7 +671,7 @@ fn error_request_id(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let request_id = value.get("error")?.get("requestId")?.as_str()?;
     let valid = request_id.starts_with("dec-")
-        && (4..=200).contains(&request_id.len())
+        && (5..=200).contains(&request_id.len())
         && request_id.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         });
