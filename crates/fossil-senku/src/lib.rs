@@ -8,11 +8,12 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -57,6 +58,16 @@ impl ProfileId {
             Self::ValidationRecovery => "validation_recovery_v1",
             Self::KasekiGoalCheck => "kaseki_goal_check_v1",
             Self::KasekiRunEvaluation => "kaseki_run_evaluation_v1",
+        }
+    }
+
+    pub const fn contract_key(self) -> &'static str {
+        match self {
+            Self::TaskAdmission => "contract_01",
+            Self::KasekiContextRouting => "contract_02",
+            Self::ValidationRecovery => "contract_03",
+            Self::KasekiGoalCheck => "contract_04",
+            Self::KasekiRunEvaluation => "contract_05",
         }
     }
 }
@@ -236,7 +247,7 @@ impl ProfileEvaluation {
     }
 
     pub fn validate_response(&self, body: &[u8]) -> Result<ValidatedDecision, DecisionError> {
-        validate_response(self, body)
+        validate_response(self, body, "")
     }
 
     fn validate_input(&self) -> Result<(), DecisionError> {
@@ -317,6 +328,8 @@ pub struct ValidatedDecision {
     pub answers: BTreeMap<String, DecisionAnswer>,
     pub usage: Option<ProviderUsage>,
     pub duration_ms: u64,
+    pub attempt_count: u64,
+    pub correlation_id: String,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -440,11 +453,13 @@ pub struct SenkuClient {
     client: Client,
     origin: Url,
     token: SecretString,
+    provider_deadline_ms: u64,
     metrics: Arc<ClientMetrics>,
 }
 
 impl SenkuClient {
     pub fn new(config: SenkuClientConfig) -> Result<Self, DecisionError> {
+        let provider_deadline_ms = provider_deadline_budget_ms(config.request_timeout);
         let client = Client::builder()
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -454,6 +469,7 @@ impl SenkuClient {
             client,
             origin: config.origin,
             token: config.token,
+            provider_deadline_ms,
             metrics: Arc::new(ClientMetrics::default()),
         })
     }
@@ -487,6 +503,13 @@ impl DecisionService for SenkuClient {
         let body = request.request_body()?;
         self.metrics.attempts[index].fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
+        let correlation_id = Uuid::new_v4().to_string();
+        let deadline_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .saturating_add(self.provider_deadline_ms as u128)
+            .min(u64::MAX as u128) as u64;
         let url = format!(
             "{}/v1/profiles/{}/evaluate",
             self.origin.as_str().trim_end_matches('/'),
@@ -498,6 +521,8 @@ impl DecisionService for SenkuClient {
             .bearer_auth(self.token.expose_secret())
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("x-correlation-id", &correlation_id)
+            .header("x-senku-deadline-ms", deadline_at_ms.to_string())
             .body(body)
             .send()
             .await
@@ -520,7 +545,7 @@ impl DecisionService for SenkuClient {
                 return Err(error);
             }
         };
-        match request.validate_response(&body) {
+        match validate_response(&request, &body, &correlation_id) {
             Ok(decision) => {
                 let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 self.metrics.successes[index].fetch_add(1, Ordering::Relaxed);
@@ -1099,153 +1124,203 @@ fn tail_chars(value: &str, maximum: usize) -> String {
     value.chars().skip(chars - maximum).collect()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ExpectedAnswer {
     Noul,
-    Choice(&'static [&'static str]),
-    Score,
+    Choice(Vec<String>),
+    Score {
+        maximum: f64,
+        legend: BTreeMap<String, String>,
+    },
 }
 
-fn expected_answers(evaluation: &ProfileEvaluation) -> BTreeMap<String, ExpectedAnswer> {
-    let mut expected = BTreeMap::new();
-    match evaluation {
-        ProfileEvaluation::TaskAdmission(_) => {
-            for id in [
-                "contains_credentials",
-                "changes_permissions",
-                "crosses_security_boundary",
-            ] {
-                expected.insert(id.to_owned(), ExpectedAnswer::Noul);
+fn profile_contract_artifact() -> &'static Value {
+    static ARTIFACT: OnceLock<Value> = OnceLock::new();
+    ARTIFACT.get_or_init(|| {
+        serde_json::from_str(include_str!("../contracts/senku-profiles.v1.json"))
+            .expect("checked-in Senku profile contract artifact must be valid JSON")
+    })
+}
+
+fn contract_profile(profile_id: ProfileId) -> Result<&'static Value, DecisionError> {
+    profile_contract_artifact()
+        .get("contracts")
+        .and_then(Value::as_array)
+        .and_then(|contracts| {
+            contracts.iter().find(|contract| {
+                contract.get("key").and_then(Value::as_str) == Some(profile_id.contract_key())
+            })
+        })
+        .ok_or(DecisionError::InvalidResponse)
+}
+
+fn answer_from_schema(schema: &Value) -> Result<ExpectedAnswer, DecisionError> {
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or(DecisionError::InvalidResponse)?;
+    match properties
+        .get("type")
+        .and_then(|value| value.get("const"))
+        .and_then(Value::as_str)
+    {
+        Some("noul") => Ok(ExpectedAnswer::Noul),
+        Some("choice") => {
+            let labels = properties
+                .get("choice")
+                .and_then(|value| value.get("enum"))
+                .and_then(Value::as_array)
+                .ok_or(DecisionError::InvalidResponse)?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(DecisionError::InvalidResponse)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if labels.len() < 2 {
+                return Err(DecisionError::InvalidResponse);
             }
-            expected.insert(
-                "risk_level".to_owned(),
-                ExpectedAnswer::Choice(&["low", "review", "high"]),
-            );
-            expected.insert(
-                "task_type".to_owned(),
-                ExpectedAnswer::Choice(&[
-                    "feature",
-                    "bug_fix",
-                    "refactor",
-                    "documentation",
-                    "investigation",
-                    "test_only",
-                    "infrastructure",
-                ]),
-            );
-            expected.insert(
-                "validation_focus".to_owned(),
-                ExpectedAnswer::Choice(&[
-                    "unit_tests",
-                    "integration_tests",
-                    "type_and_lint",
-                    "docs_checks",
-                    "repo_defined_checks",
-                ]),
-            );
+            Ok(ExpectedAnswer::Choice(labels))
         }
-        ProfileEvaluation::ValidationRecovery(_) => {
-            expected.insert(
-                "validation_failure_cause".to_owned(),
-                ExpectedAnswer::Choice(&[
-                    "test_failure",
-                    "type_or_lint_failure",
-                    "build_failure",
-                    "dependency_or_environment",
-                    "timeout_or_flaky",
-                    "implementation_logic",
-                    "unknown",
-                ]),
-            );
-            expected.insert(
-                "validation_recovery_action".to_owned(),
-                ExpectedAnswer::Choice(&[
-                    "fix_implementation",
-                    "repair_environment",
-                    "retry_validation_once",
-                    "inspect_diagnostics",
-                ]),
-            );
+        Some("score") => {
+            let score = properties
+                .get("score")
+                .ok_or(DecisionError::InvalidResponse)?;
+            let maximum = score
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .ok_or(DecisionError::InvalidResponse)?;
+            let legend_properties = properties
+                .get("legend")
+                .and_then(|value| value.get("properties"))
+                .and_then(Value::as_object)
+                .ok_or(DecisionError::InvalidResponse)?;
+            let legend = legend_properties
+                .iter()
+                .map(|(key, value)| {
+                    let text = value
+                        .get("const")
+                        .and_then(Value::as_str)
+                        .ok_or(DecisionError::InvalidResponse)?;
+                    Ok((key.clone(), text.to_owned()))
+                })
+                .collect::<Result<BTreeMap<_, _>, DecisionError>>()?;
+            if !maximum.is_finite() || maximum < 1.0 || legend.len() != maximum as usize + 1 {
+                return Err(DecisionError::InvalidResponse);
+            }
+            Ok(ExpectedAnswer::Score { maximum, legend })
+        }
+        _ => Err(DecisionError::InvalidResponse),
+    }
+}
+
+fn contracts_from_schema(
+    schema: &Value,
+) -> Result<BTreeMap<String, ExpectedAnswer>, DecisionError> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or(DecisionError::InvalidResponse)?
+        .iter()
+        .map(|(id, schema)| Ok((id.clone(), answer_from_schema(schema)?)))
+        .collect()
+}
+
+fn variant_schema<'a>(profile: &'a Value, variant: &str) -> Result<&'a Value, DecisionError> {
+    profile
+        .get("outputVariants")
+        .and_then(|variants| variants.get(variant))
+        .ok_or(DecisionError::InvalidResponse)
+}
+
+fn expected_answers(
+    evaluation: &ProfileEvaluation,
+) -> Result<BTreeMap<String, ExpectedAnswer>, DecisionError> {
+    let profile = contract_profile(evaluation.profile_id())?;
+    match evaluation {
+        ProfileEvaluation::TaskAdmission(_) | ProfileEvaluation::ValidationRecovery(_) => {
+            contracts_from_schema(
+                profile
+                    .get("outputSchema")
+                    .ok_or(DecisionError::InvalidResponse)?,
+            )
         }
         ProfileEvaluation::KasekiContextRouting(input) => match input.mode {
             ContextRoutingMode::ToolOutput => {
-                expected.insert(
-                    "route".to_owned(),
-                    ExpectedAnswer::Choice(&["preserve", "compact_repeated", "structural_code"]),
-                );
+                contracts_from_schema(variant_schema(profile, "tool_output")?)
             }
             ContextRoutingMode::SemanticContext => {
-                expected.insert(
-                    "disposition".to_owned(),
-                    ExpectedAnswer::Choice(&["preserve", "condense", "discard"]),
-                );
+                contracts_from_schema(variant_schema(profile, "semantic_context")?)
             }
             ContextRoutingMode::PhaseTransfer => {
-                if let Some(candidates) = input.evidence.get("candidates").and_then(Value::as_array)
-                {
-                    for candidate in candidates {
-                        if let Some(id) = candidate.get("id").and_then(Value::as_str) {
-                            expected.insert(
-                                id.to_owned(),
-                                ExpectedAnswer::Choice(&["preserve", "condense", "discard"]),
-                            );
-                        }
-                    }
-                }
+                let template = contracts_from_schema(variant_schema(profile, "phase_transfer")?)?;
+                let candidates = input
+                    .evidence
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .ok_or(DecisionError::InvalidResponse)?;
+                candidates
+                    .iter()
+                    .map(|candidate| {
+                        let id = candidate
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .ok_or(DecisionError::InvalidResponse)?;
+                        let family = id
+                            .rsplit_once('_')
+                            .map(|(family, _)| family)
+                            .ok_or(DecisionError::InvalidResponse)?;
+                        let template_id = format!("{family}_0");
+                        let contract = template
+                            .get(&template_id)
+                            .ok_or(DecisionError::InvalidResponse)?
+                            .clone();
+                        Ok((id.to_owned(), contract))
+                    })
+                    .collect()
             }
         },
         ProfileEvaluation::KasekiGoalCheck(input) => {
+            let template = contracts_from_schema(variant_schema(profile, "with_applicability")?)?;
+            let mut expected = BTreeMap::new();
             for criterion in &input.criteria {
-                expected.insert(criterion.id.clone(), ExpectedAnswer::Noul);
+                expected.insert(
+                    criterion.id.clone(),
+                    template
+                        .get("criterion_1")
+                        .ok_or(DecisionError::InvalidResponse)?
+                        .clone(),
+                );
                 if criterion.applies_when.is_some() {
                     expected.insert(
                         format!("{}_applicability", criterion.id),
-                        ExpectedAnswer::Choice(&["applicable", "not_applicable", "unknown"]),
+                        template
+                            .get("criterion_1_applicability")
+                            .ok_or(DecisionError::InvalidResponse)?
+                            .clone(),
                     );
                 }
             }
+            Ok(expected)
         }
         ProfileEvaluation::KasekiRunEvaluation(input) => {
-            expected.insert(
-                "overall_assessment".to_owned(),
-                ExpectedAnswer::Choice(&["excellent", "good", "mixed", "poor"]),
-            );
-            expected.insert(
-                "reviewer_confidence".to_owned(),
-                ExpectedAnswer::Choice(&["high", "medium", "low"]),
-            );
-            expected.insert("task_completion_score".to_owned(), ExpectedAnswer::Score);
-            if input.include_failure_diagnosis {
-                expected.insert(
-                    "validation_failure_cause".to_owned(),
-                    ExpectedAnswer::Choice(&[
-                        "test_failure",
-                        "type_or_lint_failure",
-                        "build_failure",
-                        "dependency_or_environment",
-                        "timeout_or_flaky",
-                        "implementation_logic",
-                        "unknown",
-                    ]),
-                );
-                expected.insert(
-                    "validation_recovery_action".to_owned(),
-                    ExpectedAnswer::Choice(&[
-                        "fix_implementation",
-                        "repair_environment",
-                        "retry_validation_once",
-                        "inspect_diagnostics",
-                    ]),
-                );
+            let mut expected =
+                contracts_from_schema(variant_schema(profile, "with_failure_diagnosis")?)?;
+            if !input.include_failure_diagnosis {
+                expected.remove("validation_failure_cause");
+                expected.remove("validation_recovery_action");
             }
+            Ok(expected)
         }
     }
-    expected
 }
 
 fn validate_response(
     evaluation: &ProfileEvaluation,
     body: &[u8],
+    correlation_id: &str,
 ) -> Result<ValidatedDecision, DecisionError> {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(DecisionError::InvalidResponse);
@@ -1253,28 +1328,16 @@ fn validate_response(
     let response: Value =
         serde_json::from_slice(body).map_err(|_| DecisionError::InvalidResponse)?;
     let object = response.as_object().ok_or(DecisionError::InvalidResponse)?;
-    let allowed = [
-        "schemaVersion",
-        "requestId",
-        "status",
-        "profileId",
-        "profileVersion",
-        "provider",
-        "model",
-        "answers",
-        "result",
-        "usage",
-        "durationMs",
-        "attemptCount",
-    ];
-    if object.keys().any(|key| !allowed.contains(&key.as_str()))
-        || object.keys().filter(|key| key.as_str() != "usage").count() != 11
-        || object.get("schemaVersion").and_then(Value::as_str) != Some("1")
+    let attempt_count = object
+        .get("attemptCount")
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1)
+        .ok_or(DecisionError::InvalidResponse)?;
+    if object.get("schemaVersion").and_then(Value::as_str) != Some("1")
         || object.get("status").and_then(Value::as_str) != Some("completed")
         || object.get("profileId").and_then(Value::as_str) != Some(evaluation.profile_id().as_str())
         || object.get("profileVersion").and_then(Value::as_str) != Some("1")
         || object.get("provider").and_then(Value::as_str) != Some("jev")
-        || object.get("attemptCount").and_then(Value::as_u64) != Some(1)
     {
         return Err(DecisionError::InvalidResponse);
     }
@@ -1297,7 +1360,7 @@ fn validate_response(
     if answers != result {
         return Err(DecisionError::InvalidResponse);
     }
-    let expected = expected_answers(evaluation);
+    let expected = expected_answers(evaluation)?;
     if answers.len() != expected.len() || answers.keys().any(|id| !expected.contains_key(id)) {
         return Err(DecisionError::InvalidResponse);
     }
@@ -1316,7 +1379,16 @@ fn validate_response(
         answers: parsed_answers,
         usage,
         duration_ms,
+        attempt_count,
+        correlation_id: correlation_id.to_owned(),
     })
+}
+
+fn provider_deadline_budget_ms(request_timeout: Duration) -> u64 {
+    const MAX_PROVIDER_BUDGET_MS: u64 = 30_000;
+    let timeout_ms = request_timeout.as_millis().min(u64::MAX as u128) as u64;
+    let margin_ms = 1_000.min((timeout_ms / 10).max(1));
+    MAX_PROVIDER_BUDGET_MS.min(timeout_ms.saturating_sub(margin_ms).max(1))
 }
 
 fn response_text<'a>(
@@ -1379,8 +1451,8 @@ fn parse_answer(value: &Value, expected: ExpectedAnswer) -> Result<DecisionAnswe
             if !object.get("confidence").is_some_and(Value::is_null) {
                 return Err(DecisionError::InvalidResponse);
             }
-            let probabilities =
-                parse_probabilities(object.get("probabilities"), &["false", "true"])?;
+            let labels = vec!["false".to_owned(), "true".to_owned()];
+            let probabilities = parse_probabilities(object.get("probabilities"), &labels)?;
             if (probabilities["true"] - noul).abs() > 0.000_001 {
                 return Err(DecisionError::InvalidResponse);
             }
@@ -1389,8 +1461,11 @@ fn parse_answer(value: &Value, expected: ExpectedAnswer) -> Result<DecisionAnswe
                 probabilities,
             })
         }
-        ExpectedAnswer::Choice(labels) => parse_choice(object, kind, labels),
-        ExpectedAnswer::Score => {
+        ExpectedAnswer::Choice(labels) => parse_choice(object, kind, &labels),
+        ExpectedAnswer::Score {
+            maximum,
+            legend: expected_legend,
+        } => {
             if kind != "score"
                 || !has_exact_keys(
                     object,
@@ -1402,9 +1477,10 @@ fn parse_answer(value: &Value, expected: ExpectedAnswer) -> Result<DecisionAnswe
             let score = object
                 .get("score")
                 .and_then(Value::as_f64)
-                .filter(|score| score.is_finite() && (1.0..=5.0).contains(score))
+                .filter(|score| score.is_finite() && (0.0..=maximum).contains(score))
                 .ok_or(DecisionError::InvalidResponse)?;
-            let labels = ["1", "2", "3", "4", "5"];
+            let mut labels = expected_legend.keys().cloned().collect::<Vec<_>>();
+            labels.sort_by_key(|label| label.parse::<usize>().unwrap_or(usize::MAX));
             let probabilities = parse_probabilities(object.get("probabilities"), &labels)?;
             let legend_object = object
                 .get("legend")
@@ -1413,28 +1489,21 @@ fn parse_answer(value: &Value, expected: ExpectedAnswer) -> Result<DecisionAnswe
             if legend_object.len() != labels.len()
                 || labels
                     .iter()
-                    .any(|label| !legend_object.contains_key(*label))
+                    .any(|label| !legend_object.contains_key(label))
             {
                 return Err(DecisionError::InvalidResponse);
             }
             let mut legend = BTreeMap::new();
-            let expected_legend = [
-                "Largely unrealized",
-                "Major requirements unmet",
-                "Partially complete",
-                "Nearly complete",
-                "All requirements verified",
-            ];
-            for (label, expected_text) in labels.into_iter().zip(expected_legend) {
+            for label in labels {
                 let text = legend_object
-                    .get(label)
+                    .get(&label)
                     .and_then(Value::as_str)
                     .filter(|text| !text.trim().is_empty() && text.len() <= 512)
                     .ok_or(DecisionError::InvalidResponse)?;
-                if text != expected_text {
+                if expected_legend.get(&label).map(String::as_str) != Some(text) {
                     return Err(DecisionError::InvalidResponse);
                 }
-                legend.insert(label.to_owned(), text.to_owned());
+                legend.insert(label, text.to_owned());
             }
             let confidence = parse_confidence(object.get("confidence"))?;
             Ok(DecisionAnswer::Score {
@@ -1450,7 +1519,7 @@ fn parse_answer(value: &Value, expected: ExpectedAnswer) -> Result<DecisionAnswe
 fn parse_choice(
     object: &Map<String, Value>,
     kind: &str,
-    labels: &[&str],
+    labels: &[String],
 ) -> Result<DecisionAnswer, DecisionError> {
     if kind != "choice"
         || !has_exact_keys(object, &["type", "choice", "probabilities", "confidence"])
@@ -1460,7 +1529,7 @@ fn parse_choice(
     let choice = object
         .get("choice")
         .and_then(Value::as_str)
-        .filter(|choice| labels.contains(choice))
+        .filter(|choice| labels.iter().any(|label| label == choice))
         .ok_or(DecisionError::InvalidResponse)?;
     let probabilities = parse_probabilities(object.get("probabilities"), labels)?;
     let confidence = parse_confidence(object.get("confidence"))?;
@@ -1481,19 +1550,19 @@ fn parse_confidence(value: Option<&Value>) -> Result<Option<f64>, DecisionError>
 
 fn parse_probabilities(
     value: Option<&Value>,
-    labels: &[&str],
+    labels: &[String],
 ) -> Result<BTreeMap<String, f64>, DecisionError> {
     let object = value
         .and_then(Value::as_object)
         .ok_or(DecisionError::InvalidResponse)?;
-    if object.len() != labels.len() || labels.iter().any(|label| !object.contains_key(*label)) {
+    if object.len() != labels.len() || labels.iter().any(|label| !object.contains_key(label)) {
         return Err(DecisionError::InvalidResponse);
     }
     let mut result = BTreeMap::new();
     let mut sum = 0.0;
     for label in labels {
-        let value = probability(object.get(*label))?;
-        result.insert((*label).to_owned(), value);
+        let value = probability(object.get(label))?;
+        result.insert(label.clone(), value);
         sum += value;
     }
     if (sum - 1.0).abs() > 0.03 {

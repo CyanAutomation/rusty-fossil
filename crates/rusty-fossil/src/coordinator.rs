@@ -1362,6 +1362,8 @@ mod tests {
                 cost_micros: None,
             }),
             duration_ms: 1,
+            attempt_count: 1,
+            correlation_id: "test-advisory".to_owned(),
         }
     }
 
