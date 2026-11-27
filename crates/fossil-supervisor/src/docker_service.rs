@@ -1676,6 +1676,7 @@ fn is_success_class(launch: &ContainerLaunchRecord, outcome_class: &str) -> bool
                     .container_id
                     .as_deref()
                     .is_some_and(|container_id| !container_id.is_empty())
+                && launch.started_at_ms.is_some()
                 && launch.completed_at_ms.is_some()
         }
     };
@@ -1843,6 +1844,11 @@ mod tests {
             super::TerminalReason::Completed
         );
         assert!(terminal_callback(&completed).is_ok());
+
+        let mut missing_start = completed.clone();
+        missing_start.started_at_ms = None;
+        assert!(outcome_from_launch(&missing_start).is_err());
+        assert!(terminal_callback(&missing_start).is_err());
 
         let mut invalid_exit = completed.clone();
         invalid_exit.exit_code = Some(1);
