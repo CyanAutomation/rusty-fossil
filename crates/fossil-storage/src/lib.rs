@@ -3266,10 +3266,13 @@ fn insert_callback(
         .optional()?;
     let kind = callback_kind_str(callback.payload.kind());
     if let Some((existing_run, existing_kind, existing_payload)) = existing {
-        if existing_run != callback.run_id.to_string()
-            || existing_kind != kind
-            || existing_payload != payload_json
-        {
+        let same_payload = existing_payload == payload_json
+            || serde_json::from_str::<CallbackPayload>(&existing_payload)
+                .ok()
+                .is_some_and(|existing_payload| {
+                    same_gateway_cost_report(&existing_payload, &callback.payload)
+                });
+        if existing_run != callback.run_id.to_string() || existing_kind != kind || !same_payload {
             return Err(StoreError::CallbackIdConflict);
         }
         return Ok(CallbackEnqueueResult::AlreadyPresent);
@@ -3319,6 +3322,53 @@ fn insert_callback(
         params![callback.run_id.to_string(), now],
     )?;
     Ok(CallbackEnqueueResult::Enqueued)
+}
+
+/// Cost reports use one stable per-run event ID while their event timestamp
+/// may be regenerated after a caller restart. Treat matching report contents
+/// as the same outbox payload and retain the first persisted timestamp.
+fn same_gateway_cost_report(existing: &CallbackPayload, incoming: &CallbackPayload) -> bool {
+    match (existing, incoming) {
+        (
+            CallbackPayload::Event {
+                event_type: existing_type,
+                worker_id: existing_worker,
+                claim_callback_id: existing_claim,
+                stage: existing_stage,
+                step: existing_step,
+                payload: existing_payload,
+                ..
+            },
+            CallbackPayload::Event {
+                event_type: incoming_type,
+                worker_id: incoming_worker,
+                claim_callback_id: incoming_claim,
+                stage: incoming_stage,
+                step: incoming_step,
+                payload: incoming_payload,
+                ..
+            },
+        ) => {
+            *existing_type == OperationalEventType::ProgressUpdate
+                && *incoming_type == OperationalEventType::ProgressUpdate
+                && existing_worker == incoming_worker
+                && existing_claim == incoming_claim
+                && existing_stage.as_deref() == Some("inference")
+                && incoming_stage.as_deref() == Some("inference")
+                && existing_step.as_deref() == Some("cost_report")
+                && incoming_step.as_deref() == Some("cost_report")
+                && existing_payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("ai_gateway_cost")
+                && incoming_payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("ai_gateway_cost")
+                && existing_payload == incoming_payload
+        }
+        _ => false,
+    }
 }
 
 /// Capped exponential retry with stable per-event jitter so hosts do not

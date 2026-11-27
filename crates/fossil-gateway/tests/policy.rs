@@ -80,74 +80,133 @@ fn endpoint_accepts_only_the_cloudflare_universal_compatibility_route() {
 }
 
 #[test]
-fn model_requests_are_bounded_and_cannot_select_another_model() {
-    let good = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"max_tokens":64,"stream":true}"#;
-    let parsed = validate_completion_request(good, "workers-ai/@cf/meta/test-model", 128).unwrap();
+fn request_token_fields_do_not_become_gateway_token_budgets() {
+    let good = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"stream":true}"#;
+    let parsed = validate_completion_request(good, "workers-ai/@cf/meta/test-model").unwrap();
     assert_eq!(parsed["model"], "workers-ai/@cf/meta/test-model");
+    assert!(parsed.get("max_tokens").is_none());
+    assert!(parsed.get("max_completion_tokens").is_none());
+
+    let large_requested_output = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":1000000,"n":4}"#;
+    let parsed =
+        validate_completion_request(large_requested_output, "workers-ai/@cf/meta/test-model")
+            .unwrap();
+    assert_eq!(parsed["n"], 4);
+    assert!(parsed.get("max_completion_tokens").is_none());
+    assert!(parsed.get("max_tokens").is_none());
 
     let other_model = br#"{"model":"openai/gpt-x","messages":[{"role":"user","content":"hello"}]}"#;
     assert_eq!(
-        validate_completion_request(other_model, "workers-ai/@cf/meta/test-model", 128),
-        Err(BrokerError::InvalidRequest)
-    );
-    let too_many = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"max_tokens":129}"#;
-    assert_eq!(
-        validate_completion_request(too_many, "workers-ai/@cf/meta/test-model", 128),
+        validate_completion_request(other_model, "workers-ai/@cf/meta/test-model"),
         Err(BrokerError::InvalidRequest)
     );
     assert_eq!(
-        validate_completion_request(&vec![b'x'; 512 * 1024 + 1], "model", 128),
+        validate_completion_request(&vec![b'x'; 512 * 1024 + 1], "model"),
+        Err(BrokerError::InvalidRequest)
+    );
+
+    let image_content = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#;
+    assert_eq!(
+        validate_completion_request(image_content, "workers-ai/@cf/meta/test-model"),
+        Err(BrokerError::InvalidRequest)
+    );
+    let unaccounted_modality = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"modalities":["image"]}"#;
+    assert_eq!(
+        validate_completion_request(unaccounted_modality, "workers-ai/@cf/meta/test-model"),
         Err(BrokerError::InvalidRequest)
     );
 }
 
 #[test]
-fn request_budget_is_atomic_and_persists_only_counts() {
+fn request_ledger_tracks_cost_without_limiting_inference_count() {
     let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("gateway.sqlite3");
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("gateway.sqlite3");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let request_claims = claims(now, now + 60_000);
+    let run = claims(now, now + 60_000);
+
     {
         let ledger = GatewayRequestLedger::open(&database).unwrap();
-        ledger.reserve(&request_claims, 100, 2, 250).unwrap();
-        ledger.reserve(&request_claims, 100, 2, 250).unwrap();
-        assert_eq!(
-            ledger.reserve(&request_claims, 1, 2, 250),
-            Err(BrokerError::RateLimited)
-        );
+        for index in 0..1_000 {
+            let request_id = EventId::new();
+            let log_id = format!("log-{index}");
+            ledger.begin_request(&run, request_id).unwrap();
+            ledger
+                .record_gateway_log(&run, request_id, &log_id)
+                .unwrap();
+            ledger.record_gateway_cost(&log_id, 0.00025).unwrap();
+        }
+        let request_without_cost = EventId::new();
+        ledger.begin_request(&run, request_without_cost).unwrap();
+        let report = ledger.cost_report(&run).unwrap();
+        assert_eq!(report.request_count, 1_001);
+        assert_eq!(report.priced_request_count, 1_000);
+        assert_eq!(report.pending_request_count, 1);
+        assert!((report.estimated_cost_usd - 0.25).abs() < 0.000_001);
     }
+
     let ledger = GatewayRequestLedger::open(&database).unwrap();
+    let report = ledger.cost_report(&run).unwrap();
+    assert_eq!(report.request_count, 1_001);
+    assert_eq!(report.priced_request_count, 1_000);
+    assert_eq!(report.pending_request_count, 1);
+
+    let mut changed_fence = run.clone();
+    changed_fence.worker_id = WorkerId::parse("other-worker").unwrap();
     assert_eq!(
-        ledger.reserve(&request_claims, 1, 2, 250),
-        Err(BrokerError::RateLimited)
-    );
-    assert_eq!(
-        ledger.reserve(&claims(1_000, 62_000), 1, 3, 250),
+        ledger.cost_report(&changed_fence),
         Err(BrokerError::InvalidToken)
     );
 }
 
 #[test]
-fn gateway_enforces_a_per_run_request_rate_window() {
+fn opening_the_ledger_discards_obsolete_budget_state() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let ledger = GatewayRequestLedger::open(directory.path().join("rate.sqlite3")).unwrap();
+    let database = directory.path().join("legacy.sqlite3");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE gateway_run_budget (
+                run_id TEXT PRIMARY KEY,
+                worker_id TEXT NOT NULL,
+                claim_callback_id TEXT NOT NULL,
+                start_callback_id TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                request_count INTEGER NOT NULL,
+                request_bytes INTEGER NOT NULL,
+                rate_window_started_at_ms INTEGER NOT NULL,
+                rate_window_request_count INTEGER NOT NULL,
+                reserved_cost_microusd INTEGER NOT NULL DEFAULT 0,
+                maximum_cost_microusd INTEGER NOT NULL DEFAULT 0,
+                cost_policy_identity TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .unwrap();
+    drop(connection);
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let ledger = GatewayRequestLedger::open(&database).unwrap();
+    let table_count: i64 = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gateway_run_budget'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 0);
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let request_claims = claims(now, now + 60_000);
-    for _ in 0..10 {
-        ledger.reserve(&request_claims, 1, 64, 1_000).unwrap();
-    }
-    assert_eq!(
-        ledger.reserve(&request_claims, 1, 64, 1_000),
-        Err(BrokerError::RateLimited)
-    );
+    ledger
+        .begin_request(&claims(now, now + 60_000), EventId::new())
+        .unwrap();
 }
 
 #[test]

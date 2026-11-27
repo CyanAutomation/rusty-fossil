@@ -34,6 +34,7 @@ An operator-requested cancellation remains a distinct durable action. A hard-sto
 ## Consequences and prerequisites
 
 - Phase 2B synthetic defaults and SIGTERM behavior remain unchanged.
+- The 2026-11-27 Phase 2C-A.3 work has not implemented these coding-specific deadline, cancellation, outage, shutdown, or maintenance controls. The Pi workload remains rejected by the supervisor; see the [integration map](../PHASE-2C-A.3-INTEGRATION-MAP.md).
 - Multi-hour continuation requires a native Pi test of recovery, clock behavior, memory, storage wear, Docker cgroups, outbound network policy and controlled credentials.
 - Phase 2C-A must define a local maintenance control and single-supervisor ownership mechanism before implementing continuation across process replacement.
 - The timeout values above are a proposal for a non-production pilot, not implemented configuration or production guarantees.

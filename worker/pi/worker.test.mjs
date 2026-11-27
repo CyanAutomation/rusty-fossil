@@ -105,8 +105,7 @@ test("rejects writable, oversized, malformed, empty, and symlink gateway tokens"
 test("writes a static OpenAI-compatible Pi model behind the fixed broker", () => {
   const model = "workers-ai/@cf/meta/disposable-test-model";
   const token = "run-token-" + "a".repeat(48);
-  const cost = { input: 0.25, output: 1.5, cacheRead: 0.05, cacheWrite: 0.1 };
-  assert.deepEqual(buildPiModelsConfig(model, token, cost), {
+  assert.deepEqual(buildPiModelsConfig(model, token), {
     providers: {
       "fossil-gateway": {
         baseUrl: "https://fossil-gateway:8787/v1",
@@ -119,21 +118,13 @@ test("writes a static OpenAI-compatible Pi model behind the fixed broker", () =>
             name: model,
             reasoning: false,
             input: ["text"],
-            cost,
-            contextWindow: 32768,
-            maxTokens: 4096,
           },
         ],
       },
     },
   });
   assert.equal(GATEWAY_CA_CERT_PATH, "/run/fossil/gateway-ca.pem");
-  assert.throws(() => buildPiModelsConfig(model, "short", cost), /invalid gateway token/);
-  assert.throws(() => buildPiModelsConfig(model, token), /invalid model pricing/);
-  assert.throws(
-    () => buildPiModelsConfig(model, token, { ...cost, output: Number.POSITIVE_INFINITY }),
-    /invalid model pricing/,
-  );
+  assert.throws(() => buildPiModelsConfig(model, "short"), /invalid gateway token/);
 });
 
 test("builds a fixed Pi JSON-mode invocation without a shell or prompt argument", () => {

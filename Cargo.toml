@@ -24,6 +24,7 @@ axum = { version = "0.8", features = ["http1", "json", "tokio"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 fossil-core = { path = "crates/fossil-core" }
+fossil-gateway = { path = "crates/fossil-gateway" }
 fossil-soyuz = { path = "crates/fossil-soyuz" }
 fossil-senku = { path = "crates/fossil-senku" }
 fossil-queue = { path = "crates/fossil-queue" }

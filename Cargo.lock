@@ -1436,6 +1436,7 @@ dependencies = [
  "bollard",
  "clap",
  "fossil-core",
+ "fossil-gateway",
  "fossil-queue",
  "fossil-senku",
  "fossil-soyuz",

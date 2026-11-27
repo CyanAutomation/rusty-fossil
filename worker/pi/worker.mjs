@@ -167,19 +167,11 @@ export async function readGatewayTokenFile(filePath = GATEWAY_TOKEN_PATH) {
   }
 }
 
-export function buildPiModelsConfig(model, gatewayToken, cost) {
+export function buildPiModelsConfig(model, gatewayToken) {
   if (typeof model !== "string" || !MODEL_ID_PATTERN.test(model)) {
     throw new Error("invalid Pi model");
   }
   validateGatewayToken(gatewayToken);
-  if (
-    !cost ||
-    ![cost.input, cost.output, cost.cacheRead, cost.cacheWrite].every(
-      (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
-    )
-  ) {
-    throw new Error("invalid model pricing");
-  }
   return {
     providers: {
       [PI_GATEWAY_PROVIDER]: {
@@ -193,9 +185,6 @@ export function buildPiModelsConfig(model, gatewayToken, cost) {
             name: model,
             reasoning: false,
             input: ["text"],
-            cost,
-            contextWindow: 32768,
-            maxTokens: 4096,
           },
         ],
       },
@@ -203,23 +192,7 @@ export function buildPiModelsConfig(model, gatewayToken, cost) {
   };
 }
 
-function readModelCostFromEnvironment(environment = process.env) {
-  const read = (name) => {
-    const value = environment[name];
-    if (typeof value !== "string" || !/^(?:0|[1-9]\d*)(?:\.\d{1,8})?$/.test(value)) {
-      throw new Error("invalid model pricing");
-    }
-    return Number(value);
-  };
-  return {
-    input: read("FOSSIL_PI_COST_INPUT_USD_PER_MILLION"),
-    output: read("FOSSIL_PI_COST_OUTPUT_USD_PER_MILLION"),
-    cacheRead: read("FOSSIL_PI_COST_CACHE_READ_USD_PER_MILLION"),
-    cacheWrite: read("FOSSIL_PI_COST_CACHE_WRITE_USD_PER_MILLION"),
-  };
-}
-
-async function writePiModelsConfig(model, gatewayToken, cost) {
+async function writePiModelsConfig(model, gatewayToken) {
   await mkdir(PI_AGENT_DIRECTORY, { recursive: true, mode: 0o700 });
   const configPath = join(PI_AGENT_DIRECTORY, "models.json");
   let file;
@@ -229,7 +202,7 @@ async function writePiModelsConfig(model, gatewayToken, cost) {
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
-    await file.writeFile(JSON.stringify(buildPiModelsConfig(model, gatewayToken, cost)), "utf8");
+    await file.writeFile(JSON.stringify(buildPiModelsConfig(model, gatewayToken)), "utf8");
   } finally {
     await file?.close();
   }
@@ -265,8 +238,7 @@ async function writePiStreamSeal(seal) {
 
 async function runPi(prompt, model) {
   const gatewayToken = await readGatewayTokenFile();
-  const cost = readModelCostFromEnvironment();
-  await writePiModelsConfig(model, gatewayToken, cost);
+  await writePiModelsConfig(model, gatewayToken);
   const invocation = buildPiInvocation(model);
   const child = spawn(invocation.file, invocation.args, {
     cwd: "/workspace",

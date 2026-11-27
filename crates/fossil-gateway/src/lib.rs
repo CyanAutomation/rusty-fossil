@@ -33,8 +33,6 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
 pub const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RUN_TOKEN_TTL_MS: i64 = 3 * 60 * 60 * 1_000;
 const MAX_FUTURE_CLOCK_SKEW_MS: i64 = 30_000;
-const GATEWAY_RATE_WINDOW_MS: i64 = 60_000;
-const MAX_REQUESTS_PER_RATE_WINDOW: i64 = 10;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerError {
@@ -44,8 +42,6 @@ pub enum BrokerError {
     InvalidToken,
     #[error("model request is invalid")]
     InvalidRequest,
-    #[error("model request limit was reached")]
-    RateLimited,
     #[error("model gateway request failed")]
     ProviderFailure,
     #[error("gateway request ledger is unavailable")]
@@ -184,24 +180,47 @@ fn valid_gateway_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Validate the model and the fields that can affect request cost. Unknown
-/// payload fields are preserved for provider compatibility, but cannot change
-/// the upstream URL or selected model.
+/// Validate the configured model and supported request fields. Token-count
+/// options are removed so client defaults cannot impose an inference budget;
+/// unknown fields cannot change the upstream URL or selected model.
 pub fn validate_completion_request(
     body: &[u8],
     expected_model: &str,
-    maximum_output_tokens: u32,
 ) -> Result<Value, BrokerError> {
-    if body.is_empty()
-        || body.len() > MAX_REQUEST_BODY_BYTES
-        || !valid_model_id(expected_model)
-        || maximum_output_tokens == 0
-        || maximum_output_tokens > 16_384
-    {
+    if body.is_empty() || body.len() > MAX_REQUEST_BODY_BYTES || !valid_model_id(expected_model) {
         return Err(BrokerError::InvalidRequest);
     }
     let mut value: Value = serde_json::from_slice(body).map_err(|_| BrokerError::InvalidRequest)?;
     let object = value.as_object_mut().ok_or(BrokerError::InvalidRequest)?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "user",
+        "seed",
+        "response_format",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+    ];
+    if object
+        .keys()
+        .any(|key| !ALLOWED_FIELDS.contains(&key.as_str()))
+    {
+        return Err(BrokerError::InvalidRequest);
+    }
     if object.get("model").and_then(Value::as_str) != Some(expected_model) {
         return Err(BrokerError::InvalidRequest);
     }
@@ -210,16 +229,23 @@ pub fn validate_completion_request(
         .and_then(Value::as_array)
         .filter(|messages| !messages.is_empty() && messages.len() <= 128)
         .ok_or(BrokerError::InvalidRequest)?;
-    if messages.iter().any(|message| {
-        message
-            .as_object()
-            .and_then(|message| message.get("role"))
+    for message in messages {
+        let message = message.as_object().ok_or(BrokerError::InvalidRequest)?;
+        let role = message
+            .get("role")
             .and_then(Value::as_str)
-            .is_none_or(|role| {
-                !matches!(role, "system" | "developer" | "user" | "assistant" | "tool")
+            .filter(|role| {
+                matches!(
+                    *role,
+                    "system" | "developer" | "user" | "assistant" | "tool"
+                )
             })
-    }) {
-        return Err(BrokerError::InvalidRequest);
+            .ok_or(BrokerError::InvalidRequest)?;
+        if let Some(content) = message.get("content")
+            && !is_bounded_text_content(content, role)
+        {
+            return Err(BrokerError::InvalidRequest);
+        }
     }
     if object
         .get("stream")
@@ -227,40 +253,68 @@ pub fn validate_completion_request(
     {
         return Err(BrokerError::InvalidRequest);
     }
-    if object
-        .get("tools")
-        .is_some_and(|tools| tools.as_array().is_none_or(|tools| tools.len() > 64))
-    {
-        return Err(BrokerError::InvalidRequest);
-    }
-    if object
-        .get("n")
-        .is_some_and(|value| value.as_u64() != Some(1))
-    {
-        return Err(BrokerError::InvalidRequest);
-    }
-
-    let has_max_tokens = object.contains_key("max_tokens");
-    let has_max_completion_tokens = object.contains_key("max_completion_tokens");
-    if has_max_tokens && has_max_completion_tokens {
-        return Err(BrokerError::InvalidRequest);
-    }
-    let token_key = if has_max_completion_tokens {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    };
-    if let Some(value) = object.get(token_key) {
-        if value
-            .as_u64()
-            .is_none_or(|tokens| tokens == 0 || tokens > u64::from(maximum_output_tokens))
-        {
+    if let Some(tools) = object.get("tools") {
+        let tools = tools.as_array().ok_or(BrokerError::InvalidRequest)?;
+        if tools.len() > 64 || tools.iter().any(|tool| !is_function_tool(tool)) {
             return Err(BrokerError::InvalidRequest);
         }
-    } else {
-        object.insert(token_key.to_owned(), Value::from(maximum_output_tokens));
     }
+    object.remove("max_tokens");
+    object.remove("max_completion_tokens");
     Ok(value)
+}
+
+fn is_bounded_text_content(content: &Value, role: &str) -> bool {
+    match content {
+        Value::String(_) => true,
+        Value::Null => role == "assistant",
+        Value::Array(parts) => {
+            !parts.is_empty()
+                && parts.iter().all(|part| {
+                    part.as_object().is_some_and(|part| {
+                        part.get("type").and_then(Value::as_str) == Some("text")
+                            && part.get("text").and_then(Value::as_str).is_some()
+                            && part
+                                .keys()
+                                .all(|key| matches!(key.as_str(), "type" | "text"))
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
+fn is_function_tool(tool: &Value) -> bool {
+    let Some(tool) = tool.as_object() else {
+        return false;
+    };
+    if tool.len() != 2 || tool.get("type").and_then(Value::as_str) != Some("function") {
+        return false;
+    }
+    let Some(function) = tool.get("function").and_then(Value::as_object) else {
+        return false;
+    };
+    if function.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "name" | "description" | "parameters" | "strict"
+        )
+    }) {
+        return false;
+    }
+    function
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.is_empty() && name.len() <= 128)
+        && function
+            .get("description")
+            .is_none_or(|description| description.as_str().is_some())
+        && function
+            .get("parameters")
+            .is_none_or(|parameters| parameters.is_object())
+        && function
+            .get("strict")
+            .is_none_or(|strict| strict.is_boolean())
 }
 
 fn valid_model_id(value: &str) -> bool {
@@ -271,21 +325,37 @@ fn valid_model_id(value: &str) -> bool {
         })
 }
 
-/// SQLite-backed request accounting. Only run IDs, fences, expiries and
-/// counters are stored; prompt and response contents never enter the ledger.
+/// SQLite-backed correlation and observed-cost ledger. It stores only run
+/// fences, gateway log IDs, and cost values; prompts and token counts stay out.
 pub struct GatewayRequestLedger {
     connection: Mutex<Connection>,
 }
 
-struct ExistingRunBudget {
-    worker_id: String,
-    claim_callback_id: String,
-    start_callback_id: String,
-    expires_at_ms: i64,
-    request_count: i64,
-    request_bytes: i64,
-    rate_window_started_at_ms: i64,
-    rate_window_request_count: i64,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCostReport {
+    pub estimated_cost_usd: f64,
+    pub currency: &'static str,
+    pub source: &'static str,
+    pub complete: bool,
+    pub request_count: u64,
+    pub priced_request_count: u64,
+    pub pending_request_count: u64,
+}
+
+impl GatewayCostReport {
+    fn new(estimated_cost_usd: f64, request_count: u64, priced_request_count: u64) -> Self {
+        let pending_request_count = request_count.saturating_sub(priced_request_count);
+        Self {
+            estimated_cost_usd,
+            currency: "USD",
+            source: "cloudflare_ai_gateway",
+            complete: pending_request_count == 0,
+            request_count,
+            priced_request_count,
+            pending_request_count,
+        }
+    }
 }
 
 impl GatewayRequestLedger {
@@ -310,16 +380,19 @@ impl GatewayRequestLedger {
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
-                 CREATE TABLE IF NOT EXISTS gateway_run_budget (
+                 DROP TABLE IF EXISTS gateway_run_budget;
+                 CREATE TABLE IF NOT EXISTS gateway_run_cost (
                     run_id TEXT PRIMARY KEY,
                     worker_id TEXT NOT NULL,
                     claim_callback_id TEXT NOT NULL,
                     start_callback_id TEXT NOT NULL,
-                    expires_at_ms INTEGER NOT NULL,
-                    request_count INTEGER NOT NULL,
-                    request_bytes INTEGER NOT NULL,
-                    rate_window_started_at_ms INTEGER NOT NULL,
-                    rate_window_request_count INTEGER NOT NULL
+                    expires_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS gateway_request_cost (
+                    request_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES gateway_run_cost(run_id),
+                    log_id TEXT UNIQUE,
+                    cost_usd REAL
                  );",
             )
             .map_err(|_| BrokerError::LedgerUnavailable)?;
@@ -328,20 +401,14 @@ impl GatewayRequestLedger {
         })
     }
 
-    pub fn reserve(
+    /// Persist the run fence and request identity before calling Cloudflare.
+    /// This records usage; it never rejects a request based on count, bytes,
+    /// rate, token count, or cost.
+    pub fn begin_request(
         &self,
         claims: &GatewayTokenClaims,
-        request_bytes: usize,
-        maximum_requests: u32,
-        maximum_bytes: u64,
+        request_id: EventId,
     ) -> Result<(), BrokerError> {
-        if request_bytes == 0
-            || request_bytes > MAX_REQUEST_BODY_BYTES
-            || maximum_requests == 0
-            || maximum_bytes < request_bytes as u64
-        {
-            return Err(BrokerError::RateLimited);
-        }
         let mut connection = self
             .connection
             .lock()
@@ -351,112 +418,202 @@ impl GatewayRequestLedger {
             .map_err(|_| BrokerError::LedgerUnavailable)?;
         let now = now_ms()?;
         ensure_unexpired_at(claims, now)?;
-        transaction
-            .execute(
-                "DELETE FROM gateway_run_budget WHERE expires_at_ms <= ?1",
-                [now],
-            )
-            .map_err(|_| BrokerError::LedgerUnavailable)?;
-        let current: Option<ExistingRunBudget> = transaction
+        let existing: Option<(String, String, String, i64)> = transaction
             .query_row(
-                "SELECT worker_id, claim_callback_id, start_callback_id,
-                        expires_at_ms, request_count, request_bytes,
-                        rate_window_started_at_ms, rate_window_request_count
-                 FROM gateway_run_budget WHERE run_id = ?1",
+                "SELECT worker_id, claim_callback_id, start_callback_id, expires_at_ms
+                 FROM gateway_run_cost WHERE run_id = ?1",
                 [claims.run_id.to_string()],
-                |row| {
-                    Ok(ExistingRunBudget {
-                        worker_id: row.get(0)?,
-                        claim_callback_id: row.get(1)?,
-                        start_callback_id: row.get(2)?,
-                        expires_at_ms: row.get(3)?,
-                        request_count: row.get(4)?,
-                        request_bytes: row.get(5)?,
-                        rate_window_started_at_ms: row.get(6)?,
-                        rate_window_request_count: row.get(7)?,
-                    })
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|_| BrokerError::LedgerUnavailable)?;
-
-        match current {
-            Some(existing) => {
-                if existing.worker_id != claims.worker_id.to_string()
-                    || existing.claim_callback_id != claims.claim_callback_id.to_string()
-                    || existing.start_callback_id != claims.start_callback_id.to_string()
-                    || existing.expires_at_ms != claims.expires_at_ms
+        match existing {
+            Some((worker_id, claim_id, start_id, expires_at_ms)) => {
+                if worker_id != claims.worker_id.to_string()
+                    || claim_id != claims.claim_callback_id.to_string()
+                    || start_id != claims.start_callback_id.to_string()
+                    || expires_at_ms != claims.expires_at_ms
                 {
                     return Err(BrokerError::InvalidToken);
                 }
-                if existing.request_count < 0
-                    || existing.request_bytes < 0
-                    || existing.rate_window_request_count < 0
-                {
-                    return Err(BrokerError::LedgerUnavailable);
-                }
-                let (next_window_started, next_window_count) = if now
-                    .saturating_sub(existing.rate_window_started_at_ms)
-                    >= GATEWAY_RATE_WINDOW_MS
-                {
-                    (now, 1)
-                } else if now < existing.rate_window_started_at_ms
-                    || existing.rate_window_request_count >= MAX_REQUESTS_PER_RATE_WINDOW
-                {
-                    return Err(BrokerError::RateLimited);
-                } else {
-                    (
-                        existing.rate_window_started_at_ms,
-                        existing.rate_window_request_count + 1,
-                    )
-                };
-                let current_bytes = u64::try_from(existing.request_bytes)
-                    .map_err(|_| BrokerError::LedgerUnavailable)?;
-                let next_bytes = current_bytes.saturating_add(request_bytes as u64);
-                if existing.request_count >= i64::from(maximum_requests)
-                    || next_bytes > maximum_bytes
-                {
-                    return Err(BrokerError::RateLimited);
-                }
-                transaction
-                    .execute(
-                        "UPDATE gateway_run_budget SET request_count = ?2, request_bytes = ?3,
-                         rate_window_started_at_ms = ?4, rate_window_request_count = ?5
-                         WHERE run_id = ?1",
-                        params![
-                            claims.run_id.to_string(),
-                            existing.request_count + 1,
-                            i64::try_from(next_bytes).map_err(|_| BrokerError::RateLimited)?,
-                            next_window_started,
-                            next_window_count
-                        ],
-                    )
-                    .map_err(|_| BrokerError::LedgerUnavailable)?;
             }
             None => {
                 transaction
                     .execute(
-                        "INSERT INTO gateway_run_budget (
-                            run_id, worker_id, claim_callback_id, start_callback_id,
-                            expires_at_ms, request_count, request_bytes,
-                            rate_window_started_at_ms, rate_window_request_count
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1)",
+                        "INSERT INTO gateway_run_cost (
+                            run_id, worker_id, claim_callback_id, start_callback_id, expires_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![
                             claims.run_id.to_string(),
                             claims.worker_id.to_string(),
                             claims.claim_callback_id.to_string(),
                             claims.start_callback_id.to_string(),
                             claims.expires_at_ms,
-                            request_bytes as i64,
-                            now,
                         ],
                     )
                     .map_err(|_| BrokerError::LedgerUnavailable)?;
             }
         }
         transaction
+            .execute(
+                "INSERT INTO gateway_request_cost (request_id, run_id) VALUES (?1, ?2)",
+                params![request_id.to_string(), claims.run_id.to_string()],
+            )
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        transaction
             .commit()
             .map_err(|_| BrokerError::LedgerUnavailable)
+    }
+
+    pub fn record_gateway_log(
+        &self,
+        claims: &GatewayTokenClaims,
+        request_id: EventId,
+        log_id: &str,
+    ) -> Result<(), BrokerError> {
+        if log_id.is_empty()
+            || log_id.len() > 128
+            || !log_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        let updated = connection
+            .execute(
+                "UPDATE gateway_request_cost
+                 SET log_id = ?1
+                 WHERE request_id = ?2 AND run_id = ?3
+                   AND EXISTS (
+                     SELECT 1 FROM gateway_run_cost
+                     WHERE run_id = ?3 AND worker_id = ?4 AND claim_callback_id = ?5
+                       AND start_callback_id = ?6 AND expires_at_ms = ?7
+                   )",
+                params![
+                    log_id,
+                    request_id.to_string(),
+                    claims.run_id.to_string(),
+                    claims.worker_id.to_string(),
+                    claims.claim_callback_id.to_string(),
+                    claims.start_callback_id.to_string(),
+                    claims.expires_at_ms,
+                ],
+            )
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        if updated != 1 {
+            return Err(BrokerError::InvalidToken);
+        }
+        Ok(())
+    }
+
+    pub fn pending_log_ids(&self, claims: &GatewayTokenClaims) -> Result<Vec<String>, BrokerError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        ensure_run_fence(&connection, claims)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT log_id FROM gateway_request_cost
+                 WHERE run_id = ?1 AND log_id IS NOT NULL AND cost_usd IS NULL
+                 ORDER BY request_id",
+            )
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        statement
+            .query_map([claims.run_id.to_string()], |row| row.get(0))
+            .map_err(|_| BrokerError::LedgerUnavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| BrokerError::LedgerUnavailable)
+    }
+
+    pub fn record_gateway_cost(&self, log_id: &str, cost_usd: f64) -> Result<(), BrokerError> {
+        if !cost_usd.is_finite() || cost_usd < 0.0 {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        let updated = connection
+            .execute(
+                "UPDATE gateway_request_cost SET cost_usd = ?1 WHERE log_id = ?2",
+                params![cost_usd, log_id],
+            )
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        if updated != 1 {
+            return Err(BrokerError::LedgerUnavailable);
+        }
+        Ok(())
+    }
+
+    pub fn cost_report(
+        &self,
+        claims: &GatewayTokenClaims,
+    ) -> Result<GatewayCostReport, BrokerError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| BrokerError::LedgerUnavailable)?;
+        ensure_run_fence(&connection, claims)?;
+        connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(cost_usd), COALESCE(SUM(cost_usd), 0.0)
+                 FROM gateway_request_cost WHERE run_id = ?1",
+                [claims.run_id.to_string()],
+                |row| {
+                    let request_count = row.get::<_, i64>(0)?;
+                    let priced_request_count = row.get::<_, i64>(1)?;
+                    let total_cost_usd = row.get::<_, f64>(2)?;
+                    Ok((request_count, priced_request_count, total_cost_usd))
+                },
+            )
+            .map_err(|_| BrokerError::LedgerUnavailable)
+            .and_then(|(request_count, priced_request_count, total_cost_usd)| {
+                let request_count =
+                    u64::try_from(request_count).map_err(|_| BrokerError::LedgerUnavailable)?;
+                let priced_request_count = u64::try_from(priced_request_count)
+                    .map_err(|_| BrokerError::LedgerUnavailable)?;
+                if !total_cost_usd.is_finite() {
+                    return Err(BrokerError::LedgerUnavailable);
+                }
+                Ok(GatewayCostReport::new(
+                    total_cost_usd,
+                    request_count,
+                    priced_request_count,
+                ))
+            })
+    }
+}
+
+fn ensure_run_fence(
+    connection: &Connection,
+    claims: &GatewayTokenClaims,
+) -> Result<(), BrokerError> {
+    let matches: bool = connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM gateway_run_cost
+                WHERE run_id = ?1 AND worker_id = ?2 AND claim_callback_id = ?3
+                  AND start_callback_id = ?4 AND expires_at_ms = ?5
+             )",
+            params![
+                claims.run_id.to_string(),
+                claims.worker_id.to_string(),
+                claims.claim_callback_id.to_string(),
+                claims.start_callback_id.to_string(),
+                claims.expires_at_ms,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|_| BrokerError::LedgerUnavailable)?;
+    if matches {
+        Ok(())
+    } else {
+        Err(BrokerError::InvalidToken)
     }
 }
 
@@ -505,38 +662,11 @@ fn private_ledger_path(path: &Path) -> Result<std::path::PathBuf, BrokerError> {
     Ok(path)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GatewayRequestLimits {
-    pub maximum_requests_per_run: u32,
-    pub maximum_request_bytes_per_run: u64,
-    pub maximum_output_tokens: u32,
-}
-
-impl GatewayRequestLimits {
-    pub fn new(
-        maximum_requests_per_run: u32,
-        maximum_request_bytes_per_run: u64,
-        maximum_output_tokens: u32,
-    ) -> Result<Self, BrokerError> {
-        if !(1..=512).contains(&maximum_requests_per_run)
-            || !(MAX_REQUEST_BODY_BYTES as u64..=64 * 1024 * 1024)
-                .contains(&maximum_request_bytes_per_run)
-            || !(1..=16_384).contains(&maximum_output_tokens)
-        {
-            return Err(BrokerError::InvalidConfiguration);
-        }
-        Ok(Self {
-            maximum_requests_per_run,
-            maximum_request_bytes_per_run,
-            maximum_output_tokens,
-        })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayUpstreamResponse {
     pub status: u16,
     pub content_type: String,
+    pub log_id: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -547,6 +677,8 @@ pub trait GatewayUpstream: Send + Sync {
         &self,
         endpoint: &str,
         gateway_auth_token: &SecretString,
+        run_id: RunId,
+        request_id: EventId,
         request_body: Vec<u8>,
     ) -> Result<GatewayUpstreamResponse, BrokerError>;
 }
@@ -574,8 +706,15 @@ impl GatewayUpstream for ReqwestGatewayUpstream {
         &self,
         endpoint: &str,
         gateway_auth_token: &SecretString,
+        run_id: RunId,
+        request_id: EventId,
         request_body: Vec<u8>,
     ) -> Result<GatewayUpstreamResponse, BrokerError> {
+        let metadata = serde_json::to_string(&serde_json::json!({
+            "run_id": run_id.to_string(),
+            "request_id": request_id.to_string(),
+        }))
+        .map_err(|_| BrokerError::InvalidRequest)?;
         let response = self
             .client
             .post(endpoint)
@@ -584,11 +723,20 @@ impl GatewayUpstream for ReqwestGatewayUpstream {
                 "cf-aig-authorization",
                 format!("Bearer {}", gateway_auth_token.expose_secret()),
             )
+            .header("cf-aig-collect-log-payload", "false")
+            .header("cf-aig-event-id", request_id.to_string())
+            .header("cf-aig-metadata", metadata)
             .body(request_body)
             .send()
             .await
             .map_err(|_| BrokerError::ProviderFailure)?;
         let status = response.status().as_u16();
+        let log_id = response
+            .headers()
+            .get("cf-aig-log-id")
+            .or_else(|| response.headers().get("cf-aig-event-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -599,6 +747,7 @@ impl GatewayUpstream for ReqwestGatewayUpstream {
             return Ok(GatewayUpstreamResponse {
                 status,
                 content_type,
+                log_id,
                 body: Vec::new(),
             });
         }
@@ -620,8 +769,120 @@ impl GatewayUpstream for ReqwestGatewayUpstream {
         Ok(GatewayUpstreamResponse {
             status,
             content_type,
+            log_id,
             body,
         })
+    }
+}
+
+#[async_trait]
+pub trait GatewayLogReader: Send + Sync {
+    /// Read the Cloudflare AI Gateway's estimated USD cost for one log entry.
+    /// Missing cost means Cloudflare has not supplied an estimate yet.
+    async fn cost_usd(&self, log_id: &str) -> Result<Option<f64>, BrokerError>;
+}
+
+struct ReqwestGatewayLogReader {
+    client: reqwest::Client,
+    token: SecretString,
+    logs_url: Url,
+}
+
+impl ReqwestGatewayLogReader {
+    fn new(endpoint: &GatewayEndpoint, token: SecretString) -> Result<Self, BrokerError> {
+        let mut segments = endpoint
+            .0
+            .path_segments()
+            .ok_or(BrokerError::InvalidConfiguration)?;
+        let account_id = segments.nth(1).ok_or(BrokerError::InvalidConfiguration)?;
+        let gateway_id = segments.next().ok_or(BrokerError::InvalidConfiguration)?;
+        let mut logs_url = Url::parse("https://api.cloudflare.com/client/v4/")
+            .map_err(|_| BrokerError::InvalidConfiguration)?;
+        logs_url
+            .path_segments_mut()
+            .map_err(|_| BrokerError::InvalidConfiguration)?
+            .extend([
+                "accounts",
+                account_id,
+                "ai-gateway",
+                "gateways",
+                gateway_id,
+                "logs",
+            ]);
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|_| BrokerError::InvalidConfiguration)?;
+        Ok(Self {
+            client,
+            token,
+            logs_url,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct CloudflareLogEnvelope {
+    success: bool,
+    result: CloudflareLogResult,
+}
+
+#[derive(Deserialize)]
+struct CloudflareLogResult {
+    cost: Option<f64>,
+}
+
+#[async_trait]
+impl GatewayLogReader for ReqwestGatewayLogReader {
+    async fn cost_usd(&self, log_id: &str) -> Result<Option<f64>, BrokerError> {
+        if log_id.is_empty()
+            || log_id.len() > 128
+            || !log_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let mut url = self.logs_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| BrokerError::InvalidConfiguration)?
+            .push(log_id);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await
+            .map_err(|_| BrokerError::ProviderFailure)?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > 128 * 1024)
+        {
+            return Err(BrokerError::ProviderFailure);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| BrokerError::ProviderFailure)?;
+        if body.len() > 128 * 1024 {
+            return Err(BrokerError::ProviderFailure);
+        }
+        let envelope: CloudflareLogEnvelope =
+            serde_json::from_slice(&body).map_err(|_| BrokerError::ProviderFailure)?;
+        if !envelope.success {
+            return Err(BrokerError::ProviderFailure);
+        }
+        let Some(cost) = envelope.result.cost else {
+            return Ok(None);
+        };
+        if !cost.is_finite() || cost < 0.0 {
+            return Err(BrokerError::ProviderFailure);
+        }
+        Ok(Some(cost))
     }
 }
 
@@ -632,7 +893,7 @@ pub struct GatewayBroker {
     gateway_auth_token: SecretString,
     signer: GatewayTokenSigner,
     ledger: GatewayRequestLedger,
-    limits: GatewayRequestLimits,
+    log_reader: std::sync::Arc<dyn GatewayLogReader>,
     upstream: std::sync::Arc<dyn GatewayUpstream>,
 }
 
@@ -644,27 +905,30 @@ impl GatewayBroker {
         gateway_auth_token: SecretString,
         signer: GatewayTokenSigner,
         ledger: GatewayRequestLedger,
-        limits: GatewayRequestLimits,
     ) -> Result<Self, BrokerError> {
         let upstream = std::sync::Arc::new(ReqwestGatewayUpstream::new()?);
-        Self::with_upstream(
+        let log_reader = std::sync::Arc::new(ReqwestGatewayLogReader::new(
+            &endpoint,
+            gateway_auth_token.clone(),
+        )?);
+        Self::with_clients(
             endpoint,
             model,
             gateway_auth_token,
             signer,
             ledger,
-            limits,
+            log_reader,
             upstream,
         )
     }
 
-    fn with_upstream(
+    fn with_clients(
         endpoint: GatewayEndpoint,
         model: String,
         gateway_auth_token: SecretString,
         signer: GatewayTokenSigner,
         ledger: GatewayRequestLedger,
-        limits: GatewayRequestLimits,
+        log_reader: std::sync::Arc<dyn GatewayLogReader>,
         upstream: std::sync::Arc<dyn GatewayUpstream>,
     ) -> Result<Self, BrokerError> {
         if !valid_model_id(&model)
@@ -682,7 +946,7 @@ impl GatewayBroker {
             gateway_auth_token,
             signer,
             ledger,
-            limits,
+            log_reader,
             upstream,
         })
     }
@@ -691,6 +955,7 @@ impl GatewayBroker {
         Router::new()
             .route("/healthz", get(health))
             .route("/v1/chat/completions", post(infer))
+            .route("/v1/cost", get(cost_report))
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .with_state(self)
     }
@@ -703,24 +968,25 @@ impl GatewayBroker {
         let token = bearer_token(headers).ok_or(BrokerError::InvalidToken)?;
         let now = now_ms()?;
         let claims = self.signer.verify(token, now)?;
-        let request =
-            validate_completion_request(body, &self.model, self.limits.maximum_output_tokens)?;
+        let request = validate_completion_request(body, &self.model)?;
         let request_body = serde_json::to_vec(&request).map_err(|_| BrokerError::InvalidRequest)?;
-        self.ledger.reserve(
-            &claims,
-            request_body.len(),
-            self.limits.maximum_requests_per_run,
-            self.limits.maximum_request_bytes_per_run,
-        )?;
+        let request_id = EventId::new();
+        self.ledger.begin_request(&claims, request_id)?;
 
         let response = self
             .upstream
             .send(
                 self.endpoint.as_str(),
                 &self.gateway_auth_token,
+                claims.run_id,
+                request_id,
                 request_body,
             )
             .await?;
+        if let Some(log_id) = response.log_id.as_deref() {
+            self.ledger
+                .record_gateway_log(&claims, request_id, log_id)?;
+        }
         if !(200..300).contains(&response.status) {
             return Err(BrokerError::ProviderFailure);
         }
@@ -738,6 +1004,20 @@ impl GatewayBroker {
         builder
             .body(Body::from(response.body))
             .map_err(|_| BrokerError::ProviderFailure)
+    }
+
+    async fn refresh_cost_report(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<GatewayCostReport, BrokerError> {
+        let token = bearer_token(headers).ok_or(BrokerError::InvalidToken)?;
+        let claims = self.signer.verify(token, now_ms()?)?;
+        for log_id in self.ledger.pending_log_ids(&claims)? {
+            if let Some(cost_usd) = self.log_reader.cost_usd(&log_id).await? {
+                self.ledger.record_gateway_cost(&log_id, cost_usd)?;
+            }
+        }
+        self.ledger.cost_report(&claims)
     }
 }
 
@@ -767,7 +1047,6 @@ async fn infer(
             let status = match error {
                 BrokerError::InvalidToken => StatusCode::UNAUTHORIZED,
                 BrokerError::InvalidRequest => StatusCode::BAD_REQUEST,
-                BrokerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
                 BrokerError::InvalidConfiguration
                 | BrokerError::LedgerUnavailable
                 | BrokerError::ClockUnavailable
@@ -785,6 +1064,39 @@ async fn infer(
                 .status(status)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
                 .body(Body::from(body))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+    }
+}
+
+async fn cost_report(
+    State(broker): State<std::sync::Arc<GatewayBroker>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    match broker.refresh_cost_report(&headers).await {
+        Ok(report) => {
+            let body = serde_json::to_vec(&report).unwrap_or_else(|_| b"{}".to_vec());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(Body::from(body))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+        Err(error) => {
+            let status = match error {
+                BrokerError::InvalidToken => StatusCode::UNAUTHORIZED,
+                BrokerError::InvalidRequest => StatusCode::BAD_REQUEST,
+                BrokerError::InvalidConfiguration
+                | BrokerError::LedgerUnavailable
+                | BrokerError::ClockUnavailable
+                | BrokerError::ProviderFailure => StatusCode::BAD_GATEWAY,
+            };
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(Body::from(
+                    r#"{"error":{"type":"cost_unavailable","message":"gateway cost report is unavailable"}}"#,
+                ))
                 .unwrap_or_else(|_| Response::new(Body::empty()))
         }
     }
@@ -817,6 +1129,7 @@ mod tests {
     use super::*;
     use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::UNIX_EPOCH;
 
     struct MockGateway {
@@ -824,6 +1137,7 @@ mod tests {
         expected_auth_token: String,
         response: GatewayUpstreamResponse,
         seen_request: Mutex<Option<Vec<u8>>>,
+        calls: AtomicU64,
     }
 
     #[async_trait]
@@ -832,15 +1146,35 @@ mod tests {
             &self,
             endpoint: &str,
             gateway_auth_token: &SecretString,
+            run_id: RunId,
+            request_id: EventId,
             request_body: Vec<u8>,
         ) -> Result<GatewayUpstreamResponse, BrokerError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
             assert_eq!(endpoint, self.expected_endpoint);
             assert_eq!(gateway_auth_token.expose_secret(), self.expected_auth_token);
+            assert_eq!(run_id, claims(0).run_id);
+            assert_ne!(
+                request_id,
+                EventId::parse("cc1c1b68-5f60-4d7e-8f50-5deabc37000b").unwrap()
+            );
             *self
                 .seen_request
                 .lock()
                 .map_err(|_| BrokerError::ProviderFailure)? = Some(request_body);
-            Ok(self.response.clone())
+            let mut response = self.response.clone();
+            response.log_id = Some(format!("log-{call}"));
+            Ok(response)
+        }
+    }
+
+    struct MockLogReader;
+
+    #[async_trait]
+    impl GatewayLogReader for MockLogReader {
+        async fn cost_usd(&self, log_id: &str) -> Result<Option<f64>, BrokerError> {
+            assert!(log_id.starts_with("log-"));
+            Ok(Some(0.00025))
         }
     }
 
@@ -899,17 +1233,19 @@ mod tests {
             response: GatewayUpstreamResponse {
                 status: response_status,
                 content_type: response_content_type.to_owned(),
+                log_id: None,
                 body: response_body.to_vec(),
             },
             seen_request: Mutex::new(None),
+            calls: AtomicU64::new(0),
         });
-        let broker = GatewayBroker::with_upstream(
+        let broker = GatewayBroker::with_clients(
             endpoint,
             "workers-ai/@cf/meta/test-model".to_owned(),
             SecretString::from(mock.expected_auth_token.clone()),
             signer,
             GatewayRequestLedger::open_in_memory().unwrap(),
-            GatewayRequestLimits::new(4, MAX_REQUEST_BODY_BYTES as u64, 128).unwrap(),
+            std::sync::Arc::new(MockLogReader),
             mock.clone(),
         )
         .unwrap();
@@ -926,28 +1262,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broker_forwards_only_the_fixed_model_endpoint_and_broker_credential() {
-        let body = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"stream":true}"#;
+    async fn broker_forwards_unlimited_requests_and_reports_observed_cost() {
+        let body = br#"{"model":"workers-ai/@cf/meta/test-model","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":1000000,"stream":true}"#;
         let event_stream = b"data: [DONE]\n\n";
         let (broker, mock, token) = test_broker(200, "text/event-stream", event_stream);
-        let response = broker
-            .forward(&request_headers(&token), body)
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
-        assert_eq!(
-            axum::body::to_bytes(response.into_body(), 1024)
+        for index in 0..100 {
+            let response = broker
+                .forward(&request_headers(&token), body)
                 .await
-                .unwrap()
-                .as_ref(),
-            event_stream
-        );
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                event_stream
+            );
+            assert_eq!(mock.calls.load(Ordering::Relaxed), index + 1);
+        }
         let forwarded: Value =
             serde_json::from_slice(mock.seen_request.lock().unwrap().as_ref().unwrap()).unwrap();
-        assert_eq!(forwarded["max_tokens"], 128);
+        assert!(forwarded.get("max_completion_tokens").is_none());
+        assert!(forwarded.get("max_tokens").is_none());
         assert_eq!(forwarded["model"], "workers-ai/@cf/meta/test-model");
+        let report = broker
+            .refresh_cost_report(&request_headers(&token))
+            .await
+            .unwrap();
+        assert_eq!(report.request_count, 100);
+        assert_eq!(report.priced_request_count, 100);
+        assert_eq!(report.pending_request_count, 0);
+        assert!(report.complete);
+        assert!((report.estimated_cost_usd - 0.025).abs() < 0.000_001);
     }
 
     #[tokio::test]

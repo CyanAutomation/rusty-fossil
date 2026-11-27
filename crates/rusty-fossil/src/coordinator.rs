@@ -2,6 +2,7 @@ use fossil_core::contract::{OperationalEventType, SoyuzRunStatus};
 use fossil_core::ids::{ClaimCallbackId, EventId, RunId, WorkerId};
 use fossil_core::lifecycle::LocalLifecycleState;
 use fossil_core::queue::{CloudflareQueueMessage, QueueEnvelope};
+use fossil_gateway::GatewayCostReport;
 use fossil_queue::{CloudflareQueueClient, QueueDisposition, retry_delay_seconds};
 use fossil_senku::{
     AgentStageSettings as SenkuStageSettings, DecisionService, ProfileEvaluation,
@@ -13,14 +14,42 @@ use fossil_soyuz::{
     StartedRequest, WorkerClaimRequest,
 };
 use fossil_storage::{
-    CallbackOutboxRecord, CallbackPayload, ExecutionDescriptor, RecoveryAction, SqliteStore,
-    callback_retry_deadline_ms,
+    CallbackEnqueueResult, CallbackOutboxRecord, CallbackPayload, ExecutionDescriptor,
+    RecoveryAction, SqliteStore, StoreError, callback_retry_deadline_ms,
 };
 use fossil_supervisor::SupervisorIpcClient;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
+
+const GATEWAY_COST_EVENT_NAMESPACE: Uuid =
+    Uuid::from_u128(0x3254_5bc1_4103_5b77_9c25_a738_86c4_77e1);
+
+fn gateway_cost_event_id(run_id: RunId) -> EventId {
+    let mut bytes =
+        (run_id.as_uuid().as_u128() ^ GATEWAY_COST_EVENT_NAMESPACE.as_u128()).to_be_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let stable = Uuid::from_bytes(bytes);
+    EventId::parse(&stable.to_string()).expect("derived UUID is valid")
+}
+
+#[derive(Debug, Error)]
+pub enum GatewayCostReportError {
+    #[error("gateway cost report is incomplete or invalid")]
+    InvalidReport,
+    #[error("run is not authorized for a gateway cost event")]
+    Unauthorized,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Soyuz(#[from] SoyuzClientError),
+    #[error("gateway cost report could not be encoded")]
+    Encode,
+}
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 #[derive(Default)]
@@ -166,6 +195,70 @@ impl AuthorizationCoordinator {
                 .senku_task_admission_degraded
                 .load(Ordering::Relaxed),
         }
+    }
+
+    /// Persist one complete broker cost report as Soyuz operational metadata.
+    /// The deterministic event ID makes retries idempotent; callers must
+    /// enqueue this while Soyuz still accepts progress events for the run.
+    pub async fn enqueue_gateway_cost_report(
+        &self,
+        run_id: RunId,
+        report: GatewayCostReport,
+    ) -> Result<CallbackEnqueueResult, GatewayCostReportError> {
+        if report.currency != "USD"
+            || report.source != "cloudflare_ai_gateway"
+            || !report.estimated_cost_usd.is_finite()
+            || report.estimated_cost_usd < 0.0
+            || !report.complete
+            || report.pending_request_count != 0
+            || report.priced_request_count != report.request_count
+        {
+            return Err(GatewayCostReportError::InvalidReport);
+        }
+
+        let local = self.store.get_run(run_id)?;
+        let claim_callback_id = local
+            .claim_callback_id
+            .filter(|_| local.worker_id == self.worker_id && local.start_authorized)
+            .ok_or(GatewayCostReportError::Unauthorized)?;
+        if matches!(
+            local.lifecycle_state,
+            LocalLifecycleState::ExecutionTerminal
+        ) {
+            return Err(GatewayCostReportError::Unauthorized);
+        }
+
+        let canonical = self.soyuz.get_run(run_id).await?;
+        if canonical.run_id != run_id
+            || !matches!(
+                canonical.status,
+                SoyuzRunStatus::Running | SoyuzRunStatus::CancelRequested
+            )
+            || canonical.worker_id.as_ref() != Some(&self.worker_id)
+            || canonical.claim_callback_id != Some(claim_callback_id)
+        {
+            return Err(GatewayCostReportError::Unauthorized);
+        }
+
+        let mut payload =
+            serde_json::to_value(report).map_err(|_| GatewayCostReportError::Encode)?;
+        payload["kind"] = serde_json::Value::String("ai_gateway_cost".to_owned());
+        let event_id = gateway_cost_event_id(run_id);
+        self.store
+            .enqueue_callback(CallbackOutboxRecord::new(
+                event_id,
+                run_id,
+                CallbackPayload::Event {
+                    event_type: OperationalEventType::ProgressUpdate,
+                    worker_id: self.worker_id.clone(),
+                    claim_callback_id,
+                    stage: Some("inference".to_owned()),
+                    step: Some("cost_report".to_owned()),
+                    timestamp_ms: now_ms(),
+                    payload,
+                },
+            ))
+            .map_err(GatewayCostReportError::Store)
     }
 
     /// Replays durable callback intents independently from Queue intake and

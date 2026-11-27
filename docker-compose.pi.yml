@@ -28,9 +28,6 @@ services:
       FOSSIL_GATEWAY_TLS_CERT_FILE: /run/secrets/fossil_gateway_tls_certificate
       FOSSIL_GATEWAY_TLS_KEY_FILE: /run/secrets/fossil_gateway_tls_private_key
       FOSSIL_GATEWAY_LEDGER_PATH: /var/lib/fossil-gateway/ledger.sqlite3
-      FOSSIL_GATEWAY_MAX_REQUESTS_PER_RUN: "64"
-      FOSSIL_GATEWAY_MAX_REQUEST_BYTES_PER_RUN: "16777216"
-      FOSSIL_GATEWAY_MAX_OUTPUT_TOKENS: "4096"
     secrets:
       - fossil_gateway_auth_token
       - fossil_gateway_signing_key
